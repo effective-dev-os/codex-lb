@@ -334,7 +334,23 @@ class _HTTPBridgeRetryCircuitMixin:
             state = self._http_bridge_retry_circuits.get(session.key)
             if state is None:
                 return 0.0
-            return max(0.0, state.cooldown_until - now)
+            if state.cooldown_until > now:
+                return state.cooldown_until - now
+            # The single half-open probe slot is consumed as soon as one
+            # request is admitted (see _http_bridge_precreated_retry_allowed);
+            # every request rejected for the rest of the lease sees
+            # cooldown_until == 0 even though it cannot succeed until
+            # half_open_until. Reporting 0 here understates the true wait by
+            # up to _HTTP_BRIDGE_RETRY_CIRCUIT_HALF_OPEN_LEASE_SECONDS, which
+            # feeds a bogus ~1s Retry-After into callers (request_submit.py,
+            # streaming.py) and drives a client's own bounded reconnect
+            # budget to exhaustion well before the circuit can clear.
+            if (
+                state.consecutive_failures >= _HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_THRESHOLD
+                and state.half_open_until > now
+            ):
+                return state.half_open_until - now
+            return 0.0
 
     async def _record_http_bridge_retry_circuit_failure(
         self: Any,

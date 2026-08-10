@@ -22592,6 +22592,44 @@ async def test_http_bridge_retry_circuit_allows_only_one_half_open_probe() -> No
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_retry_circuit_reports_half_open_wait_when_blocked() -> None:
+    """Requests rejected during the half-open lease must not see a ~0s cooldown.
+
+    Once the single half-open probe is consumed, cooldown_until resets to 0
+    (see _http_bridge_precreated_retry_allowed), but the session stays
+    rejected until half_open_until. If cooldown-seconds reports 0 here, the
+    Retry-After it feeds (request_submit.py, streaming.py) tells the caller
+    it is safe to retry almost immediately, driving a bounded client retry
+    budget to exhaustion long before the lease actually clears (#followup to
+    #1534/#1485 quarantine work).
+    """
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    hard_session = _make_bridge_session(key_value="bridge-circuit-half-open-cooldown")
+    now = time.monotonic()
+    cast(Any, service)._http_bridge_retry_circuits[hard_session.key] = (
+        http_bridge_retry_circuit_module._HTTPBridgeRetryCircuitState(
+            consecutive_failures=2,
+            cooldown_until=now - 1.0,
+            last_detail="missing_response_created_timeout",
+            last_touched_monotonic=now,
+        )
+    )
+    service._durable_bridge = SimpleNamespace(lookup_retry_circuit=AsyncMock(return_value=None))
+
+    # First call consumes the single half-open probe slot.
+    assert await service._http_bridge_precreated_retry_allowed(hard_session) is True
+    # Second call is rejected: this is the state a real client's retry lands in.
+    assert await service._http_bridge_precreated_retry_allowed(hard_session) is False
+
+    cooldown = await service._http_bridge_precreated_retry_cooldown_seconds(hard_session)
+    assert cooldown > 30.0, "blocked half-open probe must report the real remaining wait, not ~0s"
+    assert (
+        cooldown
+        <= http_bridge_retry_circuit_module._HTTP_BRIDGE_RETRY_CIRCUIT_HALF_OPEN_LEASE_SECONDS
+    )
+
+
+@pytest.mark.asyncio
 async def test_http_bridge_retry_circuit_allows_fresh_hard_account_switch_during_cooldown() -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     request_state = proxy_service._WebSocketRequestState(
