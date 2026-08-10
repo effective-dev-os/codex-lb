@@ -937,6 +937,21 @@ async def _connect_upstream_websocket(
             **subprotocol_kwargs,
         )
     except asyncio.TimeoutError as exc:
+        # A connect-phase open_timeout is never classified by
+        # is_process_network_failure (it carries no socket/DNS errno), so unlike
+        # the post-connect send path this exception never reached
+        # _rotate_after_websocket_network_failure. When the shared SOCKS5-backed
+        # transport itself is the stale resource, every subsequent connect on it
+        # keeps timing out until something else discards it. Rotation is
+        # cooldown-gated and best-effort (network_recovery.py) so this is safe to
+        # call on every connect timeout, not just a confirmed network failure.
+        try:
+            await rotate_shared_http_transport(transport="websocket", request_id=get_request_id())
+        except Exception:
+            # Best-effort, matches _rotate_after_websocket_network_failure: never
+            # let a rotation failure replace the credential-safe timeout the
+            # owning request must surface.
+            logger.warning("Failed to rotate shared HTTP state after websocket connect timeout", exc_info=True)
         raise ProxyResponseError(
             502,
             openai_error("upstream_unavailable", "Request to upstream timed out"),

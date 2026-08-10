@@ -474,6 +474,76 @@ async def test_direct_websocket_network_send_and_receive_are_typed_and_rotate_wi
 
 
 @pytest.mark.asyncio
+async def test_connect_responses_websocket_connect_timeout_rotates_shared_transport(monkeypatch):
+    # A connect-phase open_timeout carries no socket/DNS errno, so it was never
+    # classified by is_process_network_failure and never reached rotation -
+    # unlike the post-connect send/receive path covered above. If the shared
+    # SOCKS5-backed transport itself is the stale resource, every subsequent
+    # connect attempt on it keeps timing out until something else discards it.
+    websocket_connect = AsyncMock(side_effect=asyncio.TimeoutError("open_timeout"))
+    rotate = AsyncMock(return_value="rotated")
+    monkeypatch.setattr(proxy_websocket_module, "websocket_connect", websocket_connect)
+    monkeypatch.setattr(proxy_websocket_module, "rotate_shared_http_transport", rotate)
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            proxy_downstream_websocket_idle_timeout_seconds=120.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=False,
+        ),
+    )
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await connect_responses_websocket(
+            {"openai-beta": "responses_websockets=2026-02-06"},
+            "access-token",
+            "account-123",
+            allow_direct_egress=True,
+        )
+
+    assert exc_info.value.status_code == 502
+    assert _proxy_error_code(exc_info.value) == "upstream_unavailable"
+    rotate.assert_awaited_once()
+    assert rotate.await_args.kwargs["transport"] == "websocket"
+
+
+@pytest.mark.asyncio
+async def test_connect_responses_websocket_connect_timeout_rotation_failure_preserves_original_error(monkeypatch):
+    # Rotation is best-effort - a broken rotation path must never replace the
+    # credential-safe timeout the owning request has to surface.
+    websocket_connect = AsyncMock(side_effect=asyncio.TimeoutError("open_timeout"))
+    rotate = AsyncMock(side_effect=RuntimeError("rotation exploded"))
+    monkeypatch.setattr(proxy_websocket_module, "websocket_connect", websocket_connect)
+    monkeypatch.setattr(proxy_websocket_module, "rotate_shared_http_transport", rotate)
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            proxy_downstream_websocket_idle_timeout_seconds=120.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=False,
+        ),
+    )
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await connect_responses_websocket(
+            {"openai-beta": "responses_websockets=2026-02-06"},
+            "access-token",
+            "account-123",
+            allow_direct_egress=True,
+        )
+
+    assert exc_info.value.status_code == 502
+    assert _proxy_error_code(exc_info.value) == "upstream_unavailable"
+    rotate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_connect_responses_websocket_routed_codex_call_preserves_size_limit(monkeypatch):
     route = ResolvedUpstreamRoute(
         mode="account_bound",
