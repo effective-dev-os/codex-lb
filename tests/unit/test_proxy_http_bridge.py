@@ -24,6 +24,7 @@ from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
 from app.core.auth.refresh import RefreshError
+from app.core.clients import proxy_websocket as proxy_websocket_module
 from app.core.clients.proxy import CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY, ProxyResponseError
 from app.core.clients.proxy_websocket import (
     UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
@@ -6806,6 +6807,123 @@ def _bridge_selection_settings() -> SimpleNamespace:
         prefer_earlier_reset_window="secondary",
         routing_strategy="usage_weighted",
     )
+
+
+async def _real_websocket_connect_timeout_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> ProxyResponseError:
+    """Produce the connect-timeout error through the real websocket code path.
+
+    Building it via connect_responses_websocket rather than by hand keeps the
+    bridge-level failover assertions below coupled to the actual raise site: if
+    its pre-dispatch provenance is ever dropped, this stops excluding the
+    account and the test fails instead of silently passing on a stale literal.
+    """
+
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "websocket_connect",
+        AsyncMock(side_effect=asyncio.TimeoutError("open_timeout")),
+    )
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "rotate_shared_http_transport",
+        AsyncMock(return_value="rotated"),
+    )
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            proxy_downstream_websocket_idle_timeout_seconds=120.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=False,
+        ),
+    )
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await proxy_websocket_module.connect_responses_websocket(
+            {"openai-beta": "responses_websockets=2026-02-06"},
+            "access-token",
+            "account-123",
+            allow_direct_egress=True,
+        )
+    return exc_info.value
+
+
+@pytest.mark.asyncio
+async def test_create_http_bridge_session_excludes_account_on_websocket_connect_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead account's connect timeout must move the session, not re-select it.
+
+    Regression for a live incident: an untagged connect timeout left the
+    account in the pool, so the balancer re-selected it for every request
+    (~90 failures / 5 min on one account while its siblings served fine) until
+    the process was restarted.
+    """
+
+    connect_timeout_error = await _real_websocket_connect_timeout_error(monkeypatch)
+    # Guard the premise: the bridge failover is gated on this provenance.
+    assert connect_timeout_error.failure_phase == "connect"
+    assert connect_timeout_error.retryable_same_contract is True
+
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    account_a = cast(Any, SimpleNamespace(id="acc-ws-timeout-a", status=AccountStatus.ACTIVE, plan_type="plus"))
+    account_b = cast(Any, SimpleNamespace(id="acc-ws-timeout-b", status=AccountStatus.ACTIVE, plan_type="plus"))
+    lease_a = proxy_service.AccountLease("lease-ws-timeout-a", account_a.id, "stream", time.monotonic())
+    lease_b = proxy_service.AccountLease("lease-ws-timeout-b", account_b.id, "stream", time.monotonic())
+    selections: list[set[str]] = []
+    backed_off_accounts: list[object] = []
+    released_leases: list[proxy_service.AccountLease] = []
+    upstream = cast(Any, SimpleNamespace(response_header=lambda _name: None, close=AsyncMock()))
+
+    async def select_account(_deadline: float, **kwargs: object) -> proxy_service.AccountSelection:
+        excluded = set(cast(set[str], kwargs["exclude_account_ids"]))
+        selections.append(excluded)
+        if not excluded:
+            return proxy_service.AccountSelection(account=account_a, error_message=None, lease=lease_a)
+        return proxy_service.AccountSelection(account=account_b, error_message=None, lease=lease_b)
+
+    async def release_account_lease(lease: proxy_service.AccountLease | None) -> None:
+        if lease is not None:
+            released_leases.append(lease)
+
+    async def record_error_backoff(account: object) -> None:
+        backed_off_accounts.append(account)
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: SimpleNamespace(get=AsyncMock(return_value=_bridge_selection_settings())),
+    )
+    monkeypatch.setattr(service, "_select_account_with_budget_compatible", select_account)
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(side_effect=[account_a, account_b]))
+    monkeypatch.setattr(
+        service,
+        "_open_upstream_websocket_with_budget",
+        AsyncMock(side_effect=[connect_timeout_error, upstream]),
+    )
+    monkeypatch.setattr(service._load_balancer, "release_account_lease", release_account_lease)
+    monkeypatch.setattr(service._load_balancer, "record_error_backoff", record_error_backoff)
+    monkeypatch.setattr(service._load_balancer, "record_error", AsyncMock())
+    monkeypatch.setattr(service, "_relay_http_bridge_upstream_messages", AsyncMock())
+
+    session = await service._create_http_bridge_session(
+        proxy_service._HTTPBridgeSessionKey("session_header", "sid-ws-timeout", None),
+        headers={},
+        affinity=proxy_service._AffinityPolicy(key="sid-ws-timeout"),
+        api_key=None,
+        request_model="gpt-5.4",
+        idle_ttl_seconds=120.0,
+    )
+
+    assert session.account is account_b
+    assert selections == [set(), {account_a.id}]
+    assert backed_off_accounts == [account_a]
+    assert lease_a in released_leases
+    assert lease_b not in released_leases
 
 
 @pytest.mark.asyncio

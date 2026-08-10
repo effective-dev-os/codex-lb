@@ -475,11 +475,12 @@ async def test_direct_websocket_network_send_and_receive_are_typed_and_rotate_wi
 
 @pytest.mark.asyncio
 async def test_connect_responses_websocket_connect_timeout_rotates_shared_transport(monkeypatch):
-    # A connect-phase open_timeout carries no socket/DNS errno, so it was never
-    # classified by is_process_network_failure and never reached rotation -
-    # unlike the post-connect send/receive path covered above. If the shared
-    # SOCKS5-backed transport itself is the stale resource, every subsequent
-    # connect attempt on it keeps timing out until something else discards it.
+    # The load-bearing assertion is the failover provenance, not the rotation:
+    # without retryable_same_contract/failure_phase="connect", the http_bridge
+    # pre-dispatch failover never excludes the account or records a backoff, so
+    # the load balancer re-selects the same dead account indefinitely (observed
+    # live on prod: ~90 timeouts/5min on one account while rotation ran on
+    # nearly every one of them and changed nothing).
     websocket_connect = AsyncMock(side_effect=asyncio.TimeoutError("open_timeout"))
     rotate = AsyncMock(return_value="rotated")
     monkeypatch.setattr(proxy_websocket_module, "websocket_connect", websocket_connect)
@@ -506,6 +507,13 @@ async def test_connect_responses_websocket_connect_timeout_rotates_shared_transp
 
     assert exc_info.value.status_code == 502
     assert _proxy_error_code(exc_info.value) == "upstream_unavailable"
+    # An open_timeout is pre-dispatch by definition: the WS handshake never
+    # completed, so no request bytes could have reached upstream. This
+    # provenance is what authorizes _HTTPBridgePreDispatchFailover to move the
+    # session off the failing account and record its backoff.
+    assert exc_info.value.failure_phase == "connect"
+    assert exc_info.value.retryable_same_contract is True
+    assert is_confirmed_pre_dispatch_transport_error(exc_info.value) is True
     rotate.assert_awaited_once()
     assert rotate.await_args.kwargs["transport"] == "websocket"
 
@@ -540,6 +548,11 @@ async def test_connect_responses_websocket_connect_timeout_rotation_failure_pres
 
     assert exc_info.value.status_code == 502
     assert _proxy_error_code(exc_info.value) == "upstream_unavailable"
+    # Failover provenance must survive a failed rotation: account exclusion is
+    # the actual fix, rotation is only a secondary best-effort measure.
+    assert exc_info.value.failure_phase == "connect"
+    assert exc_info.value.retryable_same_contract is True
+    assert is_confirmed_pre_dispatch_transport_error(exc_info.value) is True
     rotate.assert_awaited_once()
 
 

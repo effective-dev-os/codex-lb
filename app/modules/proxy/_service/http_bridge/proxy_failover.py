@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from app.core.clients.proxy import ProxyResponseError, is_confirmed_pre_dispatch_transport_error
@@ -7,6 +8,8 @@ from app.db.models import Account
 from app.modules.proxy._service.http_bridge.protocol import _HTTPBridgeServiceProtocol
 from app.modules.proxy._service.support import _DeferredAccountBackoffLifecycle
 from app.modules.proxy.load_balancer import AccountLease
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,4 +58,13 @@ class _HTTPBridgePreDispatchFailover:
         self.excluded_account_ids.add(account.id)
         self.preferred_account_id = None
         self.reallocate_sticky = True
+        # Without this the auto-mitigated case is silent: a persistently dead
+        # account stops producing visible 502s and simply disappears from
+        # selection, which is exactly the state an operator needs to see.
+        logger.info(
+            "Bridge pre-dispatch failover account_id=%s failure_detail=%s excluded_count=%d",
+            account.id,
+            exc.failure_detail,
+            len(self.excluded_account_ids),
+        )
         return True
