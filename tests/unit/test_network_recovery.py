@@ -11,6 +11,8 @@ import aiohttp
 import pytest
 from aiohttp.client_exceptions import ClientConnectorError
 from aiohttp.client_reqrep import ConnectionKey
+from aiohttp_socks import ProxyTimeoutError as SocksProxyTimeoutError
+from python_socks import ProxyTimeoutError as PythonSocksProxyTimeoutError
 
 import app.core.resilience.network_recovery as network_recovery
 
@@ -376,3 +378,39 @@ async def test_rotation_diagnostic_identifies_already_rotated_generation(monkeyp
     assert "stage=detected" in caplog.text
     assert "rotation=already_rotated" in caplog.text
     assert "request_id=req_coalesced" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        pytest.param(lambda: SocksProxyTimeoutError("Proxy connection timed out: 8.0"), id="aiohttp-socks"),
+        pytest.param(lambda: PythonSocksProxyTimeoutError("Proxy connection timed out: 8.0"), id="python-socks"),
+    ],
+)
+def test_socks_proxy_timeout_is_a_confirmed_pre_dispatch_failure(exc_factory) -> None:
+    # A SOCKS5 CONNECT that timed out never opened the tunnel, so nothing was
+    # dispatched and the request is safe to move to another account. Regression
+    # for a live incident: aiohttp_socks' variant subclasses bare Exception, so
+    # it was classified as neither pre-dispatch nor proxy-endpoint, leaving
+    # failover and backoff dormant for every degraded-proxy failure.
+    exc = exc_factory()
+    assert network_recovery.is_pre_dispatch_connection_failure(exc) is True
+    assert network_recovery.is_proxy_endpoint_failure(exc) is True
+
+
+def test_socks_proxy_timeout_is_classified_through_an_exception_chain() -> None:
+    # Real call sites re-raise, so the classifier must see it via __cause__.
+    try:
+        try:
+            raise SocksProxyTimeoutError("Proxy connection timed out: 8.0")
+        except SocksProxyTimeoutError as exc:
+            raise RuntimeError("upstream websocket failed") from exc
+    except RuntimeError as wrapper:
+        assert network_recovery.is_pre_dispatch_connection_failure(wrapper) is True
+        assert network_recovery.is_proxy_endpoint_failure(wrapper) is True
+
+
+def test_socks_proxy_timeout_is_not_a_process_network_failure() -> None:
+    # It must not be mistaken for host-wide DNS/route loss, which routes to the
+    # account-neutral recovery path instead of penalising the selected account.
+    assert network_recovery.is_process_network_failure(SocksProxyTimeoutError("timed out")) is False

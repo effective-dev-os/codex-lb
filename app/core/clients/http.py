@@ -185,6 +185,13 @@ async def _build_http_client() -> HttpClient:
             limit_per_host=settings.http_connector_limit_per_host,
             ssl=ssl_context,
             rdns=socks_config.rdns,
+            # Same reasoning as the TCPConnector branch below, and it matters
+            # MORE here: every dropped idle connection costs a fresh SOCKS5
+            # CONNECT through the proxy, so a short keepalive multiplies
+            # exposure to a degraded proxy on top of the TTFT cost.
+            # ttl_dns_cache is deliberately omitted - ProxyConnector forces
+            # NoResolver (rdns), so it would be a no-op here.
+            keepalive_timeout=90,
             socket_factory=_keepalive_socket_factory,
         )
     else:
@@ -212,6 +219,7 @@ async def _build_http_client() -> HttpClient:
                 socks_config.connector_url,
                 ssl=ssl_context,
                 rdns=socks_config.rdns,
+                keepalive_timeout=90,
                 socket_factory=_keepalive_socket_factory,
             )
             ws_trust_env = False
