@@ -11,7 +11,9 @@ from typing import Literal
 
 import aiohttp
 from aiohttp_socks import ProxyConnectionError as SocksProxyConnectionError
+from aiohttp_socks import ProxyTimeoutError as SocksProxyTimeoutError
 from python_socks import ProxyConnectionError as PythonSocksProxyConnectionError
+from python_socks import ProxyTimeoutError as PythonSocksProxyTimeoutError
 
 from app.core.clients.http import refresh_http_client_after_network_failure
 from app.core.utils.retry import backoff_seconds
@@ -83,6 +85,14 @@ def is_pre_dispatch_connection_failure(exc: BaseException) -> bool:
                 aiohttp.ConnectionTimeoutError,
                 SocksProxyConnectionError,
                 PythonSocksProxyConnectionError,
+                # A SOCKS5 CONNECT that timed out never opened the tunnel, so no
+                # request byte can have reached the destination. aiohttp_socks'
+                # variant subclasses bare Exception (not OSError), so without
+                # naming it explicitly every classifier here returns False and
+                # failover, backoff and same-contract retry all stay dormant for
+                # the whole class of degraded-proxy failures.
+                SocksProxyTimeoutError,
+                PythonSocksProxyTimeoutError,
             ),
         )
         for current in _exception_chain(exc)
@@ -95,7 +105,13 @@ def is_proxy_endpoint_failure(exc: BaseException) -> bool:
     return any(
         isinstance(
             current,
-            (aiohttp.ClientProxyConnectionError, SocksProxyConnectionError, PythonSocksProxyConnectionError),
+            (
+                aiohttp.ClientProxyConnectionError,
+                SocksProxyConnectionError,
+                PythonSocksProxyConnectionError,
+                SocksProxyTimeoutError,
+                PythonSocksProxyTimeoutError,
+            ),
         )
         for current in _exception_chain(exc)
     )
