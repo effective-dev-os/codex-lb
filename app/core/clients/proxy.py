@@ -587,6 +587,28 @@ def _rewrite_turn_metadata_installation_id(value: JsonValue, codex_installation_
     return json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
 
 
+def scope_prompt_cache_key_to_account(payload: dict[str, JsonValue], account_id: str | None) -> None:
+    """Namespace the outbound prompt_cache_key per upstream account.
+
+    A pooled deployment presents one conversation's cache key under every account it
+    fails over to, so a single value appears against several unrelated credentials —
+    a ready-made correlator that joins the pool into one system upstream.
+
+    Free to do, and probably a win: prompt caches are org-scoped, so after an account
+    switch the cache is cold whatever the key says, while one shared value makes the
+    routing hint compete across several caches at once. Internal affinity is untouched
+    — it resolved from the original value before account selection ran, and this only
+    rewrites the copy that leaves the process.
+    """
+    if not account_id:
+        return
+    cache_key = payload.get("prompt_cache_key")
+    if not isinstance(cache_key, str) or not cache_key:
+        return
+    scope = hashlib.sha256(account_id.encode()).hexdigest()[:8]
+    payload["prompt_cache_key"] = f"{scope}-{cache_key}"
+
+
 def apply_codex_installation_metadata(payload: dict[str, JsonValue], codex_installation_id: str | None) -> None:
     raw_metadata = payload.get("client_metadata")
     client_metadata: dict[str, JsonValue] = {}
@@ -2784,6 +2806,9 @@ async def _stream_responses_with_session(
         payload_size_estimate_bytes=payload_size_estimate_bytes,
     )
     payload_dict = websocket_payload_dict if transport == "websocket" else http_payload_dict
+    # After transport selection, so only the dict that actually leaves is rewritten,
+    # and before payload_json is rebuilt below so the serialized body carries it.
+    scope_prompt_cache_key_to_account(payload_dict, account_id)
     payload_json = json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
     if transport == "websocket":
         upstream_headers = _build_upstream_websocket_headers(headers, access_token, account_id)
@@ -3628,6 +3653,7 @@ class _CompactCommandTransport:
             payload_dict,
             responses_lite=_payload_uses_responses_lite(payload_dict),
         )
+        scope_prompt_cache_key_to_account(payload_dict, self.account_id)
         _apply_responses_lite_http_header(upstream_headers, payload_dict)
         try:
             validate_compact_input_wire_budget(payload_dict)
