@@ -14,6 +14,7 @@ import anyio
 
 from app.core import shutdown as shutdown_state
 from app.core.auth.refresh import RefreshError
+from app.core.balancer.logic import retry_hint_seconds
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
 from app.core.clients.files import finalize_file as core_finalize_file  # noqa: F401
 from app.core.clients.proxy import CodexControlResponse as CodexControlResponse
@@ -1755,7 +1756,9 @@ class _HTTPBridgeMixin(
                     and preferred_account_is_continuity_owner
                     and selection.error_code == CONTINUITY_OWNER_UNAVAILABLE
                 ):
-                    raise _http_bridge_previous_response_owner_unavailable_error()
+                    raise _http_bridge_previous_response_owner_unavailable_error(
+                        retry_hint_seconds(selection.error_message)
+                    )
                 status_code, error_payload = selection_failure_response(selection)
                 raise ProxyResponseError(status_code, error_payload)
             if require_preferred_account and preferred_account_id is not None and account.id != preferred_account_id:
@@ -1766,7 +1769,9 @@ class _HTTPBridgeMixin(
                     selected_account_id=account.id,
                 )
                 if preferred_account_is_continuity_owner:
-                    raise _http_bridge_previous_response_owner_unavailable_error()
+                    # The selector handed back a DIFFERENT account, so the owner was not gone —
+                    # it lost a capacity decision. Retrying can win it back.
+                    raise _http_bridge_previous_response_owner_unavailable_error(transient=True)
                 raise ProxyResponseError(
                     503,
                     openai_error(

@@ -1247,9 +1247,26 @@ QUOTA_EXCEEDED_COOLDOWN_SECONDS = 120.0
 SELECTOR_RETRY_HINT_MAX_SECONDS = 300
 
 
+# Exported so the response mapper can recognise its own hint. A selector failure carrying this
+# message knows when a retry will succeed, which makes it a rate limit rather than a gateway
+# fault — see selection_errors.selection_failure_response.
+SELECTOR_RETRY_HINT_PREFIX = "Rate limit exceeded. Try again in"
+
+
 def _format_retry_hint(wait_seconds: float) -> str:
     capped = min(max(0.0, wait_seconds), float(SELECTOR_RETRY_HINT_MAX_SECONDS))
-    return f"Rate limit exceeded. Try again in {capped:.0f}s"
+    return f"{SELECTOR_RETRY_HINT_PREFIX} {capped:.0f}s"
+
+
+def retry_hint_seconds(message: str | None) -> float | None:
+    """Seconds from a selector retry-hint message, or None if it is not one."""
+    if not message or not message.startswith(SELECTOR_RETRY_HINT_PREFIX):
+        return None
+    tail = message[len(SELECTOR_RETRY_HINT_PREFIX) :].strip().rstrip("s")
+    try:
+        return max(0.0, float(tail))
+    except ValueError:
+        return None
 
 
 def handle_quota_exceeded(state: AccountState, error: UpstreamError) -> None:

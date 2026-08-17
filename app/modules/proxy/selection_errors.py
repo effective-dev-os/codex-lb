@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from app.core.balancer.logic import retry_hint_seconds
 from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.resilience.overload import is_local_overload_error_code
 
@@ -38,4 +39,14 @@ def selection_failure_response(selection: SelectionFailure) -> tuple[int, OpenAI
         )
     if is_local_overload_error_code(code):
         return 429, openai_error(code, message, error_type="rate_limit_error")
+    # A selector failure that already carries "Try again in Ns" is a rate limit: the pool is
+    # momentarily out of capacity and the wait is known. Returning 503 made every client surface
+    # it as a hard gateway error and stop, so a 60-second dip was shown to the user instead of
+    # being waited out. 429 rate_limit_error is the class LiteLLM and Codex CLI already back off
+    # on, and resets_at carries the deadline.
+    if retry_hint_seconds(message) is not None:
+        return (
+            429,
+            openai_error(code, message, error_type="rate_limit_error", resets_at=selection.resets_at),
+        )
     return 503, openai_error(code, message)

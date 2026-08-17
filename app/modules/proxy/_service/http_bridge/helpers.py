@@ -2373,7 +2373,40 @@ def _mark_http_bridge_reader_handoff_reconnect_failed(session: Any, old_reader: 
         session.closed = True
 
 
-def _http_bridge_previous_response_owner_unavailable_error() -> ProxyResponseError:
+def _http_bridge_previous_response_owner_unavailable_error(
+    retry_after_seconds: float | None = None,
+    *,
+    transient: bool = False,
+) -> ProxyResponseError:
+    """The conversation's account could not be used.
+
+    Two very different causes reach here and they need different answers. If the account is
+    merely at its rate limit or momentarily unselectable, retrying DOES work and telling the user
+    to start over destroys a conversation for nothing — measured 2026-08-17, 78 of these in 40
+    minutes while the owning account was healthy and the pool was simply out of short-term
+    capacity, so every one of them was advice that could not help. Only when the owner is
+    unavailable with no known deadline is "start a new conversation" the truth.
+    """
+    if retry_after_seconds is not None:
+        return ProxyResponseError(
+            429,
+            openai_error(
+                "previous_response_owner_rate_limited",
+                "The account holding this conversation is at its rate limit. "
+                f"Retry in {retry_after_seconds:.0f}s — starting a new conversation will not help.",
+                error_type="rate_limit_error",
+            ),
+        )
+    if transient:
+        return ProxyResponseError(
+            429,
+            openai_error(
+                "previous_response_owner_busy",
+                "The account holding this conversation is busy. Retry shortly — "
+                "starting a new conversation will not help.",
+                error_type="rate_limit_error",
+            ),
+        )
     return ProxyResponseError(
         502,
         openai_error(
