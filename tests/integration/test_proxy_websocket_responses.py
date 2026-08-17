@@ -9535,7 +9535,7 @@ def test_backend_responses_websocket_previous_response_usage_limit_returns_upstr
 
     assert event["type"] == "response.failed"
     assert event["response"]["error"]["code"] == "upstream_unavailable"
-    assert event["response"]["error"]["message"] == "Previous response owner account is unavailable; retry later."
+    assert event["response"]["error"]["message"] == "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
     assert connect_models == ["gpt-5.1"]
     assert captured_preferred_accounts == ["acct_ws_proxy_owner"]
     assert handled_error_codes == ["usage_limit_reached"]

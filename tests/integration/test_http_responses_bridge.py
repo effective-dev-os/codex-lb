@@ -7523,7 +7523,7 @@ async def test_v1_responses_http_bridge_reports_unavailable_required_owner_when_
 
     assert second.status_code == 502
     assert second.json()["error"] == {
-        "message": "Previous response owner account is unavailable; retry later.",
+        "message": "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
         "type": "server_error",
         "code": "previous_response_owner_unavailable",
     }

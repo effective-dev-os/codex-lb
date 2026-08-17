@@ -12037,7 +12037,7 @@ async def test_stream_via_http_bridge_preserves_context_after_owner_unavailable(
             "error": {
                 "type": "server_error",
                 "code": owner_error_code,
-                "message": "Previous response owner account is unavailable; retry later.",
+                "message": "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
             }
         },
     )
@@ -21639,7 +21639,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
         502,
         proxy_service.openai_error(
             "previous_response_owner_unavailable",
-            "Previous response owner account is unavailable; retry later.",
+            "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
             error_type="server_error",
         ),
     )
@@ -22045,7 +22045,7 @@ async def test_durable_model_transition_preserves_owner_provenance_when_replacin
         502,
         openai_error(
             "previous_response_owner_unavailable",
-            "Previous response owner account is unavailable; retry later.",
+            "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
         ),
     )
     first_session: proxy_service._HTTPBridgeSession | None = None

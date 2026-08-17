@@ -2013,7 +2013,7 @@ class _HTTPBridgeStreamingMixin:
                 502,
                 openai_error(
                     "previous_response_owner_unavailable",
-                    "Previous response owner account is unavailable; retry later.",
+                    "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
                 ),
             )
             _record_continuity_fail_closed(

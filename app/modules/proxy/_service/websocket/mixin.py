@@ -3432,7 +3432,7 @@ class _WebSocketMixin:
             and account.id != preferred_account_id
         ):
             await proxy._load_balancer.release_account_lease(selection.lease)
-            message = "Previous response owner account is unavailable; retry later."
+            message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
             _record_continuity_fail_closed(
                 surface="websocket_connect",
                 reason="owner_account_unavailable",
@@ -3510,7 +3510,7 @@ class _WebSocketMixin:
                     error_message=error_message,
                 )
                 return None
-            message = "Previous response owner account is unavailable; retry later."
+            message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
             _record_continuity_fail_closed(
                 surface="websocket_connect",
                 reason="owner_account_unavailable",

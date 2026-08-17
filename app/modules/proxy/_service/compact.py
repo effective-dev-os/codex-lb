@@ -660,7 +660,7 @@ class _CompactMixin:
                     else None,
                 )
                 if len(selection_inputs.accounts) != 1:
-                    message = "Previous response owner account is unavailable; retry later."
+                    message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
                     _record_continuity_fail_closed(
                         surface="compact",
                         reason="owner_account_unavailable",

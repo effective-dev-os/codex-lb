@@ -538,7 +538,7 @@ def _rewrite_previous_response_stream_error(
         )
         return (
             "previous_response_owner_unavailable",
-            "Previous response owner account is unavailable; retry later.",
+            "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
             normalized_code,
         )
     return None

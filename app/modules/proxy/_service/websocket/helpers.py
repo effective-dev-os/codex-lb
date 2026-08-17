@@ -1309,7 +1309,7 @@ def _rewrite_websocket_previous_response_owner_unavailable_event(
     )
     rewritten_event_payload = response_failed_event(
         "upstream_unavailable",
-        "Previous response owner account is unavailable; retry later.",
+        "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
         error_type="server_error",
         response_id=_websocket_downstream_response_id(request_state),
     )
