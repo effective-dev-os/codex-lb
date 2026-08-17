@@ -1332,7 +1332,7 @@ class _StreamingRetryMixin:
                         account_ids=None,
                     )
                     if len(selection_inputs.accounts) != 1:
-                        message = "Previous response owner account is unavailable; retry later."
+                        message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
                         _record_continuity_fail_closed(
                             surface="http_stream",
                             reason="owner_account_unavailable",
@@ -1767,7 +1767,7 @@ class _StreamingRetryMixin:
                         return
                     if require_preferred_account and preferred_account_id is not None:
                         error_code = "previous_response_owner_unavailable"
-                        message = "Previous response owner account is unavailable; retry later."
+                        message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
                         reason = "owner_account_unavailable"
                         upstream_error_code = "no_accounts"
                         if selection.error_code == "continuity_owner_conflict":
@@ -1921,7 +1921,7 @@ class _StreamingRetryMixin:
                         )
                     else:
                         error_code = "previous_response_owner_unavailable"
-                        message = "Previous response owner account is unavailable; retry later."
+                        message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
                         reason = "owner_account_unavailable"
                         upstream_error_code = "upstream_unavailable"
                         if selection.error_code == "continuity_owner_conflict":
