@@ -12,6 +12,7 @@ from typing import Any, cast
 import pytest
 
 import app.modules.proxy.load_balancer as load_balancer_module
+from app.core.balancer import NO_ACCOUNTS_CONFIGURED
 from app.core.balancer.types import UpstreamError
 from app.core.crypto import TokenEncryptor
 from app.core.openai.model_registry import (
@@ -3352,9 +3353,9 @@ async def test_select_account_empty_pool_preserves_no_accounts_for_modeled_reque
     selection = await balancer.select_account(model="gpt-5.3-codex")
 
     assert selection.account is None
-    assert selection.error_code is None
+    assert selection.error_code == NO_ACCOUNTS_CONFIGURED
     assert selection.error_message is not None
-    assert "No available accounts" in selection.error_message
+    assert "No accounts are configured" in selection.error_message
 
 
 @pytest.mark.asyncio

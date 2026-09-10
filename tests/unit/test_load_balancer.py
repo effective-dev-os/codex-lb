@@ -11,6 +11,8 @@ import pytest
 
 from app.core import usage as usage_core
 from app.core.balancer import (
+    ALL_ACCOUNTS_QUOTA_EXCEEDED,
+    ALL_ACCOUNTS_RATE_LIMITED,
     HEALTH_TIER_DRAINING,
     HEALTH_TIER_HEALTHY,
     HEALTH_TIER_PROBING,
@@ -798,7 +800,7 @@ def test_select_account_requires_usage_window_evidence_for_quota_exhaustion():
     result = select_account(states, now=now)
 
     assert result.account is None
-    assert result.error_code is None
+    assert result.error_code == ALL_ACCOUNTS_QUOTA_EXCEEDED
     assert result.error_message == "Rate limit exceeded. Try again in 300s"
 
 
@@ -816,7 +818,7 @@ def test_select_account_can_disable_pool_usage_exhaustion_for_owner_scope():
     result = select_account(states, now=now, allow_usage_exhaustion_error=False)
 
     assert result.account is None
-    assert result.error_code is None
+    assert result.error_code == ALL_ACCOUNTS_QUOTA_EXCEEDED
     assert result.error_message == "Rate limit exceeded. Try again in 300s"
 
 
@@ -849,7 +851,7 @@ def test_budget_safe_selection_uses_full_scope_for_usage_exhaustion() -> None:
     )
 
     assert result.account is None
-    assert result.error_code is None
+    assert result.error_code == ALL_ACCOUNTS_QUOTA_EXCEEDED
     assert result.error_message == "Rate limit exceeded. Try again in 300s"
 
 
@@ -883,7 +885,7 @@ def test_budget_safe_capacity_selection_forwards_usage_exhaustion_controls() -> 
     )
 
     assert result.account is None
-    assert result.error_code is None
+    assert result.error_code == ALL_ACCOUNTS_QUOTA_EXCEEDED
     assert result.error_message == "Rate limit exceeded. Try again in 300s"
 
 
@@ -917,7 +919,7 @@ def test_opportunistic_budget_safe_selection_uses_full_scope_for_usage_exhaustio
     )
 
     assert result.account is None
-    assert result.error_code is None
+    assert result.error_code == ALL_ACCOUNTS_QUOTA_EXCEEDED
     assert result.error_message == "Rate limit exceeded. Try again in 300s"
 
 
@@ -936,7 +938,7 @@ def test_select_account_uses_raw_priority_usage_for_exhaustion_evidence() -> Non
     result = select_account(states, now=now)
 
     assert result.account is None
-    assert result.error_code is None
+    assert result.error_code == ALL_ACCOUNTS_RATE_LIMITED
     assert result.error_message == "No available accounts"
 
 
@@ -950,7 +952,7 @@ def test_select_account_does_not_treat_generic_rate_limit_as_usage_exhaustion():
     result = select_account(states, now=now)
 
     assert result.account is None
-    assert result.error_code is None
+    assert result.error_code == ALL_ACCOUNTS_RATE_LIMITED
     assert result.error_message == "No available accounts"
 
 
@@ -995,7 +997,7 @@ def test_select_account_excludes_per_account_standard_quota_bypass_from_pool_exh
     result = select_account([state], now=now)
 
     assert result.account is None
-    assert result.error_code is None
+    assert result.error_code == ALL_ACCOUNTS_QUOTA_EXCEEDED
 
 
 def test_select_account_excludes_scoped_standard_quota_bypass_from_pool_exhaustion():
@@ -1010,7 +1012,7 @@ def test_select_account_excludes_scoped_standard_quota_bypass_from_pool_exhausti
     result = select_account([state], now=now, bypass_quota_exceeded_account_ids={"quota"})
 
     assert result.account is None
-    assert result.error_code is None
+    assert result.error_code == ALL_ACCOUNTS_QUOTA_EXCEEDED
 
 
 def test_select_account_reports_paused_and_deactivated_without_reauth_reason():

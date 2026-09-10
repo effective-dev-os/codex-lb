@@ -17,6 +17,7 @@ from app.core.balancer import (
     HEALTH_TIER_DRAINING,
     HEALTH_TIER_HEALTHY,
     HEALTH_TIER_PROBING,
+    POOL_UNAVAILABLE_ERROR_CODES,
     QUOTA_EXCEEDED_COOLDOWN_SECONDS,
     RATE_LIMITED_MIN_COOLDOWN_SECONDS,
     ROUTING_POLICY_BURN_FIRST,
@@ -38,7 +39,7 @@ from app.core.balancer import (
 from app.core.balancer import (
     select_account as select_account,
 )
-from app.core.balancer.types import UpstreamError
+from app.core.balancer.types import AccountStatusCensus, UpstreamError
 from app.core.config import settings as config_settings
 from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
@@ -660,7 +661,8 @@ class LoadBalancer:
 
         selection_inputs = await load_selection_inputs()
         caps = concurrency_caps or effective_account_concurrency_caps()
-        circuit_breaker_open = _is_upstream_circuit_breaker_open()
+        configured_accounts = selection_inputs.runtime_accounts or selection_inputs.accounts
+        circuit_breaker_open = _is_upstream_circuit_breaker_open(account.id for account in configured_accounts)
         if circuit_breaker_open:
             set_degraded("upstream circuit breaker is open")
         elif (
@@ -845,8 +847,11 @@ class LoadBalancer:
                     error_message=error_message,
                     error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
                 )
-            if error_message == "No available accounts" and not owner_restricted_selection:
-                set_degraded("all upstream accounts are unavailable")
+            uncoded_empty_pool = selection_error_code is None and error_message == "No available accounts"
+            if (
+                selection_error_code in POOL_UNAVAILABLE_ERROR_CODES or uncoded_empty_pool
+            ) and not owner_restricted_selection:
+                set_degraded(_degraded_pool_reason(selection_inputs.runtime_accounts or selection_inputs.accounts))
                 error_message = _format_degraded_error_message(error_message)
             elif (
                 not owner_restricted_selection
@@ -1544,6 +1549,7 @@ class LoadBalancer:
         ignore_standard_quota: bool = False,
         allow_usage_exhaustion_error: bool = True,
         usage_exhaustion_states: Iterable[AccountState] | None = None,
+        status_census: AccountStatusCensus | None = None,
     ) -> _StickySelectionOutcome:
         return await _run_select_with_stickiness(
             states=states,
@@ -3038,11 +3044,35 @@ def _additional_usage_is_exhausted(entry: AdditionalUsageHistory) -> bool:
     return float(entry.used_percent) >= 100.0
 
 
-def _is_upstream_circuit_breaker_open() -> bool:
+def _is_upstream_circuit_breaker_open(account_ids: Iterable[str]) -> bool:
     settings = get_settings()
     if not getattr(settings, "circuit_breaker_enabled", False):
         return False
-    return are_all_account_circuit_breakers_open()
+    return are_all_account_circuit_breakers_open(account_ids)
+
+
+_DEGRADED_STATUS_PHRASES: tuple[tuple[AccountStatus, str], ...] = (
+    (AccountStatus.PAUSED, "paused"),
+    (AccountStatus.DEACTIVATED, "deactivated"),
+    (AccountStatus.REAUTH_REQUIRED, "awaiting re-authentication"),
+    (AccountStatus.RATE_LIMITED, "rate limited"),
+    (AccountStatus.QUOTA_EXCEEDED, "over quota"),
+)
+
+
+def _degraded_pool_reason(accounts: Iterable[Account]) -> str:
+    census = AccountStatusCensus.from_statuses(account.status for account in accounts)
+    if census.total == 0:
+        return "no accounts are configured"
+    for status, phrase in _DEGRADED_STATUS_PHRASES:
+        if census.count(status) == census.total:
+            return f"{census.total} of {census.total} accounts are {phrase}"
+    if census.count(*(status for status, _ in _DEGRADED_STATUS_PHRASES)) == census.total:
+        breakdown = ", ".join(
+            f"{census.count(status)} {phrase}" for status, phrase in _DEGRADED_STATUS_PHRASES if census.count(status)
+        )
+        return f"none of {census.total} accounts are available ({breakdown})"
+    return "all upstream accounts are unavailable"
 
 
 def _format_degraded_error_message(message: str | None) -> str:
