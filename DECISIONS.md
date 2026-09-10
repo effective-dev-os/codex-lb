@@ -95,3 +95,85 @@ current decomposition direction and prevent accidental regression:
 - CI can enforce architectural ratchets through `scripts/check_proxy_architecture.py`
 - The accepted thresholds are starting ratchets, not final goals; future PRs
   should lower them after major domain packages are extracted
+
+## ADR-0002: Degradation is declared from account-status evidence, never from selector prose
+
+- **Date:** 2026-09-10
+- **Status:** Accepted
+- **Scope:** `app/core/balancer/`, `app/modules/proxy/load_balancer.py`,
+  `app/core/resilience/circuit_breaker.py`
+
+### Context
+
+An administratively dead pool reported `"No available accounts"` with no
+`error_code`, and `LoadBalancer` string-matched that prose to declare the whole
+fleet degraded. The most evidence-starved path in the selector was the only one
+wired to global degradation.
+
+The evidence was never lost. `_selectable_accounts()` drops every account whose
+status is `PAUSED`, `DEACTIVATED` or `REAUTH_REQUIRED` before the states the
+selector classifies are built, but `selection_inputs.runtime_accounts` still
+carries those accounts. Nothing consulted them, so every status-classification
+arm in `select_account` filtered an already-empty list and produced nothing.
+
+Measured cost, 2026-09-03..09-10: four accounts were deactivated by a 404 from
+the ChatGPT usage endpoint, the pool served zero completions for seven days,
+and the only thing anyone could read was `"No available accounts. Service is
+operating in degraded mode: all upstream accounts are unavailable"` — a
+sentence that names neither the condition nor the remedy.
+
+A second, independent defect compounded it: `are_all_account_circuit_breakers_open()`
+quantified `all()` over a lazily populated dict, so one OPEN breaker for the
+single account that had ever failed satisfied the quantifier and declared a
+healthy fleet degraded.
+
+### Decision
+
+Degradation is declared from a typed selection code backed by an account-status
+census, not from the text of an error message.
+
+- `AccountStatusCensus` carries per-status counts for the configured fleet.
+  It is **advisory only**: it may not enter a candidate pool, a sort key, or a
+  strategy branch. Selection order for a pool with at least one selectable
+  account is unchanged.
+- The selector classifies an empty candidate pool from the census and returns a
+  typed code plus a message naming the real condition
+  (`"3 of 3 accounts are paused"`).
+- The census speaks only when it covers the whole configured fleet. A pool
+  narrowed by request scope — owner-restricted continuity, for one — still falls
+  through as before, so one blocked account is never reported as a fleet-wide
+  condition.
+- `LoadBalancer` escalates on membership in the typed-code set. The prose match
+  is retained solely as the fallback for the still-uncoded empty-pool case, so
+  no escalation that fires today stops firing.
+- A circuit breaker that does not exist means an account that has never failed.
+  `are_all_account_circuit_breakers_open()` takes the configured account ids and
+  treats a missing breaker as closed.
+
+Every new code is registered in both literal registries outside
+`selection_errors.py` — `_UNAVAILABLE_SELECTION_ERROR_CODES` (unlisted codes
+fall through to 502) and `_LOCAL_PROXY_ERROR_CODES` (failure-log attribution
+and the stream-error rewrite). A code added to one and not the other is a
+silent behavior change, not a partial rollout.
+
+### Alternatives considered
+
+| Alternative | Why rejected |
+| --- | --- |
+| Keep the prose match, improve the wording | The defect is that a string is the contract; a better string is the same defect |
+| Let paused/deactivated accounts through the filter | Fail-closed there is deliberate; the bug is illegibility, not exclusion |
+| Return 429 instead of 503 for a dead pool | The status code is not the lever — a client router treats 408/409/429 and everything >=500 as retry-eligible alike |
+| Report the census from the dashboard only | The engineer reading a 503 body is the one who needs it |
+
+### Consequences
+
+- A whole-fleet `RATE_LIMITED` or `QUOTA_EXCEEDED` census now carries a code
+  where all three returns previously carried none.
+- Callers that branched on the message text must branch on `error_code`.
+  `_account_selection_recovery_sleep_seconds` was updated accordingly; its
+  invariant — an administratively dead pool gets no recovery sleep — is
+  unchanged.
+- The typed code is legible to a human reading `error.message` through a
+  LiteLLM proxy, not to a client branching on `error.code`: LiteLLM discards the
+  upstream envelope and stamps `code = str(status_code)`.
+- This makes the failure legible. It does not make a dead pool serve traffic.
