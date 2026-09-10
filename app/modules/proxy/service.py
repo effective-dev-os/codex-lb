@@ -18,6 +18,7 @@ from app.core.auth.refresh import (
 )
 from app.core.balancer import (
     PERMANENT_FAILURE_CODES,
+    POOL_UNAVAILABLE_ERROR_CODES,
     TRAFFIC_CLASS_FOREGROUND,
     TRAFFIC_CLASS_OPPORTUNISTIC,
     ResetPreferenceWindow,
@@ -2225,7 +2226,7 @@ def _proxy_response_error_code(exc: ProxyResponseError) -> str | None:
     return _normalize_error_code(error.code, error.type)
 
 
-_LOCAL_PROXY_ERROR_CODES = frozenset(
+_LOCAL_PROXY_ERROR_CODES = POOL_UNAVAILABLE_ERROR_CODES | frozenset(
     {
         "bridge_owner_forward_failed",
         "bridge_instance_mismatch",

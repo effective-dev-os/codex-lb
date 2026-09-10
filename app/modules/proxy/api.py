@@ -45,6 +45,7 @@ from app.core.auth.dependencies import (
     validate_usage_api_key,
 )
 from app.core.auth.refresh import RefreshError
+from app.core.balancer import POOL_UNAVAILABLE_ERROR_CODES
 from app.core.cache.invalidation import NAMESPACE_RESET_CREDITS, bump_cache_invalidation_local
 from app.core.clients.files import FileProxyError
 from app.core.clients.proxy import (
@@ -659,7 +660,7 @@ _UNAVAILABLE_SELECTION_ERROR_CODES = {
     "additional_quota_data_unavailable",
     "quota_exhausted",
     "no_additional_quota_eligible_accounts",
-}
+} | set(POOL_UNAVAILABLE_ERROR_CODES)
 _STREAM_STARTUP_ERROR_PROBE_SECONDS = 0.05
 _CAPACITY_WAIT_MARKER_GRACE_SECONDS = 0.05
 # Keep bridge startup probing above tiny event-loop scheduling jitter:

@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import Collection, Iterable, Literal
 
-from app.core.balancer.types import FailureClass, UpstreamError
+from app.core.balancer.types import AccountStatusCensus, FailureClass, UpstreamError
 from app.core.usage import PLAN_CAPACITY_CREDITS_SECONDARY
 from app.core.utils.retry import backoff_seconds, parse_retry_after
 from app.db.models import AccountStatus
@@ -162,6 +162,59 @@ class SelectionResult:
 
 
 USAGE_LIMIT_REACHED = "usage_limit_reached"
+
+NO_ACCOUNTS_CONFIGURED = "no_accounts_configured"
+ALL_ACCOUNTS_PAUSED = "all_accounts_paused"
+ALL_ACCOUNTS_DEACTIVATED = "all_accounts_deactivated"
+ALL_ACCOUNTS_REAUTH_REQUIRED = "all_accounts_reauth_required"
+ALL_ACCOUNTS_ADMINISTRATIVELY_UNAVAILABLE = "all_accounts_administratively_unavailable"
+ALL_ACCOUNTS_RATE_LIMITED = "all_accounts_rate_limited"
+ALL_ACCOUNTS_QUOTA_EXCEEDED = "all_accounts_quota_exceeded"
+
+# Whole-pool conditions: the whole configured fleet, not one request's scope,
+# cannot serve traffic. Degradation is declared from membership here instead of
+# from selector prose.
+POOL_UNAVAILABLE_ERROR_CODES = frozenset(
+    {
+        NO_ACCOUNTS_CONFIGURED,
+        ALL_ACCOUNTS_PAUSED,
+        ALL_ACCOUNTS_DEACTIVATED,
+        ALL_ACCOUNTS_REAUTH_REQUIRED,
+        ALL_ACCOUNTS_ADMINISTRATIVELY_UNAVAILABLE,
+        ALL_ACCOUNTS_RATE_LIMITED,
+        ALL_ACCOUNTS_QUOTA_EXCEEDED,
+    }
+)
+
+_CENSUS_STATUS_CODES: tuple[tuple[AccountStatus, str, str], ...] = (
+    (AccountStatus.PAUSED, ALL_ACCOUNTS_PAUSED, "are paused"),
+    (AccountStatus.DEACTIVATED, ALL_ACCOUNTS_DEACTIVATED, "are deactivated"),
+    (AccountStatus.REAUTH_REQUIRED, ALL_ACCOUNTS_REAUTH_REQUIRED, "require re-authentication"),
+)
+
+
+def census_selection_failure(census: AccountStatusCensus) -> SelectionResult | None:
+    """Explain an empty candidate pool from configured account statuses.
+
+    Returns ``None`` when the census cannot explain it -- some account is
+    routable and the pool was emptied by request scope, not by account status.
+    """
+    if census.total == 0:
+        return SelectionResult(None, "No accounts are configured", error_code=NO_ACCOUNTS_CONFIGURED)
+    blocked = census.count(*(status for status, _, _ in _CENSUS_STATUS_CODES))
+    if blocked != census.total:
+        return None
+    for status, code, phrase in _CENSUS_STATUS_CODES:
+        if census.count(status) == census.total:
+            return SelectionResult(None, f"{census.total} of {census.total} accounts {phrase}", error_code=code)
+    breakdown = ", ".join(
+        f"{census.count(status)} {status.value}" for status, _, _ in _CENSUS_STATUS_CODES if census.count(status)
+    )
+    return SelectionResult(
+        None,
+        f"{census.total} of {census.total} accounts are administratively unavailable ({breakdown})",
+        error_code=ALL_ACCOUNTS_ADMINISTRATIVELY_UNAVAILABLE,
+    )
 
 
 def pool_usage_exhaustion(
@@ -486,6 +539,7 @@ def select_account(
     selection_seed: str | None = None,
     allow_usage_exhaustion_error: bool = True,
     usage_exhaustion_states: Iterable[AccountState] | None = None,
+    status_census: AccountStatusCensus | None = None,
 ) -> SelectionResult:
     """Select an eligible account by applying availability checks and routing strategy.
 
@@ -549,6 +603,9 @@ def select_account(
             via ``configure_replica_salt`` (else the host identity) is used. It
             affects only the final tie-break; the primary usage/health/cost
             ordering is unchanged.
+        status_census: Optional status counts for every configured account,
+            used only to explain an empty candidate pool. It never enters a
+            candidate pool, a sort key, or a strategy branch.
 
     Returns:
         A ``SelectionResult`` containing the selected ``AccountState`` and no
@@ -662,6 +719,20 @@ def select_account(
             rate_limited = [s for s in all_states if s.status == AccountStatus.RATE_LIMITED]
             quota_exceeded = [s for s in all_states if s.status == AccountStatus.QUOTA_EXCEEDED]
 
+            if not all_states and status_census is not None:
+                census_failure = census_selection_failure(status_census)
+                if census_failure is not None:
+                    return census_failure
+
+            # "All" only when these states are both the whole candidate list
+            # and the whole configured fleet. An owner-restricted or otherwise
+            # narrowed list would otherwise report one blocked account as a
+            # fleet-wide condition.
+            usage_blocked_code: str | None = None
+            covers_configured_pool = status_census is None or status_census.total == len(all_states)
+            if all_states and covers_configured_pool and len(rate_limited) + len(quota_exceeded) == len(all_states):
+                usage_blocked_code = ALL_ACCOUNTS_QUOTA_EXCEEDED if quota_exceeded else ALL_ACCOUNTS_RATE_LIMITED
+
             if not rate_limited and not quota_exceeded:
                 if paused and expired_reauth and deactivated:
                     return SelectionResult(None, "All accounts are paused, deactivated, or require re-authentication")
@@ -681,12 +752,12 @@ def select_account(
                 reset_candidates = [s.reset_at for s in quota_exceeded if s.reset_at]
                 if reset_candidates:
                     wait_seconds = max(0, min(reset_candidates) - int(current))
-                    return SelectionResult(None, _format_retry_hint(wait_seconds))
+                    return SelectionResult(None, _format_retry_hint(wait_seconds), error_code=usage_blocked_code)
             cooldowns = [s.cooldown_until for s in all_states if s.cooldown_until and s.cooldown_until > current]
             if cooldowns:
                 wait_seconds = max(0.0, min(cooldowns) - current)
-                return SelectionResult(None, _format_retry_hint(wait_seconds))
-            return SelectionResult(None, "No available accounts")
+                return SelectionResult(None, _format_retry_hint(wait_seconds), error_code=usage_blocked_code)
+            return SelectionResult(None, "No available accounts", error_code=usage_blocked_code)
 
     def _reset_first_sort_key(state: AccountState) -> tuple[int, float, float, float, float, str]:
         reset_bucket_days = _reset_preference_bucket(state, current, prefer_earlier_reset_window)

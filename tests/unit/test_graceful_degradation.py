@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Iterator, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.core.balancer import (
+    ALL_ACCOUNTS_ADMINISTRATIVELY_UNAVAILABLE,
+    ALL_ACCOUNTS_DEACTIVATED,
+    ALL_ACCOUNTS_PAUSED,
+    ALL_ACCOUNTS_QUOTA_EXCEEDED,
+    ALL_ACCOUNTS_RATE_LIMITED,
+    ALL_ACCOUNTS_REAUTH_REQUIRED,
+    NO_ACCOUNTS_CONFIGURED,
+)
 from app.core.openai.model_registry import ModelRegistry, ReasoningLevel, UpstreamModel
 from app.core.resilience.degradation import get_status, is_degraded, set_degraded, set_normal
+from app.db.models import Account, AccountStatus
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.proxy import load_balancer as load_balancer_module
@@ -176,8 +188,9 @@ async def test_load_balancer_returns_degraded_message_when_no_accounts_available
     selection = await balancer.select_account()
 
     assert selection.account is None
+    assert selection.error_code == NO_ACCOUNTS_CONFIGURED
     assert selection.error_message == (
-        "No available accounts. Service is operating in degraded mode: all upstream accounts are unavailable"
+        "No accounts are configured. Service is operating in degraded mode: no accounts are configured"
     )
     assert is_degraded() is True
 
@@ -211,4 +224,125 @@ async def test_load_balancer_clears_stale_degraded_state_for_typed_selection_err
 
     assert selection.account is None
     assert selection.error_code == load_balancer_module.NO_PLAN_SUPPORT_FOR_MODEL
+    assert is_degraded() is False
+
+
+def _configured_account(account_id: str, status: AccountStatus) -> Account:
+    return Account(
+        id=account_id,
+        chatgpt_account_id=f"workspace-{account_id}",
+        email=f"{account_id}@example.com",
+        plan_type="plus",
+        access_token_encrypted=b"access",
+        refresh_token_encrypted=b"refresh",
+        id_token_encrypted=b"id",
+        last_refresh=datetime.now(timezone.utc),
+        status=status,
+        deactivation_reason=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("statuses", "error_code", "error_message", "degraded_reason"),
+    [
+        (
+            [AccountStatus.PAUSED] * 3,
+            ALL_ACCOUNTS_PAUSED,
+            "3 of 3 accounts are paused",
+            "3 of 3 accounts are paused",
+        ),
+        (
+            [AccountStatus.DEACTIVATED] * 3,
+            ALL_ACCOUNTS_DEACTIVATED,
+            "3 of 3 accounts are deactivated",
+            "3 of 3 accounts are deactivated",
+        ),
+        (
+            [AccountStatus.REAUTH_REQUIRED] * 3,
+            ALL_ACCOUNTS_REAUTH_REQUIRED,
+            "3 of 3 accounts require re-authentication",
+            "3 of 3 accounts are awaiting re-authentication",
+        ),
+        (
+            [AccountStatus.PAUSED, AccountStatus.PAUSED, AccountStatus.DEACTIVATED],
+            ALL_ACCOUNTS_ADMINISTRATIVELY_UNAVAILABLE,
+            "3 of 3 accounts are administratively unavailable (2 paused, 1 deactivated)",
+            "none of 3 accounts are available (2 paused, 1 deactivated)",
+        ),
+    ],
+)
+async def test_administratively_dead_pool_names_the_account_condition(
+    monkeypatch: pytest.MonkeyPatch,
+    statuses: list[AccountStatus],
+    error_code: str,
+    error_message: str,
+    degraded_reason: str,
+) -> None:
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_settings", lambda: SimpleNamespace(circuit_breaker_enabled=False)
+    )
+    accounts = [_configured_account(f"census-{index}", status) for index, status in enumerate(statuses)]
+
+    balancer = LoadBalancer(lambda: _repo_factory(list(accounts)))
+    selection = await balancer.select_account()
+
+    assert selection.account is None
+    assert selection.error_code == error_code
+    assert selection.error_message == (f"{error_message}. Service is operating in degraded mode: {degraded_reason}")
+    assert is_degraded() is True
+    assert get_status()["reason"] == degraded_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "reset_at", "error_code", "degraded_reason"),
+    [
+        (AccountStatus.RATE_LIMITED, 3600, ALL_ACCOUNTS_RATE_LIMITED, "3 of 3 accounts are rate limited"),
+        (AccountStatus.QUOTA_EXCEEDED, None, ALL_ACCOUNTS_QUOTA_EXCEEDED, "3 of 3 accounts are over quota"),
+    ],
+)
+async def test_usage_blocked_pool_names_the_account_condition(
+    monkeypatch: pytest.MonkeyPatch,
+    status: AccountStatus,
+    reset_at: int | None,
+    error_code: str,
+    degraded_reason: str,
+) -> None:
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_settings", lambda: SimpleNamespace(circuit_breaker_enabled=False)
+    )
+    accounts = [_configured_account(f"usage-{index}", status) for index in range(3)]
+    if reset_at is not None:
+        for account in accounts:
+            account.reset_at = int(time.time()) + reset_at
+
+    balancer = LoadBalancer(lambda: _repo_factory(list(accounts)))
+    selection = await balancer.select_account()
+
+    assert selection.account is None
+    assert selection.error_code == error_code
+    assert selection.error_message is not None
+    assert selection.error_message.endswith(f"Service is operating in degraded mode: {degraded_reason}")
+    assert is_degraded() is True
+
+
+@pytest.mark.asyncio
+async def test_one_active_account_still_routes_with_paused_siblings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_settings", lambda: SimpleNamespace(circuit_breaker_enabled=False)
+    )
+    accounts = [
+        _configured_account("mixed-active", AccountStatus.ACTIVE),
+        _configured_account("mixed-paused-1", AccountStatus.PAUSED),
+        _configured_account("mixed-paused-2", AccountStatus.PAUSED),
+    ]
+    set_degraded("all upstream accounts are unavailable")
+
+    balancer = LoadBalancer(lambda: _repo_factory(list(accounts)))
+    selection = await balancer.select_account()
+
+    assert selection.account is not None
+    assert selection.account.id == "mixed-active"
+    assert selection.error_code is None
     assert is_degraded() is False

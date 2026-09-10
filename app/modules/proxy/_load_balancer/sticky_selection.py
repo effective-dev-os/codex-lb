@@ -11,10 +11,12 @@ from app.core.balancer import (
     HEALTH_TIER_DRAINING,
     HEALTH_TIER_HEALTHY,
     HEALTH_TIER_PROBING,
+    POOL_UNAVAILABLE_ERROR_CODES,
     ROUTING_POLICY_BURN_FIRST,
     ROUTING_POLICY_PRESERVE,
     TRAFFIC_CLASS_FOREGROUND,
     AccountState,
+    AccountStatusCensus,
     ResetPreferenceWindow,
     RoutingCostsByAccount,
     RoutingStrategy,
@@ -284,6 +286,7 @@ class StickySelectionOwner(Protocol):
         usage_exhaustion_states: Iterable[AccountState] | None = None,
         sticky_refresh_skip_deadline: datetime | None = None,
         redact_sensitive_details: bool = False,
+        status_census: AccountStatusCensus | None = None,
     ) -> _StickySelectionOutcome: ...
 
     async def release_account_lease(self, lease: AccountLease | None) -> None: ...
@@ -919,6 +922,10 @@ async def run_sticky_selection_path(
                         usage_exhaustion_states=states,
                         sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
                         redact_sensitive_details=redact_sensitive_details,
+                        status_census=AccountStatusCensus.from_statuses(
+                            account.status
+                            for account in (selection_inputs.runtime_accounts or selection_inputs.accounts)
+                        ),
                     )
                     result = sticky_outcome.selection
                     if (
@@ -1167,6 +1174,7 @@ async def run_sticky_selection_path(
         if (
             selected_snapshot is None
             and selection_error_code is not None
+            and selection_error_code not in POOL_UNAVAILABLE_ERROR_CODES
             and not hard_sticky
             and attempt < MAX_SELECTION_ATTEMPTS
         ):
@@ -1431,6 +1439,7 @@ async def _select_with_stickiness(
     overload_backoff_runtime: Mapping[str, RuntimeState] | None = None,
     clock: Clock,
     redact_sensitive_details: bool = False,
+    status_census: AccountStatusCensus | None = None,
 ) -> _StickySelectionOutcome:
     if not sticky_key or not sticky_repo:
         return _StickySelectionOutcome(
@@ -1447,6 +1456,7 @@ async def _select_with_stickiness(
                 routing_costs_by_account_id=routing_costs_by_account_id,
                 allow_usage_exhaustion_error=allow_usage_exhaustion_error,
                 usage_exhaustion_states=usage_exhaustion_states,
+                status_census=status_census,
             )
         )
     if sticky_kind is None:
@@ -1540,6 +1550,7 @@ async def _select_with_stickiness(
             routing_costs_by_account_id=routing_costs_by_account_id,
             allow_usage_exhaustion_error=allow_usage_exhaustion_error,
             usage_exhaustion_states=usage_exhaustion_state_list,
+            status_census=status_census,
         )
 
     if not existing and initial_preferred_account_id is not None:
@@ -2255,6 +2266,7 @@ def _select_account_preferring_budget_safe(
     allow_usage_exhaustion_error: bool = True,
     usage_exhaustion_states: Iterable[AccountState] | None = None,
     selection_seed: str | None = None,
+    status_census: AccountStatusCensus | None = None,
 ) -> SelectionResult:
     state_list = list(states)
     if selection_seed is None and routing_strategy not in ("sequential_drain", "reset_drain", "single_account"):
@@ -2304,6 +2316,7 @@ def _select_account_preferring_budget_safe(
         ]
         return select_account(
             budget_safe_states or state_list,
+            status_census=status_census,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
             routing_strategy=routing_strategy,
@@ -2350,6 +2363,7 @@ def _select_account_preferring_budget_safe(
         selection_pool = preferred_states if len(preferred_states) != len(state_list) else state_list
         preferred = select_account(
             selection_pool,
+            status_census=status_census,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
             routing_strategy=routing_strategy,
@@ -2371,6 +2385,7 @@ def _select_account_preferring_budget_safe(
     if routing_strategy == "usage_weighted" and state_list:
         return select_account(
             state_list,
+            status_census=status_census,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
             routing_strategy=routing_strategy,
@@ -2399,6 +2414,7 @@ def _select_account_preferring_budget_safe(
         allow_usage_exhaustion_error=allow_usage_exhaustion_error,
         usage_exhaustion_states=usage_exhaustion_states,
         selection_seed=selection_seed,
+        status_census=status_census,
     )
 
 

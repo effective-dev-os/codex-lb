@@ -15,6 +15,7 @@ from typing import Any, Literal, NoReturn, Protocol, cast
 import anyio
 
 from app.core.auth.refresh import RefreshError, is_transient_refresh_contention, refresh_contention_kind
+from app.core.balancer import ALL_ACCOUNTS_QUOTA_EXCEEDED, ALL_ACCOUNTS_RATE_LIMITED
 from app.core.balancer.types import UpstreamError
 from app.core.clients.proxy import CodexControlRequestPrivacyPolicy, ProxyResponseError
 from app.core.clients.proxy_websocket import (
@@ -119,6 +120,10 @@ _ACCOUNT_SELECTION_RETRY_HINT_RE = re.compile(r"try again in\s+([0-9]+(?:\.[0-9]
 _LOCAL_ACCOUNT_CAP_ERROR_CODES = frozenset(
     {"account_response_create_cap", "account_stream_cap", "api_key_stream_fair_share"}
 )
+# Codes the selector itself synthesizes a "try again in Ns" hint for. The hint
+# is local evidence, not an upstream 429, so it is surfaced to the client
+# instead of being waited out here.
+_LOCAL_SELECTOR_RETRY_HINT_CODES = frozenset({"no_accounts", ALL_ACCOUNTS_RATE_LIMITED, ALL_ACCOUNTS_QUOTA_EXCEEDED})
 _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE = "account_model_unsupported"
 _PROPAGATED_CAPACITY_STARTUP_WAIT: ContextVar[asyncio.Event | None] = ContextVar(
     "propagated_capacity_startup_wait",
@@ -462,7 +467,10 @@ def _account_selection_recovery_sleep_seconds_from_message(
         or "no accounts with available additional quota" in lowered
         or "no fresh additional quota data" in lowered
         or (
-            (error_code == "no_accounts" or (suppress_uncoded_local_selector_hint and error_code is None))
+            (
+                error_code in _LOCAL_SELECTOR_RETRY_HINT_CODES
+                or (suppress_uncoded_local_selector_hint and error_code is None)
+            )
             and lowered.startswith("rate limit exceeded. try again in")
         )
     ):

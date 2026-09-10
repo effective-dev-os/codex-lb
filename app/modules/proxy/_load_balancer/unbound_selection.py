@@ -9,6 +9,7 @@ from typing import Generic, Protocol, TypeVar
 
 from app.core.balancer import (
     AccountState,
+    AccountStatusCensus,
     ResetPreferenceWindow,
     RoutingCostsByAccount,
     RoutingStrategy,
@@ -229,6 +230,10 @@ async def run_unbound_selection_path(
                         routing_costs_by_account_id=effective_routing_costs,
                         allow_usage_exhaustion_error=allow_usage_exhaustion_error,
                         usage_exhaustion_states=states,
+                        status_census=AccountStatusCensus.from_statuses(
+                            account.status
+                            for account in (selection_inputs.runtime_accounts or selection_inputs.accounts)
+                        ),
                     )
 
                 # Fresh admissions prefer accounts upstream is not currently

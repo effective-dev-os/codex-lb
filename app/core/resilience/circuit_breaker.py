@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from enum import Enum
-from typing import Awaitable, TypeVar
+from typing import Awaitable, Iterable, TypeVar
 
 import aiohttp
 
@@ -144,7 +144,15 @@ def get_circuit_breaker_for_account(account_id: str) -> CircuitBreaker:
     return breaker
 
 
-def are_all_account_circuit_breakers_open() -> bool:
-    if not _account_circuit_breakers:
+def are_all_account_circuit_breakers_open(account_ids: Iterable[str]) -> bool:
+    """Whether every configured account is currently tripped OPEN.
+
+    Breakers are created lazily, so quantifying over the registry alone lets
+    the one account that has ever failed declare the whole fleet down. An
+    account without a breaker has never failed and counts as closed.
+    """
+    configured = list(account_ids)
+    if not configured:
         return False
-    return all(cb.state == CircuitState.OPEN for cb in _account_circuit_breakers.values())
+    breakers = [_account_circuit_breakers.get(account_id) for account_id in configured]
+    return all(breaker is not None and breaker.state == CircuitState.OPEN for breaker in breakers)
