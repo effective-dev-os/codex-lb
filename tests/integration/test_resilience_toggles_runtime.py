@@ -53,7 +53,8 @@ async def test_circuit_breaker_toggle_flipped_via_put_gates_breaker_use_without_
     with pytest.raises(CircuitBreakerOpenError):
         await _call_upstream(account_id)
     assert load_balancer_module._is_upstream_circuit_breaker_open(
-        resolve_resilience_toggles(await get_settings_cache().get()).circuit_breaker_enabled
+        resolve_resilience_toggles(await get_settings_cache().get()).circuit_breaker_enabled,
+        [account_id],
     )
 
     # Turn it off again from the dashboard. The (still open) breaker object
@@ -66,7 +67,8 @@ async def test_circuit_breaker_toggle_flipped_via_put_gates_breaker_use_without_
     assert circuit_breaker_module._account_circuit_breakers[account_id] is breaker
     assert breaker.state is CircuitState.OPEN
     assert not load_balancer_module._is_upstream_circuit_breaker_open(
-        resolve_resilience_toggles(await get_settings_cache().get()).circuit_breaker_enabled
+        resolve_resilience_toggles(await get_settings_cache().get()).circuit_breaker_enabled,
+        [account_id],
     )
 
 

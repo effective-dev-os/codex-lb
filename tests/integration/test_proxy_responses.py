@@ -179,7 +179,7 @@ async def test_proxy_responses_no_accounts(async_client):
     assert event["response"]["object"] == "response"
     assert event["response"]["status"] == "failed"
     assert event["response"]["id"] == request_id
-    assert event["response"]["error"]["code"] == "no_accounts"
+    assert event["response"]["error"]["code"] == "no_accounts_configured"
 
 
 @pytest.mark.asyncio
@@ -1503,7 +1503,7 @@ async def test_v1_responses_routes(async_client):
     assert event["response"]["object"] == "response"
     assert event["response"]["status"] == "failed"
     assert event["response"]["id"] == request_id
-    assert event["response"]["error"]["code"] == "no_accounts"
+    assert event["response"]["error"]["code"] == "no_accounts_configured"
 
 
 @pytest.mark.asyncio
@@ -1527,7 +1527,7 @@ async def test_v1_responses_routes_under_root_path(app_instance):
     assert event["response"]["object"] == "response"
     assert event["response"]["status"] == "failed"
     assert event["response"]["id"] == request_id
-    assert event["response"]["error"]["code"] == "no_accounts"
+    assert event["response"]["error"]["code"] == "no_accounts_configured"
 
 
 @pytest.mark.asyncio
