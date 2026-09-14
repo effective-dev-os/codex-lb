@@ -27,6 +27,7 @@ import app.modules.proxy.service as proxy_module
 from app.core.clients.proxy_websocket import UpstreamWebSocketMessage as _FakeUpstreamMessage
 from app.core.config.dashboard_overrides import with_dashboard_overrides
 from app.core.config.settings import Settings
+from app.core.errors import PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE
 from app.core.openai.model_registry import ModelRegistry
 from app.core.utils.request_id import (
     reset_request_id,
@@ -8484,7 +8485,7 @@ async def test_v1_responses_http_bridge_reports_unavailable_required_owner_when_
 
     assert second.status_code == 502
     assert second.json()["error"] == {
-        "message": "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
+        "message": PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
         "type": "server_error",
         "code": "previous_response_owner_unavailable",
     }

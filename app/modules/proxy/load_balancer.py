@@ -39,7 +39,6 @@ from app.core.balancer import (
 )
 from app.core.balancer.types import AccountStatusCensus, UpstreamError
 from app.core.clock import REAL_CLOCK, Clock
-from app.core.config import settings as config_settings
 from app.core.config.dashboard_overrides import with_dashboard_overrides
 from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache

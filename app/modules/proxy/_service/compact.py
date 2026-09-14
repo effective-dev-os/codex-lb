@@ -33,7 +33,7 @@ from app.core.clients.thread_cache_identity import (
 from app.core.config.dashboard_overrides import with_dashboard_overrides
 from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
-from app.core.errors import openai_error
+from app.core.errors import PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE, openai_error
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.models import CompactResponsePayload
 from app.core.openai.requests import ResponsesCompactRequest
@@ -929,7 +929,7 @@ class _CompactMixin:
                     else None,
                 )
                 if len(selection_inputs.accounts) != 1:
-                    message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+                    message = PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE
                     _record_continuity_fail_closed(
                         surface="compact",
                         reason="owner_account_unavailable",

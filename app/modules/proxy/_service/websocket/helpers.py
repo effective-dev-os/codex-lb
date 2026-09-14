@@ -45,6 +45,7 @@ from app.core.errors import (
     PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
     PREVIOUS_RESPONSE_NOT_FOUND_CODE,
     PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
+    PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
     OpenAIErrorEnvelope,
     OpenAIErrorParam,
@@ -1635,7 +1636,7 @@ def _rewrite_websocket_previous_response_owner_unavailable_event(
     )
     rewritten_event_payload = response_failed_event(
         "upstream_unavailable",
-        "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
+        PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
         error_type="server_error",
         response_id=_websocket_downstream_response_id(request_state),
     )

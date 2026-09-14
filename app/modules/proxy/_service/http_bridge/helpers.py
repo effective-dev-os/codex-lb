@@ -44,6 +44,7 @@ from app.core.config.settings_cache import get_settings_cache
 from app.core.errors import (
     HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE,
     HTTP_BRIDGE_LOCAL_RESET_MESSAGE,
+    PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
     OpenAIErrorDetail,
     OpenAIErrorEnvelope,
     OpenAIErrorParam,
@@ -3469,7 +3470,7 @@ def _http_bridge_previous_response_owner_unavailable_error(
         502,
         openai_error(
             "previous_response_owner_unavailable",
-            "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
+            PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
             error_type="server_error",
         ),
     )

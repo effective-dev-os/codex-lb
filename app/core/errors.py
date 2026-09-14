@@ -93,6 +93,12 @@ class ResponseFailedEvent(TypedDict):
 
 
 PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE = "Upstream websocket closed before response.completed"
+# An owner that cannot come back is not a retry: the anchored turn can only be
+# served by the account that holds it, so the honest instruction is to start
+# over rather than to wait.
+PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE = (
+    "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+)
 # Local bridge recovery (fresh replay, context-overflow rollover, previous
 # response rebind) tears down our own upstream session. It is not an upstream
 # close and must not be reported as one.

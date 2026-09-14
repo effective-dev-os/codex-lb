@@ -33,6 +33,7 @@ from app.core.clients.proxy_websocket import (
     WebsocketsUpstreamWebSocket,
 )
 from app.core.config.settings_cache import get_settings_cache
+from app.core.errors import PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE
 from app.core.utils.request_id import get_request_id
 from app.db.models import Account, AccountStatus, ApiKeyUsageReservation, RequestLog
 from app.db.session import SessionLocal
@@ -10381,7 +10382,7 @@ def test_backend_responses_websocket_previous_response_usage_limit_returns_upstr
 
     assert event["type"] == "response.failed"
     assert event["response"]["error"]["code"] == "upstream_unavailable"
-    assert event["response"]["error"]["message"] == "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+    assert event["response"]["error"]["message"] == PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE
     assert connect_models == ["gpt-5.1"]
     assert captured_preferred_accounts == ["acct_ws_proxy_owner"]
     assert handled_error_codes == ["usage_limit_reached"]

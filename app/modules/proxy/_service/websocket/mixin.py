@@ -67,6 +67,7 @@ from app.core.clock import Clock, Scheduler, clock_for, scheduler_for
 from app.core.errors import (
     PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
     PREVIOUS_RESPONSE_NOT_FOUND_CODE,
+    PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
     STREAM_INCOMPLETE_ANCHOR_NEUTRAL_MESSAGES,
     OpenAIErrorEnvelope,
     OpenAIErrorParam,
@@ -4035,7 +4036,7 @@ class _WebSocketMixin:
             and account.id != preferred_account_id
         ):
             await proxy._load_balancer.release_account_lease(selection.lease)
-            message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+            message = PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE
             _record_continuity_fail_closed(
                 surface="websocket_connect",
                 reason="owner_account_unavailable",
@@ -4113,7 +4114,7 @@ class _WebSocketMixin:
                     error_message=error_message,
                 )
                 return None
-            message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+            message = PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE
             _record_continuity_fail_closed(
                 surface="websocket_connect",
                 reason="owner_account_unavailable",

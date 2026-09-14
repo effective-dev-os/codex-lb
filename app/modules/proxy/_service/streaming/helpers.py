@@ -40,6 +40,7 @@ from app.core.clients.proxy_websocket import (
 from app.core.clock import Clock
 from app.core.errors import (
     PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
+    PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
     SYNTHETIC_TRANSPORT_FAILURE_CODES,
     OpenAIErrorParam,
@@ -667,7 +668,7 @@ def _rewrite_previous_response_stream_error(
         )
         return (
             "previous_response_owner_unavailable",
-            "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
+            PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
             normalized_code,
         )
     return None
