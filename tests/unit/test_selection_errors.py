@@ -6,7 +6,6 @@ from app.core.balancer import (
     ALL_ACCOUNTS_PAUSED,
     ALL_ACCOUNTS_QUOTA_EXCEEDED,
     ALL_ACCOUNTS_RATE_LIMITED,
-    ALL_ACCOUNTS_REAUTH_REQUIRED,
     NO_ACCOUNTS_CONFIGURED,
     POOL_UNAVAILABLE_ERROR_CODES,
 )
@@ -90,7 +89,6 @@ def test_local_overload_codes_keep_rate_limit_contract(local_code: str):
         (NO_ACCOUNTS_CONFIGURED, "No accounts are configured"),
         (ALL_ACCOUNTS_PAUSED, "3 of 3 accounts are paused"),
         (ALL_ACCOUNTS_DEACTIVATED, "3 of 3 accounts are deactivated"),
-        (ALL_ACCOUNTS_REAUTH_REQUIRED, "3 of 3 accounts require re-authentication"),
         (
             ALL_ACCOUNTS_ADMINISTRATIVELY_UNAVAILABLE,
             "3 of 3 accounts are administratively unavailable (2 paused, 1 deactivated)",

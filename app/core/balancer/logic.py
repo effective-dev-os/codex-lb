@@ -166,7 +166,10 @@ USAGE_LIMIT_REACHED = "usage_limit_reached"
 NO_ACCOUNTS_CONFIGURED = "no_accounts_configured"
 ALL_ACCOUNTS_PAUSED = "all_accounts_paused"
 ALL_ACCOUNTS_DEACTIVATED = "all_accounts_deactivated"
-ALL_ACCOUNTS_REAUTH_REQUIRED = "all_accounts_reauth_required"
+# No ALL_ACCOUNTS_REAUTH_REQUIRED: upstream keeps a REAUTH_REQUIRED account
+# request-routable on its stored access token (load_balancer.py "REAUTH_REQUIRED
+# remains request-routable"), so that status can never empty the candidate pool
+# and must not be allowed to explain an empty one.
 ALL_ACCOUNTS_ADMINISTRATIVELY_UNAVAILABLE = "all_accounts_administratively_unavailable"
 ALL_ACCOUNTS_RATE_LIMITED = "all_accounts_rate_limited"
 ALL_ACCOUNTS_QUOTA_EXCEEDED = "all_accounts_quota_exceeded"
@@ -179,7 +182,6 @@ POOL_UNAVAILABLE_ERROR_CODES = frozenset(
         NO_ACCOUNTS_CONFIGURED,
         ALL_ACCOUNTS_PAUSED,
         ALL_ACCOUNTS_DEACTIVATED,
-        ALL_ACCOUNTS_REAUTH_REQUIRED,
         ALL_ACCOUNTS_ADMINISTRATIVELY_UNAVAILABLE,
         ALL_ACCOUNTS_RATE_LIMITED,
         ALL_ACCOUNTS_QUOTA_EXCEEDED,
@@ -189,7 +191,6 @@ POOL_UNAVAILABLE_ERROR_CODES = frozenset(
 _CENSUS_STATUS_CODES: tuple[tuple[AccountStatus, str, str], ...] = (
     (AccountStatus.PAUSED, ALL_ACCOUNTS_PAUSED, "are paused"),
     (AccountStatus.DEACTIVATED, ALL_ACCOUNTS_DEACTIVATED, "are deactivated"),
-    (AccountStatus.REAUTH_REQUIRED, ALL_ACCOUNTS_REAUTH_REQUIRED, "require re-authentication"),
 )
 
 

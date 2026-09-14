@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import hashlib
 import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager
@@ -823,7 +824,11 @@ async def test_compact_wire_budget_sees_the_injected_prefix(compact_budget_spy: 
 
     validated = compact_budget_spy[0]
     assert validated["input"][0]["content"][0]["text"] == _isolated().scope_line
-    assert validated["prompt_cache_key"] == f"compact-key-1-{_isolated().token}"
+    # The fork also scopes the outbound key per account
+    # (``scope_prompt_cache_key_to_account``), so the validated value carries
+    # that prefix in front of the identity token in both modes.
+    account_scope = hashlib.sha256(b"chatgpt-acct").hexdigest()[:8]
+    assert validated["prompt_cache_key"] == f"{account_scope}-compact-key-1-{_isolated().token}"
 
 
 # --------------------------------------------------------------------------

@@ -14,8 +14,8 @@ instead of maintaining independent numeric copies.
 <!-- proxy-architecture-thresholds:start -->
 ```toml
 service_lines = 2600
-load_balancer_lines = 3021
-http_bridge_mixin_lines = 2436
+load_balancer_lines = 3043
+http_bridge_mixin_lines = 2440
 streaming_mixin_lines = 1100
 proxy_service_method_lines = 1200
 load_balancer_select_account_lines = 527

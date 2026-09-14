@@ -757,13 +757,15 @@ def scope_prompt_cache_key_to_account(payload: dict[str, JsonValue], account_id:
 
     A pooled deployment presents one conversation's cache key under every account it
     fails over to, so a single value appears against several unrelated credentials —
-    a ready-made correlator that joins the pool into one system upstream.
+    a ready-made correlator that joins the pool into one system upstream. Upstream's
+    ``thread_cache_identity`` states plainly that it is not a countermeasure to
+    provider-side correlation, so this stays even where the two overlap; in
+    ``isolated`` mode the outbound key simply carries both scopes.
 
-    Free to do, and probably a win: prompt caches are org-scoped, so after an account
-    switch the cache is cold whatever the key says, while one shared value makes the
-    routing hint compete across several caches at once. Internal affinity is untouched
-    — it resolved from the original value before account selection ran, and this only
-    rewrites the copy that leaves the process.
+    Cache-neutral: upstream measured that the prefix cache is not partitioned by
+    ``prompt_cache_key`` at all, so rewriting it cannot cost a hit. Internal affinity
+    is untouched — it resolved from the original value before account selection ran,
+    and this only rewrites the copy that leaves the process.
     """
     if not account_id:
         return

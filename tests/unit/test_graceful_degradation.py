@@ -15,7 +15,6 @@ from app.core.balancer import (
     ALL_ACCOUNTS_PAUSED,
     ALL_ACCOUNTS_QUOTA_EXCEEDED,
     ALL_ACCOUNTS_RATE_LIMITED,
-    ALL_ACCOUNTS_REAUTH_REQUIRED,
     NO_ACCOUNTS_CONFIGURED,
 )
 from app.core.openai.model_registry import ModelRegistry, ReasoningLevel, UpstreamModel
@@ -257,12 +256,6 @@ def _configured_account(account_id: str, status: AccountStatus) -> Account:
             ALL_ACCOUNTS_DEACTIVATED,
             "3 of 3 accounts are deactivated",
             "3 of 3 accounts are deactivated",
-        ),
-        (
-            [AccountStatus.REAUTH_REQUIRED] * 3,
-            ALL_ACCOUNTS_REAUTH_REQUIRED,
-            "3 of 3 accounts require re-authentication",
-            "3 of 3 accounts are awaiting re-authentication",
         ),
         (
             [AccountStatus.PAUSED, AccountStatus.PAUSED, AccountStatus.DEACTIVATED],

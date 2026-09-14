@@ -3015,7 +3015,6 @@ def _is_upstream_circuit_breaker_open(circuit_breaker_enabled: bool, account_ids
 _DEGRADED_STATUS_PHRASES: tuple[tuple[AccountStatus, str], ...] = (
     (AccountStatus.PAUSED, "paused"),
     (AccountStatus.DEACTIVATED, "deactivated"),
-    (AccountStatus.REAUTH_REQUIRED, "awaiting re-authentication"),
     (AccountStatus.RATE_LIMITED, "rate limited"),
     (AccountStatus.QUOTA_EXCEEDED, "over quota"),
 )
