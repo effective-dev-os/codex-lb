@@ -350,6 +350,65 @@ async def test_required_continuity_owner_miss_does_not_mark_healthy_pool_degrade
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "reset_at", "cooldown_until", "expected_resets_at"),
+    [
+        pytest.param(
+            AccountStatus.QUOTA_EXCEEDED,
+            1_700_000_060,
+            None,
+            1_700_000_060,
+            id="quota-reset",
+        ),
+        pytest.param(
+            AccountStatus.ACTIVE,
+            None,
+            1_700_000_060.0,
+            1_700_000_060,
+            id="cooldown-until",
+        ),
+        pytest.param(
+            AccountStatus.QUOTA_EXCEEDED,
+            None,
+            None,
+            None,
+            id="unknown-pressure",
+        ),
+    ],
+)
+async def test_required_continuity_owner_selection_propagates_pressure_reset(
+    selection_cache: AccountSelectionCache,
+    monkeypatch: pytest.MonkeyPatch,
+    status: AccountStatus,
+    reset_at: int | None,
+    cooldown_until: float | None,
+    expected_resets_at: int | None,
+) -> None:
+    now = 1_700_000_000.0
+    monkeypatch.setattr(load_balancer_module.time, "time", lambda: now)
+    owner = _account("contract-required-owner-pressure")
+    owner.status = status
+    owner.reset_at = reset_at
+    alternate = _account("contract-required-owner-pressure-alternate")
+    balancer, _, _, _ = _balancer([owner, alternate], selection_cache)
+    if cooldown_until is not None:
+        balancer._runtime[owner.id] = load_balancer_module.RuntimeState(cooldown_until=cooldown_until)
+
+    selection = await balancer.select_account(
+        required_account_id=owner.id,
+        required_continuity_owner=True,
+        lease_kind="stream",
+    )
+
+    assert selection.account is None
+    assert selection.error_code == load_balancer_module.CONTINUITY_OWNER_UNAVAILABLE
+    assert selection.resets_at == expected_resets_at
+    assert selection.error_message == (
+        "No available accounts" if expected_resets_at is None else "Rate limit exceeded. Try again in 60s"
+    )
+
+
+@pytest.mark.asyncio
 async def test_deleted_required_continuity_owner_returns_typed_miss_without_global_health_change(
     selection_cache: AccountSelectionCache,
     monkeypatch: pytest.MonkeyPatch,

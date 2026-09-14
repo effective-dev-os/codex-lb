@@ -271,6 +271,7 @@ from app.modules.proxy._service.streaming.helpers import (
     _handle_stream_error as _handle_stream_error_helper,
 )
 from app.modules.proxy._service.streaming.helpers import (
+    _PREVIOUS_RESPONSE_OWNER_TEMPORARY_ERROR_CODES,
     _mark_downstream_stream_cancelled,
     _mark_upstream_stream_incomplete,
     _raw_stream_error_code_or_upstream,
@@ -475,6 +476,7 @@ class _StreamingMixin(_StreamingRetryMixin):
         *,
         request_started_at: float,
         allow_transient_retry: bool = False,
+        allow_verified_fresh_owner_replay: bool = False,
         api_key: ApiKeyData | None,
         api_key_reservation: ApiKeyUsageReservationData | None,
         settlement: _StreamSettlement,
@@ -500,6 +502,9 @@ class _StreamingMixin(_StreamingRetryMixin):
         actual_service_tier: str | None = None
         reasoning_effort = payload.reasoning.effort if payload.reasoning else None
         session_id = _owner_lookup_session_id_from_headers(headers)
+        can_retry_previsible_error = (
+            payload.previous_response_id is None or allow_verified_fresh_owner_replay
+        )
         start = time.monotonic()
         # Keep selection/failover waits out of latency and TTFT, record them as
         # queue time, then re-anchor after this attempt's admission wait.
@@ -699,15 +704,23 @@ class _StreamingMixin(_StreamingRetryMixin):
                             failure_phase="upstream", failure_detail="upstream_eof_before_terminal_event"
                         )
                     settlement.account_health_error = _facade()._should_penalize_stream_error(code)
-                    if allow_retry and code == "stream_idle_timeout":
+                    if allow_retry and can_retry_previsible_error and code == "stream_idle_timeout":
                         raise _RetryableStreamError(code, upstream_error, exclude_account=True)
-                    if allow_retry and _facade()._is_security_work_authorization_required_error(code, error_message):
+                    if (
+                        allow_retry
+                        and can_retry_previsible_error
+                        and _facade()._is_security_work_authorization_required_error(code, error_message)
+                    ):
                         error_code = _facade()._SECURITY_WORK_AUTHORIZATION_REQUIRED_CODE
                         raise _RetryableStreamError(
                             _facade()._SECURITY_WORK_AUTHORIZATION_REQUIRED_CODE,
                             upstream_error,
                         )
-                    if allow_retry and _facade()._should_retry_stream_error(code):
+                    if (
+                        allow_retry
+                        and can_retry_previsible_error
+                        and _facade()._should_retry_stream_error(code)
+                    ):
                         raise _RetryableStreamError(code, upstream_error, exclude_account=True)
                 terminal_stream_error = _TerminalStreamError(
                     error_code or code,

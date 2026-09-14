@@ -876,6 +876,9 @@ class _WebSocketRequestState:
     # on, and dropping the anchor there would silently turn a continuation into
     # a context-free fresh turn.
     fresh_upstream_request_is_retry_safe: bool = False
+    # A client-owned full resend may move accounts only after the retained
+    # continuity state positively verifies its historical input prefix.
+    client_full_resend_previous_response_prefix_verified: bool = False
     # Stable fingerprint used by the durable recovery-attempt journal. It is
     # populated only for a proof-gated fresh replay candidate.
     recovery_attempt_fingerprint: str | None = None

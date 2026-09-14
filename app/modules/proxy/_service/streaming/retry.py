@@ -75,7 +75,7 @@ from app.modules.proxy.helpers import (
     classify_upstream_failure,
     is_upstream_model_capacity_error,
 )
-from app.modules.proxy.load_balancer import AccountLease, AccountSelection
+from app.modules.proxy.load_balancer import AccountLease, AccountSelection, CONTINUITY_OWNER_UNAVAILABLE
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 
 _REQUEST_TRANSPORT_HTTP = "http"
@@ -100,6 +100,12 @@ def _http_downstream_request_is_sticky(payload: ResponsesRequest, headers: Mappi
 
 
 _POST_REFRESH_TRANSIENT_EXHAUSTED_ATTR = "_codex_lb_post_refresh_transient_exhausted"
+_REQUIRED_CONTINUITY_OWNER_DELETED_MESSAGE = "Required continuity owner account no longer exists"
+_PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE = (
+    "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+)
+_PREVIOUS_RESPONSE_OWNER_BUSY_RETRY_AFTER_SECONDS = 5
+
 
 
 def _resolve_http_downstream_transport(policy: str, *, payload: ResponsesRequest, headers: Mapping[str, str]) -> str:
@@ -873,22 +879,40 @@ class _StreamingRetryMixin:
                 if preferred_account_id is None:
                     selection_inputs = await proxy._load_balancer._load_selection_inputs(
                         model=payload.model,
+                        service_tier=payload.service_tier,
                         additional_limit_name=None,
-                        account_ids=None,
+                        account_ids=api_key.assigned_account_ids
+                        if api_key is not None and api_key.account_assignment_scope_enabled
+                        else None,
                     )
-                    if len(selection_inputs.accounts) != 1:
-                        message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+                    runtime_accounts = getattr(selection_inputs, "runtime_accounts", None)
+                    if (
+                        runtime_accounts is not None
+                        and api_key is not None
+                        and api_key.account_assignment_scope_enabled
+                    ):
+                        runtime_accounts = [
+                            account
+                            for account in runtime_accounts
+                            if account.id in api_key.assigned_account_ids
+                        ]
+                    if runtime_accounts is None or len(runtime_accounts) != 1:
+                        message = (
+                            f"The account holding this conversation is busy. Retry in "
+                            f"{_PREVIOUS_RESPONSE_OWNER_BUSY_RETRY_AFTER_SECONDS}s."
+                        )
                         _record_continuity_fail_closed(
                             surface="http_stream",
-                            reason="owner_account_unavailable",
+                            reason="owner_lookup_miss",
                             previous_response_id=payload.previous_response_id,
                             session_id=previous_response_lookup_session_id,
                             upstream_error_code="owner_lookup_miss",
                         )
                         event = response_failed_event(
-                            "previous_response_owner_unavailable",
+                            "previous_response_owner_busy",
                             message,
                             response_id=request_id,
+                            error_type="rate_limit_error",
                         )
                         yield format_sse_event(event)
                         await proxy._write_request_log(
@@ -898,7 +922,7 @@ class _StreamingRetryMixin:
                             model=payload.model,
                             latency_ms=int((time.monotonic() - start) * 1000),
                             status="error",
-                            error_code="previous_response_owner_unavailable",
+                            error_code="previous_response_owner_busy",
                             error_message=message,
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             transport=request_transport,
@@ -911,6 +935,12 @@ class _StreamingRetryMixin:
                             client_ip=client_ip,
                         )
                         return
+                    # A historical owner lookup may infer an owner only from the
+                    # sole configured runtime account in the applicable scope.
+                    # A single currently eligible account can be a surviving
+                    # replacement and is not sufficient continuity proof.
+                    preferred_account_id = runtime_accounts[0].id
+                    require_preferred_account = True
             # File and previous-response ownership are peers, not fallback
             # preferences. Resolve both before selection so a conflict cannot
             # be hidden by whichever source happened to run first. A hard turn
@@ -1113,6 +1143,7 @@ class _StreamingRetryMixin:
                     if (
                         not account
                         and selection.error_code != USAGE_LIMIT_REACHED
+                        and not (require_preferred_account and preferred_account_id is not None)
                         and (
                             selection.error_code in _LOCAL_ACCOUNT_CAP_ERROR_CODES
                             or not (propagate_http_errors and last_transient_exc is not None)
@@ -1290,18 +1321,41 @@ class _StreamingRetryMixin:
                         )
                         return
                     if require_preferred_account and preferred_account_id is not None:
-                        message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
-                        _record_continuity_fail_closed(
-                            surface="http_stream",
-                            reason="owner_account_unavailable",
-                            previous_response_id=payload.previous_response_id,
-                            session_id=headers.get("x-codex-turn-state") or headers.get("session_id"),
-                            upstream_error_code="no_accounts",
+                        selection_is_deleted_owner = (
+                            selection.error_code == CONTINUITY_OWNER_UNAVAILABLE
+                            and selection.error_message == _REQUIRED_CONTINUITY_OWNER_DELETED_MESSAGE
                         )
+                        if selection_is_deleted_owner:
+                            error_code = "previous_response_owner_unavailable"
+                            message = _PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE
+                            error_type = "server_error"
+                            resets_at = None
+                            _record_continuity_fail_closed(
+                                surface="http_stream",
+                                reason="owner_account_unavailable",
+                                previous_response_id=payload.previous_response_id,
+                                session_id=headers.get("x-codex-turn-state") or headers.get("session_id"),
+                                upstream_error_code=selection.error_code,
+                            )
+                        elif selection.resets_at is not None:
+                            error_code = "previous_response_owner_rate_limited"
+                            message = selection.error_message or "The account holding this conversation is at its rate limit."
+                            error_type = "rate_limit_error"
+                            resets_at = selection.resets_at
+                        else:
+                            error_code = "previous_response_owner_busy"
+                            message = (
+                                "The account holding this conversation is busy. "
+                                f"Retry in {_PREVIOUS_RESPONSE_OWNER_BUSY_RETRY_AFTER_SECONDS}s."
+                            )
+                            error_type = "rate_limit_error"
+                            resets_at = None
                         event = response_failed_event(
-                            "previous_response_owner_unavailable",
+                            error_code,
                             message,
+                            error_type=error_type,
                             response_id=request_id,
+                            resets_at=resets_at,
                         )
                         yield format_sse_event(event)
                         await proxy._write_request_log(
@@ -1311,7 +1365,7 @@ class _StreamingRetryMixin:
                             model=payload.model,
                             latency_ms=int((time.monotonic() - start) * 1000),
                             status="error",
-                            error_code="previous_response_owner_unavailable",
+                            error_code=error_code,
                             error_message=message,
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             transport=request_transport,
@@ -1770,6 +1824,11 @@ class _StreamingRetryMixin:
                                 allow_transient_retry=(
                                     transient_retries < _facade()._MAX_TRANSIENT_SAME_ACCOUNT_RETRIES - 1
                                     or allow_retry_flag
+                                ),
+                                allow_verified_fresh_owner_replay=(
+                                    require_preferred_account
+                                    and preferred_account_id == account.id
+                                    and verified_fresh_replay_payload is not None
                                 ),
                                 api_key=api_key,
                                 api_key_reservation=api_key_reservation,

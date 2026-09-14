@@ -795,6 +795,7 @@ def test_select_account_requires_usage_window_evidence_for_quota_exhaustion():
     now = 1_700_000_000.0
     states = [
         AccountState("a", AccountStatus.QUOTA_EXCEEDED, reset_at=int(now + 3600)),
+        AccountState("b", AccountStatus.QUOTA_EXCEEDED, reset_at=int(now + 7200)),
     ]
 
     result = select_account(states, now=now)
@@ -802,6 +803,7 @@ def test_select_account_requires_usage_window_evidence_for_quota_exhaustion():
     assert result.account is None
     assert result.error_code == ALL_ACCOUNTS_QUOTA_EXCEEDED
     assert result.error_message == "Rate limit exceeded. Try again in 300s"
+    assert result.resets_at == int(now + 3600)
 
 
 def test_select_account_can_disable_pool_usage_exhaustion_for_owner_scope():
@@ -1619,6 +1621,7 @@ def test_select_account_reports_cooldown_wait_time():
     assert result.account is None
     assert result.error_message is not None
     assert "Try again in" in result.error_message
+    assert result.resets_at == int(now + 30)
 
 
 def test_select_account_caps_quota_exceeded_retry_hint():

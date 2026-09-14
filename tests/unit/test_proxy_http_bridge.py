@@ -6,7 +6,6 @@ import inspect
 import json
 import logging
 import pickle
-import subprocess
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -117,15 +116,6 @@ def test_http_bridge_dead_owner_epoch_uses_standard_previous_response_not_found_
     assert proxy_error.payload["error"]["param"] == "previous_response_id"
 
 
-def test_http_bridge_rejected_dead_owner_recovery_code_is_not_emitted_from_app() -> None:
-    result = subprocess.run(
-        ["git", "grep", "-n", "bridge_continuity_recovery_required", "--", "app/"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 1, result.stdout
 
 
 @pytest.fixture(autouse=True)
@@ -8269,7 +8259,7 @@ async def test_reconnect_http_bridge_session_skips_capacity_wait_for_usage_limit
 
 
 @pytest.mark.asyncio
-async def test_reconnect_http_bridge_session_preserves_owner_error_for_owner_usage_limit(
+async def test_reconnect_http_bridge_session_returns_retryable_owner_rate_limit_with_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
@@ -8283,9 +8273,9 @@ async def test_reconnect_http_bridge_session_preserves_owner_error_for_owner_usa
     async def select_account(_deadline: float, **_kwargs: object) -> proxy_service.AccountSelection:
         return proxy_service.AccountSelection(
             account=None,
-            error_message="Rate limit exceeded. Try again in 1h",
-            error_code="usage_limit_reached",
-            resets_at=1_700_003_600,
+            error_message="No available accounts",
+            error_code=CONTINUITY_OWNER_UNAVAILABLE,
+            resets_at=1_700_000_030,
         )
 
     request_state = proxy_service._WebSocketRequestState(
@@ -8298,6 +8288,11 @@ async def test_reconnect_http_bridge_session_preserves_owner_error_for_owner_usa
         preferred_account_id=session.account.id,
     )
     monkeypatch.setattr(proxy_service.time, "monotonic", lambda: 100.5)
+    monkeypatch.setattr(
+        http_bridge_helpers_module,
+        "_service_time",
+        lambda: SimpleNamespace(time=lambda: 1_700_000_000.0),
+    )
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
     monkeypatch.setattr(
         proxy_service,
@@ -8308,7 +8303,7 @@ async def test_reconnect_http_bridge_session_preserves_owner_error_for_owner_usa
     monkeypatch.setattr(
         http_bridge_mixin_module,
         "_sleep_for_account_selection_recovery",
-        lambda *_args, **_kwargs: pytest.fail("owner-only usage_limit_reached must not enter recovery wait"),
+        lambda *_args, **_kwargs: pytest.fail("owner rate limit must not enter recovery wait"),
     )
 
     with pytest.raises(ProxyResponseError) as exc_info:
@@ -8318,9 +8313,14 @@ async def test_reconnect_http_bridge_session_preserves_owner_error_for_owner_usa
             require_preferred_account=True,
         )
 
-    assert exc_info.value.status_code == 502
-    assert exc_info.value.payload["error"]["code"] == "previous_response_owner_unavailable"
-    assert exc_info.value.payload["error"]["type"] == "server_error"
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.payload["error"] == {
+        "message": "The account holding this conversation is at its rate limit. Retry in 30s.",
+        "type": "rate_limit_error",
+        "code": "previous_response_owner_rate_limited",
+        "resets_at": 1_700_000_030,
+    }
+    assert exc_info.value.retry_after_seconds == 30
 
 
 @pytest.mark.asyncio

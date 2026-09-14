@@ -433,6 +433,16 @@ _MODEL_CAPACITY_LIMIT_CODES = {
     "quota_exceeded",
 }
 
+_PREVIOUS_RESPONSE_OWNER_TEMPORARY_ERROR_CODES = frozenset(
+    {
+        "rate_limit_exceeded",
+        "usage_limit_reached",
+        "insufficient_quota",
+        "usage_not_included",
+        "quota_exceeded",
+    }
+)
+
 
 def _should_retry_transient_stream_error(
     code: str | None,
@@ -529,7 +539,11 @@ def _rewrite_previous_response_stream_error(
             None,
         )
     normalized_code = _normalize_error_code(error_code, error_type)
-    if preferred_account_id is not None and normalized_code in _facade()._ACCOUNT_RECOVERY_RETRY_CODES:
+    if (
+        preferred_account_id is not None
+        and normalized_code in _facade()._ACCOUNT_RECOVERY_RETRY_CODES
+        and normalized_code not in _PREVIOUS_RESPONSE_OWNER_TEMPORARY_ERROR_CODES
+    ):
         _record_continuity_fail_closed(
             surface="http_stream",
             reason="owner_account_unavailable",

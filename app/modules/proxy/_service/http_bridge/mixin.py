@@ -14,7 +14,6 @@ import anyio
 
 from app.core import shutdown as shutdown_state
 from app.core.auth.refresh import RefreshError
-from app.core.balancer.logic import retry_hint_seconds
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
 from app.core.clients.files import finalize_file as core_finalize_file  # noqa: F401
 from app.core.clients.proxy import CodexControlResponse as CodexControlResponse
@@ -1756,9 +1755,7 @@ class _HTTPBridgeMixin(
                     and preferred_account_is_continuity_owner
                     and selection.error_code == CONTINUITY_OWNER_UNAVAILABLE
                 ):
-                    raise _http_bridge_previous_response_owner_unavailable_error(
-                        retry_hint_seconds(selection.error_message)
-                    )
+                    raise _http_bridge_previous_response_owner_unavailable_error(selection)
                 status_code, error_payload = selection_failure_response(selection)
                 raise ProxyResponseError(status_code, error_payload)
             if require_preferred_account and preferred_account_id is not None and account.id != preferred_account_id:
@@ -1771,7 +1768,7 @@ class _HTTPBridgeMixin(
                 if preferred_account_is_continuity_owner:
                     # The selector handed back a DIFFERENT account, so the owner was not gone —
                     # it lost a capacity decision. Retrying can win it back.
-                    raise _http_bridge_previous_response_owner_unavailable_error(transient=True)
+                    raise _http_bridge_previous_response_owner_unavailable_error()
                 raise ProxyResponseError(
                     503,
                     openai_error(
@@ -2175,9 +2172,13 @@ class _HTTPBridgeMixin(
                 except BaseException:
                     complete_failed_handoff()
                     raise
-                if account_neutral_recovery and selection.error_code == CONTINUITY_OWNER_UNAVAILABLE:
+                if selection.error_code == CONTINUITY_OWNER_UNAVAILABLE and (
+                    account_neutral_recovery
+                    or required_preferred_account_id is not None
+                    or hard_close_account_bound
+                ):
                     complete_failed_handoff()
-                    raise _http_bridge_previous_response_owner_unavailable_error()
+                    raise _http_bridge_previous_response_owner_unavailable_error(selection)
                 if (
                     reuse_current_account_lease
                     and not hard_close_account_bound
@@ -2190,7 +2191,7 @@ class _HTTPBridgeMixin(
                     required_preferred_account_id is not None or hard_close_account_bound
                 ):
                     complete_failed_handoff()
-                    raise _http_bridge_previous_response_owner_unavailable_error()
+                    raise _http_bridge_previous_response_owner_unavailable_error(selection)
                 if selection.error_code == USAGE_LIMIT_REACHED:
                     record_selected_account_takeover(None)
                     status_code, error_payload = selection_failure_response(selection)

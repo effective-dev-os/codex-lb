@@ -374,7 +374,7 @@ def test_websocket_account_switch_keeps_fresh_request_body():
     )
 
 
-def test_websocket_account_switch_rejects_client_owned_previous_response_chain():
+def test_websocket_account_switch_rejects_unverified_client_owned_previous_response_chain():
     request_state = proxy_service._WebSocketRequestState(
         request_id="req_ws_client_chain",
         model="gpt-5.6-sol",
@@ -18599,28 +18599,44 @@ async def test_create_http_bridge_session_fails_over_after_repeated_401_refresh_
 
 
 @pytest.mark.asyncio
-async def test_connect_proxy_websocket_previous_response_owner_usage_limit_fails_closed(monkeypatch):
+async def test_connect_proxy_websocket_pins_sole_runtime_owner_miss_before_rate_limit(
+    monkeypatch,
+):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     account_owner = _make_account("acc_ws_prev_owner")
-    account_other = _make_account("acc_ws_other")
     seen_excluded_account_ids: list[set[str]] = []
 
     async def select_account(deadline: float, **kwargs: object) -> AccountSelection:
         del deadline
+        assert kwargs["preferred_account_id"] == account_owner.id
+        assert kwargs["fallback_on_preferred_account_unavailable"] is False
         excluded_account_ids = kwargs.get("exclude_account_ids")
         seen_excluded_account_ids.append(set(cast(set[str], excluded_account_ids)))
-        if len(seen_excluded_account_ids) == 1:
-            return AccountSelection(account=account_owner, error_message=None)
-        return AccountSelection(account=account_other, error_message=None)
+        return AccountSelection(account=account_owner, error_message=None)
 
     mark_rate_limit = AsyncMock()
     first_handshake_error = proxy_module.ProxyResponseError(
         429,
-        openai_error("usage_limit_reached", "usage limit reached"),
+        openai_error(
+            "rate_limit_exceeded",
+            "rate limit reached",
+            error_type="rate_limit_error",
+            resets_at=1_700_003_600,
+        ),
     )
 
     monkeypatch.setattr(service, "_select_account_with_budget", select_account)
+    monkeypatch.setattr(
+        service._load_balancer,
+        "_load_selection_inputs",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                accounts=[account_owner],
+                runtime_accounts=[account_owner],
+            )
+        ),
+    )
     monkeypatch.setattr(service._load_balancer, "mark_rate_limit", mark_rate_limit)
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account_owner))
     monkeypatch.setattr(service, "_open_upstream_websocket", AsyncMock(side_effect=[first_handshake_error]))
@@ -18634,7 +18650,7 @@ async def test_connect_proxy_websocket_previous_response_owner_usage_limit_fails
         api_key_reservation=None,
         started_at=0.0,
         previous_response_id="resp_prev_anchor",
-        preferred_account_id=account_owner.id,
+        previous_response_owner_lookup_outcome="miss",
     )
 
     websocket_send = AsyncMock()
@@ -18655,22 +18671,92 @@ async def test_connect_proxy_websocket_previous_response_owner_usage_limit_fails
 
     assert selected_account is None
     assert selected_upstream is None
-    assert seen_excluded_account_ids == [set(), {account_owner.id}]
+    assert seen_excluded_account_ids == [set()]
+    assert request_state.preferred_account_id == account_owner.id
     mark_rate_limit.assert_awaited_once()
     mark_call = mark_rate_limit.await_args
     assert mark_call is not None
     assert mark_call.args[0] == account_owner
-    assert mark_call.args[1]["message"] == "usage limit reached"
+    assert mark_call.args[1]["message"] == "rate limit reached"
     await_args = websocket_send.await_args
     assert await_args is not None
     sent_payload = json.loads(await_args.args[0])
-    assert sent_payload["status"] == 502
-    assert sent_payload["error"]["code"] == "previous_response_owner_unavailable"
-    assert sent_payload["error"]["message"] == "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+    assert sent_payload["status"] == 429
+    assert sent_payload["error"]["code"] == "rate_limit_exceeded"
+    assert sent_payload["error"]["type"] == "rate_limit_error"
+    assert sent_payload["error"]["message"] == "rate limit reached"
+    assert sent_payload["error"]["resets_at"] == 1_700_003_600
     assert request_logs.calls[0]["request_id"] == "ws_req_prev_owner_handshake_429"
-    assert request_logs.calls[0]["error_code"] == "previous_response_owner_unavailable"
+    assert request_logs.calls[0]["error_code"] == "rate_limit_exceeded"
     assert request_logs.calls[0]["account_id"] == account_owner.id
+    load_selection_inputs = service._load_balancer._load_selection_inputs
+    load_selection_inputs.assert_awaited_once()
+    assert load_selection_inputs.await_args.kwargs["model"] == "gpt-5.1"
 
+
+@pytest.mark.asyncio
+async def test_connect_proxy_websocket_does_not_pin_single_eligible_account_from_multi_runtime_scope(
+    monkeypatch,
+):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account_eligible = _make_account("acc_ws_eligible")
+    account_configured_but_ineligible = _make_account("acc_ws_configured")
+    select_account = AsyncMock()
+    open_upstream_websocket = AsyncMock()
+    load_selection_inputs = AsyncMock(
+        return_value=SimpleNamespace(
+            accounts=[account_eligible],
+            runtime_accounts=[account_eligible, account_configured_but_ineligible],
+        )
+    )
+
+    monkeypatch.setattr(service, "_select_account_with_budget", select_account)
+    monkeypatch.setattr(service, "_open_upstream_websocket", open_upstream_websocket)
+    monkeypatch.setattr(service._load_balancer, "_load_selection_inputs", load_selection_inputs)
+
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_unproven_owner",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        previous_response_id="resp_unproven_anchor",
+        previous_response_owner_lookup_outcome="miss",
+    )
+    websocket_send = AsyncMock()
+    websocket = cast(WebSocket, SimpleNamespace(send_text=websocket_send))
+
+    selected_account, selected_upstream = await service._connect_proxy_websocket(
+        {},
+        sticky_key=None,
+        sticky_kind=None,
+        prefer_earlier_reset=False,
+        prefer_earlier_reset_window="secondary",
+        routing_strategy="usage_weighted",
+        model="gpt-5.1",
+        request_state=request_state,
+        api_key=None,
+        client_send_lock=anyio.Lock(),
+        websocket=websocket,
+    )
+
+    assert selected_account is None
+    assert selected_upstream is None
+    assert request_state.preferred_account_id is None
+    load_selection_inputs.assert_awaited_once()
+    select_account.assert_not_awaited()
+    open_upstream_websocket.assert_not_awaited()
+    await_args = websocket_send.await_args
+    assert await_args is not None
+    sent_payload = json.loads(await_args.args[0])
+    assert sent_payload["status"] == 429
+    assert sent_payload["error"]["code"] == "previous_response_owner_busy"
+    assert sent_payload["error"]["type"] == "rate_limit_error"
+    assert sent_payload["error"]["message"] == "The account holding this conversation is busy. Retry in 5s."
+    assert request_logs.calls[0]["account_id"] is None
+    assert request_logs.calls[0]["error_code"] == "previous_response_owner_busy"
 
 @pytest.mark.asyncio
 async def test_connect_proxy_websocket_surfaces_local_connect_overload_without_penalizing_account(monkeypatch):
@@ -19082,7 +19168,7 @@ async def test_connect_proxy_websocket_surfaces_selected_replacement_failure_aft
 
 
 @pytest.mark.asyncio
-async def test_select_websocket_connect_account_requires_preferred_account_for_previous_response(monkeypatch):
+async def test_select_websocket_connect_account_surfaces_preferred_account_mismatch_as_busy(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     request_state = proxy_service._WebSocketRequestState(
@@ -19128,19 +19214,22 @@ async def test_select_websocket_connect_account_requires_preferred_account_for_p
     emit_connect_failure.assert_awaited_once()
     call = emit_connect_failure.await_args
     assert call is not None
-    assert call.kwargs["status_code"] == 502
-    assert call.kwargs["error_code"] == "previous_response_owner_unavailable"
+    assert call.kwargs["status_code"] == 429
+    assert call.kwargs["error_code"] == "previous_response_owner_busy"
+    assert call.kwargs["payload"]["error"]["code"] == "previous_response_owner_busy"
+    assert call.kwargs["payload"]["error"]["type"] == "rate_limit_error"
+    assert call.kwargs["payload"]["error"]["message"] == "The account holding this conversation is busy. Retry in 5s."
     assert call.kwargs["account_id"] == "acc_owner"
     assert select_account.await_args is not None
     assert select_account.await_args.kwargs["request_stage"] == "reattach"
 
 
 @pytest.mark.asyncio
-async def test_select_websocket_connect_account_preserves_continuity_for_owner_usage_limit(monkeypatch):
+async def test_select_websocket_connect_account_propagates_owner_reset_deadline(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     request_state = proxy_service._WebSocketRequestState(
-        request_id="ws_req_prev_owner_usage_limit",
+        request_id="ws_req_prev_owner_rate_limit",
         model="gpt-5.1",
         service_tier=None,
         reasoning_effort=None,
@@ -19152,8 +19241,8 @@ async def test_select_websocket_connect_account_preserves_continuity_for_owner_u
     select_account = AsyncMock(
         return_value=AccountSelection(
             account=None,
-            error_message="Rate limit exceeded. Try again in 1h",
-            error_code="usage_limit_reached",
+            error_message="Required continuity owner is rate limited",
+            error_code="continuity_owner_unavailable",
             resets_at=1_700_003_600,
         )
     )
@@ -19184,15 +19273,17 @@ async def test_select_websocket_connect_account_preserves_continuity_for_owner_u
     emit_connect_failure.assert_awaited_once()
     call = emit_connect_failure.await_args
     assert call is not None
-    assert call.kwargs["status_code"] == 502
-    assert call.kwargs["error_code"] == "previous_response_owner_unavailable"
+    assert call.kwargs["status_code"] == 429
+    assert call.kwargs["error_code"] == "previous_response_owner_rate_limited"
     assert call.kwargs["account_id"] == "acc_owner"
-    assert call.kwargs["payload"]["error"]["code"] == "previous_response_owner_unavailable"
-    assert call.kwargs["payload"]["error"]["type"] == "server_error"
+    assert call.kwargs["payload"]["error"]["code"] == "previous_response_owner_rate_limited"
+    assert call.kwargs["payload"]["error"]["type"] == "rate_limit_error"
+    assert call.kwargs["payload"]["error"]["message"] == "Required continuity owner is rate limited"
+    assert call.kwargs["payload"]["error"]["resets_at"] == 1_700_003_600
 
 
 @pytest.mark.asyncio
-async def test_select_websocket_connect_account_records_fail_closed_for_preferred_account_mismatch(
+async def test_select_websocket_connect_account_keeps_preferred_account_mismatch_retryable(
     monkeypatch,
     caplog,
 ):
@@ -19246,20 +19337,16 @@ async def test_select_websocket_connect_account_records_fail_closed_for_preferre
     await_args = websocket_send.await_args
     assert await_args is not None
     sent_payload = json.loads(await_args.args[0])
-    assert sent_payload["status"] == 502
-    assert sent_payload["error"]["code"] == "previous_response_owner_unavailable"
-    assert "continuity_fail_closed surface=websocket_connect reason=owner_account_unavailable" in caplog.text
-    assert "resp_prev_owner" not in caplog.text
-    assert counter.samples == [
-        {
-            "labels": {"surface": "websocket_connect", "reason": "owner_account_unavailable"},
-            "value": 1.0,
-        }
-    ]
+    assert sent_payload["status"] == 429
+    assert sent_payload["error"]["code"] == "previous_response_owner_busy"
+    assert sent_payload["error"]["type"] == "rate_limit_error"
+    assert sent_payload["error"]["message"] == "The account holding this conversation is busy. Retry in 5s."
+    assert "continuity_fail_closed surface=websocket_connect reason=owner_account_unavailable" not in caplog.text
+    assert counter.samples == []
 
 
 @pytest.mark.asyncio
-async def test_select_websocket_connect_account_preferred_owner_missing_fails_closed(
+async def test_select_websocket_connect_account_deleted_preferred_owner_fails_closed(
     monkeypatch,
     caplog,
 ):
@@ -19286,8 +19373,8 @@ async def test_select_websocket_connect_account_preferred_owner_missing_fails_cl
         AsyncMock(
             return_value=AccountSelection(
                 account=None,
-                error_message="No active accounts available",
-                error_code="no_accounts",
+                error_message="Required continuity owner account no longer exists",
+                error_code="continuity_owner_unavailable",
             )
         ),
     )
@@ -20991,6 +21078,7 @@ async def test_prepare_websocket_response_create_request_captures_client_full_re
     fresh_payload = json.loads(prepared.request_state.fresh_upstream_request_text)
     assert "previous_response_id" not in fresh_payload
     assert fresh_payload["input"] == full_resend_input
+    assert prepared.request_state.client_full_resend_previous_response_prefix_verified is True
 
 
 @pytest.mark.asyncio
@@ -25631,8 +25719,19 @@ async def test_process_upstream_websocket_text_does_not_fresh_retry_injected_too
 
 
 @pytest.mark.asyncio
-async def test_process_upstream_websocket_text_maps_previous_response_usage_limit_to_upstream_unavailable(
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "usage_limit_reached",
+        "rate_limit_exceeded",
+        "insufficient_quota",
+        "usage_not_included",
+        "quota_exceeded",
+    ],
+)
+async def test_process_upstream_websocket_text_preserves_previous_response_temporary_limit_metadata(
     monkeypatch,
+    error_code: str,
 ):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
@@ -25669,8 +25768,9 @@ async def test_process_upstream_websocket_text_maps_previous_response_usage_limi
         "status": 429,
         "error": {
             "type": "invalid_request_error",
-            "code": "usage_limit_reached",
+            "code": error_code,
             "message": "The usage limit has been reached",
+            "resets_at": 1_700_003_600,
         },
     }
     upstream_text = json.dumps(upstream_payload, separators=(",", ":"))
@@ -25686,26 +25786,30 @@ async def test_process_upstream_websocket_text_maps_previous_response_usage_limi
         response_create_gate=asyncio.Semaphore(1),
     )
 
-    assert '"code":"upstream_unavailable"' in downstream_text
-    handle_stream_error.assert_awaited_once()
-    handle_call = handle_stream_error.await_args
-    assert handle_call is not None
-    assert handle_call.args[0] == account
-    assert handle_call.args[2] == "usage_limit_reached"
+    downstream_payload = json.loads(downstream_text)
+    assert downstream_payload["status"] == 429
+    downstream_error = cast(dict[str, JsonValue], downstream_payload["error"])
+    assert downstream_error["code"] == error_code
+    assert downstream_error["message"] == "The usage limit has been reached"
+    assert downstream_error["resets_at"] == 1_700_003_600
+    assert "previous_response_owner_unavailable" not in downstream_text
+    handle_stream_error.assert_not_awaited()
     finalize_request_state.assert_awaited_once()
     finalize_call = finalize_request_state.await_args
     assert finalize_call is not None
-    assert finalize_call.kwargs["event_type"] == "response.failed"
+    assert finalize_call.kwargs["event_type"] == "error"
     payload = finalize_call.kwargs["payload"]
     assert isinstance(payload, dict)
-    response_payload = cast(dict[str, JsonValue], payload["response"])
-    error_payload = cast(dict[str, JsonValue], response_payload["error"])
-    assert error_payload["code"] == "upstream_unavailable"
-    assert error_payload["message"] == "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+    assert payload["status"] == 429
+    upstream_error = cast(dict[str, JsonValue], payload["error"])
+    assert upstream_error["code"] == error_code
+    assert upstream_error["resets_at"] == 1_700_003_600
     assert upstream_control.reconnect_requested is False
     assert upstream_control.suppress_downstream_event is False
     assert upstream_control.replay_request_state is None
     assert pending_request.replay_count == 0
+    assert pending_request.previous_response_id == "resp_anchor"
+    assert pending_request.preferred_account_id == account.id
     assert list(pending_requests) == []
 
 
@@ -25778,6 +25882,97 @@ async def test_process_upstream_websocket_text_replays_proxy_verified_anchor_aft
     assert pending_request.request_text == fresh_text
     assert pending_request.previous_response_id is None
     assert pending_request.preferred_account_id is None
+    assert list(pending_requests) == []
+
+@pytest.mark.asyncio
+async def test_process_upstream_websocket_text_replays_verified_client_full_resend_after_owner_quota(
+    monkeypatch,
+):
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    finalize_request_state = AsyncMock()
+    handle_stream_error = AsyncMock()
+    account = _make_account("acc_ws_client_anchor_quota")
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize_request_state)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+
+    full_history: list[JsonValue] = [
+        {"role": "user", "content": "first turn"},
+        {
+            "type": "function_call",
+            "name": "shell_command",
+            "call_id": "call_history",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_history",
+            "output": "command output",
+        },
+        {"role": "user", "content": "follow-up"},
+    ]
+    anchored_payload = {
+        "type": "response.create",
+        "model": "gpt-5.6-sol",
+        "previous_response_id": "resp_client_anchor",
+        "input": [{"role": "user", "content": "follow-up"}],
+    }
+    fresh_payload = {
+        "type": "response.create",
+        "model": "gpt-5.6-sol",
+        "input": full_history,
+    }
+    fresh_text = json.dumps(fresh_payload, separators=(",", ":"))
+    pending_request = proxy_service._WebSocketRequestState(
+        request_id="ws_req_client_anchor_quota",
+        model="gpt-5.6-sol",
+        service_tier="priority",
+        reasoning_effort="high",
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+        request_text=json.dumps(anchored_payload, separators=(",", ":")),
+        previous_response_id="resp_client_anchor",
+        preferred_account_id=account.id,
+        fresh_upstream_request_text=fresh_text,
+        fresh_upstream_request_is_retry_safe=True,
+        client_full_resend_previous_response_prefix_verified=True,
+    )
+    pending_requests = deque([pending_request])
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+    upstream_payload = {
+        "type": "error",
+        "status": 429,
+        "error": {
+            "type": "rate_limit_error",
+            "code": "quota_exceeded",
+            "message": "The usage limit has been reached",
+            "resets_at": 1_700_003_600,
+        },
+    }
+
+    await service._process_upstream_websocket_text(
+        json.dumps(upstream_payload, separators=(",", ":")),
+        account=account,
+        account_id_value=account.id,
+        pending_requests=pending_requests,
+        pending_lock=anyio.Lock(),
+        api_key=None,
+        upstream_control=upstream_control,
+        response_create_gate=asyncio.Semaphore(1),
+    )
+
+    handle_stream_error.assert_awaited_once()
+    finalize_request_state.assert_not_awaited()
+    assert upstream_control.reconnect_requested is True
+    assert upstream_control.suppress_downstream_event is True
+    assert upstream_control.replay_request_state is pending_request
+    replay_payload = json.loads(pending_request.request_text)
+    assert "previous_response_id" not in replay_payload
+    assert replay_payload["input"] == full_history
+    assert pending_request.previous_response_id is None
+    assert pending_request.preferred_account_id is None
+    assert pending_request.excluded_account_ids == {account.id}
+    assert pending_request.affinity_policy.reallocate_sticky is True
     assert list(pending_requests) == []
 
 
@@ -26441,6 +26636,7 @@ async def test_process_upstream_websocket_text_keeps_file_backed_verified_anchor
             "type": "invalid_request_error",
             "code": "usage_limit_reached",
             "message": "The usage limit has been reached",
+            "resets_at": 1_700_003_600,
         },
     }
 
@@ -26455,9 +26651,12 @@ async def test_process_upstream_websocket_text_keeps_file_backed_verified_anchor
         response_create_gate=asyncio.Semaphore(1),
     )
 
-    assert '"code":"upstream_unavailable"' in downstream_text
-    assert "usage_limit_reached" not in downstream_text
-    handle_stream_error.assert_awaited_once()
+    downstream_payload = json.loads(downstream_text)
+    downstream_error = cast(dict[str, JsonValue], downstream_payload["error"])
+    assert downstream_error["code"] == "usage_limit_reached"
+    assert downstream_error["resets_at"] == 1_700_003_600
+    assert "previous_response_owner_unavailable" not in downstream_text
+    handle_stream_error.assert_not_awaited()
     finalize_request_state.assert_awaited_once()
     assert upstream_control.reconnect_requested is False
     assert upstream_control.suppress_downstream_event is False
@@ -34120,25 +34319,41 @@ async def test_stream_missing_tool_output_proxy_error_is_masked_to_stream_incomp
 
 
 @pytest.mark.asyncio
-async def test_stream_previous_response_owner_usage_limit_fails_closed(monkeypatch):
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "usage_limit_reached",
+        "rate_limit_exceeded",
+        "insufficient_quota",
+        "usage_not_included",
+        "quota_exceeded",
+    ],
+)
+async def test_stream_single_runtime_owner_miss_temporary_limit_preserves_upstream_metadata(
+    monkeypatch,
+    error_code: str,
+):
     settings = _make_proxy_settings()
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     account_owner = _make_account("acc_prev_owner_stream")
-    account_other = _make_account("acc_other_stream")
-    request_logs.response_owner_by_id[("resp_prev_anchor", None, "sid-stream")] = account_owner.id
+    # The only configured account in scope is the inferred continuity owner.
+    monkeypatch.setattr(
+        service._load_balancer,
+        "_load_selection_inputs",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                accounts=[account_owner],
+                runtime_accounts=[account_owner],
+            )
+        ),
+    )
     select_account_calls: list[dict[str, object]] = []
     handle_stream_error = AsyncMock(return_value={"failure_class": "rate_limit"})
     record_success = AsyncMock()
 
     async def fake_select_account(**kwargs):
         select_account_calls.append(dict(kwargs))
-        required_account_id = kwargs.get("required_account_id")
-        exclude_account_ids = set(cast(set[str], kwargs.get("exclude_account_ids", set())))
-        if required_account_id == account_owner.id:
-            return AccountSelection(account=account_owner, error_message=None)
-        if account_owner.id in exclude_account_ids:
-            return AccountSelection(account=account_other, error_message=None)
         return AccountSelection(account=account_owner, error_message=None)
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
@@ -34153,7 +34368,7 @@ async def test_stream_previous_response_owner_usage_limit_fails_closed(monkeypat
         del payload, headers, access_token, account_id, base_url, raise_for_status, kwargs
         yield (
             'data: {"type":"response.failed","response":{"id":"resp_owner_limit","status":"failed",'
-            '"error":{"code":"usage_limit_reached","message":"usage limit reached"},'
+            f'"error":{{"code":"{error_code}","message":"usage limit reached","resets_at":1700003600}},'
             '"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}\n\n'
         )
 
@@ -34173,11 +34388,13 @@ async def test_stream_previous_response_owner_usage_limit_fails_closed(monkeypat
 
     event = json.loads(chunks[0].split("data: ", 1)[1])
     assert event["type"] == "response.failed"
-    assert event["response"]["error"]["code"] == "previous_response_owner_unavailable"
-    assert event["response"]["error"]["message"] == "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+    assert event["response"]["error"]["code"] == error_code
+    assert event["response"]["error"]["message"] == "usage limit reached"
+    assert event["response"]["error"]["resets_at"] == 1_700_003_600
+    assert "previous_response_owner_unavailable" not in chunks[0]
     assert request_logs.lookup_calls == [("resp_prev_anchor", None, "sid-stream")]
     assert await service.drain_persistence_tasks(timeout_seconds=1)
-    assert request_logs.calls[0]["error_code"] == "previous_response_owner_unavailable"
+    assert request_logs.calls[0]["error_code"] == error_code
     assert request_logs.calls[0]["account_id"] == account_owner.id
     assert len(select_account_calls) == 1
     assert select_account_calls[0]["account_ids"] is None
@@ -34186,7 +34403,7 @@ async def test_stream_previous_response_owner_usage_limit_fails_closed(monkeypat
     handle_await_args = handle_stream_error.await_args
     assert handle_await_args is not None
     assert handle_await_args.args[0] == account_owner
-    assert handle_await_args.args[2] == "usage_limit_reached"
+    assert handle_await_args.args[2] == error_code
     record_success.assert_not_awaited()
 
 
@@ -34568,11 +34785,12 @@ async def test_stream_prompt_cache_key_does_not_soften_previous_response_owner(m
 
     event = json.loads(chunks[0].split("data: ", 1)[1])
     assert event["type"] == "response.failed"
-    assert event["response"]["error"]["code"] == "previous_response_owner_unavailable"
-    assert event["response"]["error"]["message"] == "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+    assert event["response"]["error"]["code"] == "previous_response_owner_busy"
+    assert event["response"]["error"]["type"] == "rate_limit_error"
+    assert event["response"]["error"]["message"] == "The account holding this conversation is busy. Retry in 5s."
     assert request_logs.lookup_calls == [("resp_prev_anchor", None, "sid-stream")]
     assert await service.drain_persistence_tasks(timeout_seconds=1)
-    assert request_logs.calls[0]["error_code"] == "previous_response_owner_unavailable"
+    assert request_logs.calls[0]["error_code"] == "previous_response_owner_busy"
     assert request_logs.calls[0]["account_id"] == account_owner.id
     select_account.assert_awaited_once()
     assert select_account.await_args is not None
@@ -34582,7 +34800,7 @@ async def test_stream_prompt_cache_key_does_not_soften_previous_response_owner(m
 
 
 @pytest.mark.asyncio
-async def test_stream_selection_fail_closed_records_owner_unavailable_metric(monkeypatch, caplog):
+async def test_stream_selection_deleted_owner_fails_closed_records_metric(monkeypatch, caplog):
     settings = _make_proxy_settings()
     request_logs = _RequestLogsRecorder()
     request_logs.response_owner_by_id[("resp_prev_anchor", None, "sid-stream")] = "acc_prev_owner_stream"
@@ -34596,7 +34814,13 @@ async def test_stream_selection_fail_closed_records_owner_unavailable_metric(mon
     monkeypatch.setattr(
         service._load_balancer,
         "select_account",
-        AsyncMock(return_value=AccountSelection(account=None, error_message="No active accounts available")),
+        AsyncMock(
+            return_value=AccountSelection(
+                account=None,
+                error_message="Required continuity owner account no longer exists",
+                error_code="continuity_owner_unavailable",
+            )
+        ),
     )
 
     payload = ResponsesRequest.model_validate(
@@ -34627,13 +34851,59 @@ async def test_stream_selection_fail_closed_records_owner_unavailable_metric(mon
         }
     ]
 
+@pytest.mark.asyncio
+async def test_stream_selection_propagates_required_owner_reset_deadline(monkeypatch):
+    settings = _make_proxy_settings()
+    request_logs = _RequestLogsRecorder()
+    account_owner = _make_account("acc_prev_owner_stream")
+    request_logs.response_owner_by_id[("resp_prev_anchor", None, "sid-stream")] = account_owner.id
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    select_account = AsyncMock(
+        return_value=AccountSelection(
+            account=None,
+            error_message="Required continuity owner is rate limited",
+            error_code="continuity_owner_unavailable",
+            resets_at=1_700_003_600,
+        )
+    )
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "hi",
+            "input": [],
+            "stream": True,
+            "previous_response_id": "resp_prev_anchor",
+        }
+    )
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-stream"})]
+
+    event = json.loads(chunks[0].split("data: ", 1)[1])
+    assert event["type"] == "response.failed"
+    assert event["response"]["error"]["code"] == "previous_response_owner_rate_limited"
+    assert event["response"]["error"]["type"] == "rate_limit_error"
+    assert event["response"]["error"]["message"] == "Required continuity owner is rate limited"
+    assert event["response"]["error"]["resets_at"] == 1_700_003_600
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
+    assert request_logs.calls[0]["account_id"] == account_owner.id
+    assert request_logs.calls[0]["error_code"] == "previous_response_owner_rate_limited"
+    select_account.assert_awaited_once()
+    assert select_account.await_args is not None
+    assert select_account.await_args.kwargs["required_account_id"] == account_owner.id
+
 
 @pytest.mark.asyncio
-async def test_stream_previous_response_owner_miss_fails_closed_before_unpinned_selection(monkeypatch):
+async def test_stream_owner_miss_with_single_eligible_account_in_multi_runtime_pool_is_busy(monkeypatch):
     settings = _make_proxy_settings()
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     account_other = _make_account("acc_other_stream")
+    account_configured_but_ineligible = _make_account("acc_second_stream")
     select_account = AsyncMock(return_value=AccountSelection(account=account_other, error_message=None))
     stream_calls: list[str | None] = []
     counter = _ObservedCounter()
@@ -34651,7 +34921,12 @@ async def test_stream_previous_response_owner_miss_fails_closed_before_unpinned_
     monkeypatch.setattr(
         service._load_balancer,
         "_load_selection_inputs",
-        AsyncMock(return_value=SimpleNamespace(accounts=[account_other, _make_account("acc_second_stream")])),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                accounts=[account_other],
+                runtime_accounts=[account_other, account_configured_but_ineligible],
+            )
+        ),
     )
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account_other))
     monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
@@ -34671,17 +34946,18 @@ async def test_stream_previous_response_owner_miss_fails_closed_before_unpinned_
 
     event = json.loads(chunks[0].split("data: ", 1)[1])
     assert event["type"] == "response.failed"
-    assert event["response"]["error"]["code"] == "previous_response_owner_unavailable"
-    assert event["response"]["error"]["message"] == "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+    assert event["response"]["error"]["code"] == "previous_response_owner_busy"
+    assert event["response"]["error"]["type"] == "rate_limit_error"
+    assert event["response"]["error"]["message"] == "The account holding this conversation is busy. Retry in 5s."
     assert request_logs.lookup_calls == [("resp_missing_owner", None, "sid-stream")]
     assert await service.drain_persistence_tasks(timeout_seconds=1)
-    assert request_logs.calls[0]["error_code"] == "previous_response_owner_unavailable"
+    assert request_logs.calls[0]["error_code"] == "previous_response_owner_busy"
     assert request_logs.calls[0]["account_id"] is None
     select_account.assert_not_awaited()
     assert stream_calls == []
     assert counter.samples == [
         {
-            "labels": {"surface": "http_stream", "reason": "owner_account_unavailable"},
+            "labels": {"surface": "http_stream", "reason": "owner_lookup_miss"},
             "value": 1.0,
         }
     ]

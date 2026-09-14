@@ -35,6 +35,7 @@ from app.db.models import Account, AccountStatus, DashboardSettings, HttpBridgeS
 from app.db.session import SessionLocal
 from app.dependencies import get_proxy_service_for_app
 from app.modules.proxy._service import support as proxy_support
+from app.modules.proxy._service.http_bridge import helpers as http_bridge_helpers_module
 from app.modules.proxy._service.http_bridge import quarantine as http_bridge_quarantine_module
 from app.modules.proxy._service.http_bridge import streaming as http_bridge_streaming_module
 from app.modules.proxy._service.http_bridge.helpers import (
@@ -7433,11 +7434,75 @@ async def test_v1_responses_http_bridge_classifies_responses_lite_developer_inte
         assert replay_payload["previous_response_id"] == "resp_bridge_custom_1"
 
 
+@pytest.mark.parametrize(
+    (
+        "selection_error_message",
+        "resets_at",
+        "expected_status",
+        "expected_error",
+        "expected_retry_after",
+        "continuation_attempts",
+    ),
+    [
+        pytest.param(
+            "Required continuity owner account no longer exists",
+            None,
+            502,
+            {
+                "message": "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
+                "type": "server_error",
+                "code": "previous_response_owner_unavailable",
+            },
+            None,
+            1,
+            id="deleted-owner-stays-terminal",
+        ),
+        pytest.param(
+            "No available accounts",
+            1_700_000_030,
+            429,
+            {
+                "message": "The account holding this conversation is at its rate limit. Retry in 30s.",
+                "type": "rate_limit_error",
+                "code": "previous_response_owner_rate_limited",
+                "resets_at": 1_700_000_030,
+            },
+            "30",
+            2,
+            id="temporarily-ineligible-owner-with-reset-is-rate-limited",
+        ),
+        pytest.param(
+            "No available accounts",
+            None,
+            429,
+            {
+                "message": "The account holding this conversation is busy. Retry in 5s.",
+                "type": "rate_limit_error",
+                "code": "previous_response_owner_busy",
+            },
+            "5",
+            2,
+            id="temporarily-ineligible-owner-without-reset-is-busy",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_v1_responses_http_bridge_reports_unavailable_required_owner_when_other_account_exists(
-    async_client, monkeypatch
+async def test_v1_responses_http_bridge_classifies_required_owner_selection_failures(
+    async_client,
+    monkeypatch,
+    selection_error_message,
+    resets_at,
+    expected_status,
+    expected_error,
+    expected_retry_after,
+    continuation_attempts,
 ):
     _install_bridge_settings(monkeypatch, enabled=True)
+    monkeypatch.setattr(
+        http_bridge_helpers_module,
+        "_service_time",
+        lambda: SimpleNamespace(time=lambda: 1_700_000_000.0),
+    )
     owner_account_id = await _import_account(
         async_client,
         "acc_http_bridge_required_owner",
@@ -7468,8 +7533,9 @@ async def test_v1_responses_http_bridge_reports_unavailable_required_owner_when_
         assert kwargs.get("preferred_account_is_continuity_owner") is True
         return AccountSelection(
             account=None,
-            error_message="Required continuity owner account no longer exists",
+            error_message=selection_error_message,
             error_code=CONTINUITY_OWNER_UNAVAILABLE,
+            resets_at=resets_at,
         )
 
     async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
@@ -7507,29 +7573,41 @@ async def test_v1_responses_http_bridge_reports_unavailable_required_owner_when_
     )
     assert first.status_code == 200
 
-    second = await asyncio.wait_for(
-        async_client.post(
-            "/v1/responses",
-            json={
-                "model": "gpt-5.1",
-                "instructions": "Return exactly OK.",
-                "input": "continue",
-                "prompt_cache_key": "http-bridge-required-owner",
-                "previous_response_id": first.json()["id"],
-            },
-        ),
-        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
-    )
+    continuation_responses = []
+    for _ in range(continuation_attempts):
+        continuation_responses.append(
+            await asyncio.wait_for(
+                async_client.post(
+                    "/v1/responses",
+                    json={
+                        "model": "gpt-5.1",
+                        "instructions": "Return exactly OK.",
+                        "input": "continue",
+                        "prompt_cache_key": "http-bridge-required-owner",
+                        "previous_response_id": first.json()["id"],
+                        "stream": True,
+                    },
+                ),
+                timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+            )
+        )
 
-    assert second.status_code == 502
-    assert second.json()["error"] == {
-        "message": "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
-        "type": "server_error",
-        "code": "previous_response_owner_unavailable",
-    }
+    for response in continuation_responses:
+        assert response.status_code == expected_status
+        assert response.json()["error"] == expected_error
+        if expected_status == 429:
+            assert "start a new conversation" not in response.json()["error"]["message"]
+        if expected_retry_after is None:
+            assert "Retry-After" not in response.headers
+        else:
+            assert response.headers["Retry-After"] == expected_retry_after
+
     assert selection_calls == [
         ("first_turn", None, False, True),
-        ("follow_up", owner_account.id, False, False),
+        *[
+            ("follow_up", owner_account.id, False, False)
+            for _ in range(continuation_attempts)
+        ],
     ]
     assert connect_count == 1
 
@@ -7628,17 +7706,49 @@ async def test_backend_responses_soft_prompt_cache_follow_up_uses_durable_owner_
 
 
 @pytest.mark.parametrize(
-    "fresh_developer_followup",
+    ("fresh_developer_followup", "selection_error_message", "resets_at"),
     [
-        pytest.param(False, id="ordinary-user-followup"),
-        pytest.param(True, id="fresh-developer-followup"),
+        pytest.param(
+            False,
+            "Required continuity owner account no longer exists",
+            None,
+            id="ordinary-user-followup-deleted-owner",
+        ),
+        pytest.param(
+            True,
+            "Required continuity owner account no longer exists",
+            None,
+            id="fresh-developer-followup-deleted-owner",
+        ),
+        pytest.param(
+            False,
+            "No available accounts",
+            1_700_000_030,
+            id="ordinary-user-followup-rate-limited-owner",
+        ),
+        pytest.param(
+            False,
+            "No available accounts",
+            None,
+            id="ordinary-user-followup-busy-owner",
+        ),
     ],
 )
 @pytest.mark.asyncio
 async def test_v1_responses_http_bridge_replays_full_resend_once_then_stays_on_new_owner(
-    async_client, app_instance, monkeypatch, fresh_developer_followup
+    async_client,
+    app_instance,
+    monkeypatch,
+    fresh_developer_followup,
+    selection_error_message,
+    resets_at,
 ):
     _install_bridge_settings(monkeypatch, enabled=True)
+    monkeypatch.setattr(
+        http_bridge_helpers_module,
+        "_service_time",
+        lambda: SimpleNamespace(time=lambda: 1_700_000_000.0),
+    )
     owner_account_id = await _import_account(
         async_client,
         "acc_http_bridge_replay_owner",
@@ -7669,8 +7779,9 @@ async def test_v1_responses_http_bridge_replays_full_resend_once_then_stays_on_n
             assert kwargs.get("preferred_account_is_continuity_owner") is True
             return AccountSelection(
                 account=None,
-                error_message="Required continuity owner account no longer exists",
+                error_message=selection_error_message,
                 error_code=CONTINUITY_OWNER_UNAVAILABLE,
+                resets_at=resets_at,
             )
         if owner_account.id in excluded_account_ids or preferred_account_id == alternate_account.id:
             return AccountSelection(account=alternate_account, error_message=None, error_code=None)

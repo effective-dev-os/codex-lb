@@ -721,12 +721,24 @@ def select_account(
             if quota_exceeded:
                 reset_candidates = [s.reset_at for s in quota_exceeded if s.reset_at]
                 if reset_candidates:
-                    wait_seconds = max(0, min(reset_candidates) - int(current))
-                    return SelectionResult(None, _format_retry_hint(wait_seconds), error_code=usage_blocked_code)
+                    earliest_reset_at = min(reset_candidates)
+                    wait_seconds = max(0, earliest_reset_at - int(current))
+                    return SelectionResult(
+                        None,
+                        _format_retry_hint(wait_seconds),
+                        error_code=usage_blocked_code,
+                        resets_at=int(earliest_reset_at),
+                    )
             cooldowns = [s.cooldown_until for s in all_states if s.cooldown_until and s.cooldown_until > current]
             if cooldowns:
-                wait_seconds = max(0.0, min(cooldowns) - current)
-                return SelectionResult(None, _format_retry_hint(wait_seconds), error_code=usage_blocked_code)
+                earliest_cooldown_until = min(cooldowns)
+                wait_seconds = max(0.0, earliest_cooldown_until - current)
+                return SelectionResult(
+                    None,
+                    _format_retry_hint(wait_seconds),
+                    error_code=usage_blocked_code,
+                    resets_at=int(earliest_cooldown_until),
+                )
             return SelectionResult(None, "No available accounts", error_code=usage_blocked_code)
 
     def _reset_first_sort_key(state: AccountState) -> tuple[int, float, float, float, float, str]:

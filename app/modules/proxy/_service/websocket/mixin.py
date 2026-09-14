@@ -465,7 +465,7 @@ from app.modules.proxy.http_bridge_forwarding import (
 from app.modules.proxy.http_bridge_forwarding import (
     OwnerForwardRelayFailure as OwnerForwardRelayFailure,
 )
-from app.modules.proxy.load_balancer import AccountLease, effective_account_concurrency_caps
+from app.modules.proxy.load_balancer import AccountLease, AccountSelection, CONTINUITY_OWNER_UNAVAILABLE, effective_account_concurrency_caps
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_enforced_service_tier_model_fallback,
@@ -497,6 +497,71 @@ _CAPABILITY_REQUIRED_NO_AUTHORIZED_ACCOUNTS_MESSAGE = (
     "security-work-authorized. codex-lb did not fall back to an ordinary account."
 )
 _CAPABILITY_REQUIRED_NO_AUTHORIZED_ACCOUNTS_ACTION = "fail_closed_capability_routing"
+_PREVIOUS_RESPONSE_OWNER_TEMPORARY_ERROR_CODES = frozenset(
+    {
+        "rate_limit_exceeded",
+        "usage_limit_reached",
+        "insufficient_quota",
+        "usage_not_included",
+        "quota_exceeded",
+    }
+)
+_REQUIRED_CONTINUITY_OWNER_DELETED_MESSAGE = "Required continuity owner account no longer exists"
+_PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE = (
+    "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+)
+_PREVIOUS_RESPONSE_OWNER_BUSY_RETRY_AFTER_SECONDS = 5
+
+
+def _websocket_required_owner_selection_failure(
+    selection: AccountSelection,
+) -> tuple[int, OpenAIErrorEnvelope, str, str, bool]:
+    if (
+        selection.error_code == CONTINUITY_OWNER_UNAVAILABLE
+        and selection.error_message == _REQUIRED_CONTINUITY_OWNER_DELETED_MESSAGE
+    ):
+        return (
+            502,
+            openai_error(
+                "previous_response_owner_unavailable",
+                _PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
+                error_type="server_error",
+            ),
+            "previous_response_owner_unavailable",
+            _PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
+            True,
+        )
+    if selection.resets_at is not None:
+        error_code = "previous_response_owner_rate_limited"
+        error_message = selection.error_message or "The account holding this conversation is at its rate limit."
+        return (
+            429,
+            openai_error(
+                error_code,
+                error_message,
+                error_type="rate_limit_error",
+                resets_at=selection.resets_at,
+            ),
+            error_code,
+            error_message,
+            False,
+        )
+    error_message = (
+        "The account holding this conversation is busy. "
+        f"Retry in {_PREVIOUS_RESPONSE_OWNER_BUSY_RETRY_AFTER_SECONDS}s."
+    )
+    return (
+        429,
+        openai_error(
+            "previous_response_owner_busy",
+            error_message,
+            error_type="rate_limit_error",
+        ),
+        "previous_response_owner_busy",
+        error_message,
+        False,
+    )
+
 
 
 class _WebSocketReplaySequenceRegression(Exception):
@@ -2747,6 +2812,7 @@ class _WebSocketMixin:
         client_full_resend_payload: ResponsesRequest | None = None
         client_full_resend_input_items: list[JsonValue] | None = None
         client_full_resend_retry_safe = False
+        client_full_resend_previous_response_prefix_verified = False
         if responses_payload.previous_response_id is not None and isinstance(responses_payload.input, list):
             previous_response_input_items = cast(list[JsonValue], responses_payload.input)
             client_full_resend_input_items = previous_response_input_items
@@ -2754,6 +2820,20 @@ class _WebSocketMixin:
                 previous_response_id=responses_payload.previous_response_id,
                 input_value=responses_payload.input,
                 continuity_state=continuity_state,
+            )
+            client_full_resend_previous_response_prefix_verified = bool(
+                client_full_resend_retry_safe
+                and continuity_state is not None
+                and continuity_state.last_completed_response_id == responses_payload.previous_response_id
+                and (
+                    continuity_state.last_completed_input_count > 0
+                    or continuity_state.last_completed_input_prefix_fingerprint is not None
+                )
+                and _facade()._input_prefix_matches_stored_context(
+                    responses_payload.input,
+                    stored_count=continuity_state.last_completed_input_count,
+                    stored_fingerprint=continuity_state.last_completed_input_prefix_fingerprint,
+                )
             )
             trimmed_input_items = _trim_websocket_previous_response_input_items(previous_response_input_items)
             if len(trimmed_input_items) != len(previous_response_input_items):
@@ -2877,6 +2957,9 @@ class _WebSocketMixin:
         request_state.expose_stale_previous_response_classifier = codex_session_affinity
         request_state.require_security_work_authorized = capability_route.require_security_work_authorized
         request_state.durable_capability_lineage_required = capability_route.require_security_work_authorized
+        request_state.client_full_resend_previous_response_prefix_verified = (
+            client_full_resend_previous_response_prefix_verified
+        )
         original_full_resend_input: JsonValue | None = None
         if session_anchor is not None:
             request_state.proxy_injected_previous_response_id = True
@@ -3105,6 +3188,57 @@ class _WebSocketMixin:
         max_attempts = _facade()._WEBSOCKET_MAX_ACCOUNT_ATTEMPTS
         excluded_account_ids: set[str] = set(request_state.excluded_account_ids)
         last_failover_exc: ProxyResponseError | None = None
+        if request_state.previous_response_id is not None and request_state.preferred_account_id is None:
+            selection_inputs = await proxy._load_balancer._load_selection_inputs(
+                model=model,
+                service_tier=request_state.requested_service_tier,
+                additional_limit_name=None,
+                account_ids=api_key.assigned_account_ids
+                if api_key is not None and api_key.account_assignment_scope_enabled
+                else None,
+            )
+            runtime_accounts = getattr(selection_inputs, "runtime_accounts", None)
+            if (
+                runtime_accounts is not None
+                and api_key is not None
+                and api_key.account_assignment_scope_enabled
+            ):
+                runtime_accounts = [
+                    account for account in runtime_accounts if account.id in api_key.assigned_account_ids
+                ]
+            if runtime_accounts is None or len(runtime_accounts) != 1:
+                message = (
+                    f"The account holding this conversation is busy. Retry in "
+                    f"{_PREVIOUS_RESPONSE_OWNER_BUSY_RETRY_AFTER_SECONDS}s."
+                )
+                _record_continuity_fail_closed(
+                    surface="websocket_connect",
+                    reason="owner_lookup_miss",
+                    previous_response_id=request_state.previous_response_id,
+                    session_id=request_state.session_id,
+                    upstream_error_code="owner_lookup_miss",
+                )
+                await proxy._emit_websocket_connect_failure(
+                    websocket,
+                    client_send_lock=client_send_lock,
+                    account_id=None,
+                    api_key=api_key,
+                    request_state=request_state,
+                    status_code=429,
+                    payload=openai_error(
+                        "previous_response_owner_busy",
+                        message,
+                        error_type="rate_limit_error",
+                    ),
+                    error_code="previous_response_owner_busy",
+                    error_message=message,
+                )
+                return None, None
+            # A historical owner lookup may infer an owner only from the sole
+            # configured runtime account in the applicable scope. A single
+            # currently eligible account can be a surviving replacement.
+            request_state.preferred_account_id = runtime_accounts[0].id
+
         last_failover_account: Account | None = None
         for attempt in range(max_attempts):
             is_retry = attempt > 0
@@ -3389,6 +3523,8 @@ class _WebSocketMixin:
             account = selection.account
             if account is not None:
                 break
+            if require_preferred_account:
+                break
             if selection.error_code == USAGE_LIMIT_REACHED:
                 break
 
@@ -3432,28 +3568,27 @@ class _WebSocketMixin:
             and account.id != preferred_account_id
         ):
             await proxy._load_balancer.release_account_lease(selection.lease)
-            message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
-            _record_continuity_fail_closed(
-                surface="websocket_connect",
-                reason="owner_account_unavailable",
-                previous_response_id=request_state.previous_response_id,
-                session_id=request_state.session_id,
-                upstream_error_code="previous_response_owner_unavailable",
+            status_code, error_payload, error_code, error_message, selection_is_deleted_owner = (
+                _websocket_required_owner_selection_failure(selection)
             )
+            if selection_is_deleted_owner:
+                _record_continuity_fail_closed(
+                    surface="websocket_connect",
+                    reason="owner_account_unavailable",
+                    previous_response_id=request_state.previous_response_id,
+                    session_id=request_state.session_id,
+                    upstream_error_code=selection.error_code,
+                )
             await proxy._emit_websocket_connect_failure(
                 websocket,
                 client_send_lock=client_send_lock,
                 account_id=preferred_account_id,
                 api_key=api_key,
                 request_state=request_state,
-                status_code=502,
-                payload=openai_error(
-                    "previous_response_owner_unavailable",
-                    message,
-                    error_type="server_error",
-                ),
-                error_code="previous_response_owner_unavailable",
-                error_message=message,
+                status_code=status_code,
+                payload=error_payload,
+                error_code=error_code,
+                error_message=error_message,
             )
             return None
         if account:
@@ -3496,42 +3631,27 @@ class _WebSocketMixin:
             )
             return None
         if require_preferred_account and preferred_account_id is not None:
-            if _facade()._is_local_account_cap_code(error_code):
-                status_code, error_payload = selection_failure_response(selection)
-                await proxy._emit_websocket_connect_failure(
-                    websocket,
-                    client_send_lock=client_send_lock,
-                    account_id=preferred_account_id,
-                    api_key=api_key,
-                    request_state=request_state,
-                    status_code=status_code,
-                    payload=error_payload,
-                    error_code=error_code,
-                    error_message=error_message,
-                )
-                return None
-            message = "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
-            _record_continuity_fail_closed(
-                surface="websocket_connect",
-                reason="owner_account_unavailable",
-                previous_response_id=request_state.previous_response_id,
-                session_id=request_state.session_id,
-                upstream_error_code=error_code,
+            status_code, error_payload, error_code, error_message, selection_is_deleted_owner = (
+                _websocket_required_owner_selection_failure(selection)
             )
+            if selection_is_deleted_owner:
+                _record_continuity_fail_closed(
+                    surface="websocket_connect",
+                    reason="owner_account_unavailable",
+                    previous_response_id=request_state.previous_response_id,
+                    session_id=request_state.session_id,
+                    upstream_error_code=selection.error_code,
+                )
             await proxy._emit_websocket_connect_failure(
                 websocket,
                 client_send_lock=client_send_lock,
                 account_id=preferred_account_id,
                 api_key=api_key,
                 request_state=request_state,
-                status_code=502,
-                payload=openai_error(
-                    "previous_response_owner_unavailable",
-                    message,
-                    error_type="server_error",
-                ),
-                error_code="previous_response_owner_unavailable",
-                error_message=message,
+                status_code=status_code,
+                payload=error_payload,
+                error_code=error_code,
+                error_message=error_message,
             )
             return None
         _facade().logger.warning(
@@ -4005,6 +4125,8 @@ class _WebSocketMixin:
         candidates_remaining = max_attempts - attempt
         if confirmed_pre_dispatch:
             action = "surface" if require_preferred_account or candidates_remaining <= 0 else "failover_next"
+        elif require_preferred_account and failure_class == "rate_limit":
+            action = "surface"
         elif exc.status_code == 401 and candidates_remaining > 0:
             action = "failover_next"
         elif deterministic_failover_enabled:
@@ -5102,11 +5224,22 @@ class _WebSocketMixin:
             retry_error_code in _facade()._WEBSOCKET_TRANSPARENT_REPLAY_ERROR_CODES
             and request_state.previous_response_id is not None
             and request_state.preferred_account_id is not None
-            and request_state.proxy_injected_previous_response_id
+            and (
+                request_state.proxy_injected_previous_response_id
+                or request_state.client_full_resend_previous_response_prefix_verified
+            )
             and request_state.fresh_upstream_request_is_retry_safe
             and request_state.fresh_upstream_request_text
         )
-        if (
+        owner_temporary_rate_limit = (
+            retry_error_code in _PREVIOUS_RESPONSE_OWNER_TEMPORARY_ERROR_CODES
+            and request_state.previous_response_id is not None
+            and request_state.preferred_account_id is not None
+        )
+        if owner_temporary_rate_limit and not retry_safe_owner_replay:
+            # Keep temporary owner pressure visible downstream instead of replaying an anchored request.
+            retry_error_code = None
+        elif (
             retry_error_code in _facade()._WEBSOCKET_TRANSPARENT_REPLAY_ERROR_CODES
             and request_state.previous_response_id is not None
             and request_state.preferred_account_id is not None
@@ -5125,17 +5258,21 @@ class _WebSocketMixin:
         if retry_safe_owner_replay and not retry_safe_previous_response_not_found:
             safe_request_text = _prepare_websocket_request_state_for_account_switch(request_state)
             if safe_request_text is None:
-                await proxy._handle_stream_error(
-                    account,
-                    {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
-                    retry_error_code,
-                )
-                event, payload, event_type, downstream_text = (
-                    _rewrite_websocket_previous_response_owner_unavailable_event(
-                        request_state=request_state,
+                if retry_error_code in _PREVIOUS_RESPONSE_OWNER_TEMPORARY_ERROR_CODES:
+                    # Keep temporary owner pressure visible downstream when the anchor cannot move.
+                    retry_error_code = None
+                else:
+                    await proxy._handle_stream_error(
+                        account,
+                        {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
+                        retry_error_code,
                     )
-                )
-                retry_error_code = None
+                    event, payload, event_type, downstream_text = (
+                        _rewrite_websocket_previous_response_owner_unavailable_event(
+                            request_state=request_state,
+                        )
+                    )
+                    retry_error_code = None
             else:
                 # Keep the global response-create gate/admission while dropping
                 # the old owner's per-account create lease. The replay may move

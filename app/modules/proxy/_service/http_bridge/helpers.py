@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -185,6 +186,7 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     _parse_openai_error,
 )
+from app.modules.proxy.load_balancer import AccountSelection, CONTINUITY_OWNER_UNAVAILABLE
 from app.modules.proxy.ring_membership import (
     RING_STALE_THRESHOLD_SECONDS,
     RingMembershipService,
@@ -206,6 +208,8 @@ T = TypeVar("T")
 _HTTP_BRIDGE_INFLIGHT_STARTED_AT_ATTR = "_codex_lb_started_at"
 _HTTP_BRIDGE_STALE_INFLIGHT_MIN_SECONDS = 120.0
 _HTTP_BRIDGE_STALE_INFLIGHT_TIMEOUT_MULTIPLIER = 6.0
+_CONTINUITY_OWNER_DELETED_MESSAGE = "Required continuity owner account no longer exists"
+_HTTP_BRIDGE_OWNER_BUSY_RETRY_AFTER_SECONDS = 5
 
 
 async def _await_task_deferring_cancellation(
@@ -2374,46 +2378,47 @@ def _mark_http_bridge_reader_handoff_reconnect_failed(session: Any, old_reader: 
 
 
 def _http_bridge_previous_response_owner_unavailable_error(
-    retry_after_seconds: float | None = None,
-    *,
-    transient: bool = False,
+    selection: AccountSelection | None = None,
 ) -> ProxyResponseError:
-    """The conversation's account could not be used.
+    """Classify a failed required-continuity-owner selection without parsing display text.
 
-    Two very different causes reach here and they need different answers. If the account is
-    merely at its rate limit or momentarily unselectable, retrying DOES work and telling the user
-    to start over destroys a conversation for nothing — measured 2026-08-17, 78 of these in 40
-    minutes while the owning account was healthy and the pool was simply out of short-term
-    capacity, so every one of them was advice that could not help. Only when the owner is
-    unavailable with no known deadline is "start a new conversation" the truth.
+    Only the canonical owner-deletion code/message pair authorizes a terminal response.
     """
-    if retry_after_seconds is not None:
+    if (
+        selection is not None
+        and selection.error_code == CONTINUITY_OWNER_UNAVAILABLE
+        and selection.error_message == _CONTINUITY_OWNER_DELETED_MESSAGE
+    ):
+        return ProxyResponseError(
+            502,
+            openai_error(
+                "previous_response_owner_unavailable",
+                "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
+                error_type="server_error",
+            ),
+        )
+    if selection is not None and selection.resets_at is not None:
+        retry_after_seconds = max(1, math.ceil(selection.resets_at - _service_time().time()))
         return ProxyResponseError(
             429,
             openai_error(
                 "previous_response_owner_rate_limited",
                 "The account holding this conversation is at its rate limit. "
-                f"Retry in {retry_after_seconds:.0f}s — starting a new conversation will not help.",
+                f"Retry in {retry_after_seconds}s.",
                 error_type="rate_limit_error",
+                resets_at=selection.resets_at,
             ),
-        )
-    if transient:
-        return ProxyResponseError(
-            429,
-            openai_error(
-                "previous_response_owner_busy",
-                "The account holding this conversation is busy. Retry shortly — "
-                "starting a new conversation will not help.",
-                error_type="rate_limit_error",
-            ),
+            retry_after_seconds=retry_after_seconds,
         )
     return ProxyResponseError(
-        502,
+        429,
         openai_error(
-            "previous_response_owner_unavailable",
-            "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
-            error_type="server_error",
+            "previous_response_owner_busy",
+            "The account holding this conversation is busy. "
+            f"Retry in {_HTTP_BRIDGE_OWNER_BUSY_RETRY_AFTER_SECONDS}s.",
+            error_type="rate_limit_error",
         ),
+        retry_after_seconds=_HTTP_BRIDGE_OWNER_BUSY_RETRY_AFTER_SECONDS,
     )
 
 

@@ -1885,10 +1885,13 @@ class _HTTPBridgeStreamingMixin:
             return durable_full_resend_is_account_neutral
 
         def owner_unavailable_allows_account_neutral_replay(exc: ProxyResponseError) -> bool:
-            return (
-                _http_bridge_is_previous_response_owner_unavailable(exc)
-                and durable_full_resend_allows_account_neutral_replay()
+            error_code, _error_message = _proxy_error_code_message(exc)
+            owner_recovery_error = _http_bridge_is_previous_response_owner_unavailable(exc) or (
+                exc.status_code == 429
+                and error_code
+                in {"previous_response_owner_rate_limited", "previous_response_owner_busy"}
             )
+            return owner_recovery_error and durable_full_resend_allows_account_neutral_replay()
 
         def switch_to_account_neutral_replay() -> None:
             nonlocal account_neutral_recovery
