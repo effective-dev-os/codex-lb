@@ -59,6 +59,26 @@ def test_previous_response_not_found_classifier_covers_openai_shapes():
     )
 
 
+def test_previous_response_not_found_classifier_covers_terse_invalid_anchor():
+    # Live Codex backend shape, 2026-09-11: no param, no response id, no
+    # "not found". Recovery must still strip the anchor and replay.
+    assert is_previous_response_not_found_error(
+        code="invalid_request_error",
+        param=None,
+        message="Invalid `previous_response_id`.",
+    )
+    assert not is_previous_response_not_found_error(
+        code="invalid_request_error",
+        param=None,
+        message="Invalid `model`.",
+    )
+    assert not is_previous_response_not_found_error(
+        code="invalid_request_error",
+        param="input",
+        message="Invalid `previous_response_id`.",
+    )
+
+
 def test_previous_response_id_from_not_found_message_extracts_anchor():
     assert (
         previous_response_id_from_not_found_message(

@@ -823,6 +823,30 @@ class _InvalidRequestPreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSoc
         )
 
 
+class _TerseInvalidPreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    """Live Codex backend shape observed 2026-09-11: no param, no anchor id."""
+
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "invalid_request_error",
+                            "message": "Invalid `previous_response_id`.",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
 class _ForeignPreviousResponseNotFoundAfterCreatedUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
@@ -13456,6 +13480,122 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_invalid_request_p
             "instructions": "Return exactly OK.",
             "input": "hello-again",
             "prompt_cache_key": "invalid-request-rebind",
+            "previous_response_id": first_body["id"],
+        },
+    )
+
+    assert second.status_code == 200
+    assert second.json()["output"][0]["content"][0]["text"] == "OK"
+    assert connect_count == 2
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_rebinds_after_upstream_terse_invalid_previous_response_id(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_terse_invalid_rebind",
+        "http-bridge-terse-invalid-rebind@example.com",
+    )
+    account = await _get_account(account_id)
+    first_upstream = _FakeBridgeUpstreamWebSocket()
+    recovered_upstream = _FakeBridgeUpstreamWebSocket()
+    connect_count = 0
+
+    async def fake_select_account_with_budget(
+        self,
+        deadline,
+        *,
+        request_id,
+        kind,
+        request_stage="first_turn",
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset_accounts,
+        routing_strategy,
+        model,
+        exclude_account_ids=None,
+        additional_limit_name=None,
+        api_key=None,
+        preferred_account_id=None,
+    ):
+        del preferred_account_id
+        del (
+            self,
+            deadline,
+            request_id,
+            kind,
+            request_stage,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset_accounts,
+            routing_strategy,
+            model,
+            exclude_account_ids,
+            additional_limit_name,
+            api_key,
+        )
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        nonlocal connect_count
+        connect_count += 1
+        if connect_count == 1:
+            return first_upstream
+        return recovered_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    first = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "hello",
+            "prompt_cache_key": "terse-invalid-rebind",
+        },
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+
+    service = get_proxy_service_for_app(app_instance)
+    async with service._http_bridge_lock:
+        session = next(iter(service._http_bridge_sessions.values()))
+        await _replace_http_bridge_upstream_reader(
+            service,
+            session,
+            cast(proxy_module.UpstreamWebSocket, _TerseInvalidPreviousResponseUpstreamWebSocket()),
+        )
+
+    second = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "hello-again",
+            "prompt_cache_key": "terse-invalid-rebind",
             "previous_response_id": first_body["id"],
         },
     )

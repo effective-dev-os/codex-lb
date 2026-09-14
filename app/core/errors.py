@@ -72,11 +72,22 @@ def previous_response_stream_incomplete_error() -> OpenAIErrorEnvelope:
     )
 
 
+_PREVIOUS_RESPONSE_REJECTED_RE = re.compile(
+    r"""invalid\s+[`'"]?previous[ _]response[ _]id[`'"]?""",
+    re.IGNORECASE,
+)
+
+
 def is_previous_response_not_found_message(message: str | None) -> bool:
     if message is None:
         return False
     normalized = " ".join(message.lower().split())
-    return "previous response" in normalized and "not found" in normalized
+    if "previous response" in normalized and "not found" in normalized:
+        return True
+    # Observed live 2026-09-11: the Codex backend rejects a stale anchor with
+    # the terse "Invalid `previous_response_id`." and no param, which carries
+    # neither "not found" nor the response id.
+    return _PREVIOUS_RESPONSE_REJECTED_RE.search(normalized) is not None
 
 
 def previous_response_id_from_not_found_message(message: str | None) -> str | None:
@@ -102,7 +113,9 @@ def is_previous_response_not_found_error(
 ) -> bool:
     if code == PREVIOUS_RESPONSE_NOT_FOUND_CODE:
         return True
-    if code != "invalid_request_error" or param != "previous_response_id":
+    if code != "invalid_request_error":
+        return False
+    if param is not None and param != "previous_response_id":
         return False
     return is_previous_response_not_found_message(message)
 
