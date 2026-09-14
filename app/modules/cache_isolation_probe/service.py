@@ -258,7 +258,7 @@ def assess_pool_pressure(accounts: Sequence[Account]) -> PoolPressure:
 
     if is_degraded():
         return _verdict("upstream_degraded", "The proxy is running in degraded mode.")
-    if are_all_account_circuit_breakers_open():
+    if are_all_account_circuit_breakers_open(account.id for account in accounts):
         return _verdict("circuit_breakers_open", "Every account circuit breaker is open.")
     if len(eligible) < MIN_PROBE_ACCOUNTS:
         return _verdict(
