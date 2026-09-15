@@ -864,6 +864,7 @@ async def run_sticky_selection_path(
             # which may delete or rebind soft mappings under pressure.
             result = _select_account_preferring_budget_safe(
                 selection_states,
+                mandatory_pool=True,
                 prefer_earlier_reset=prefer_earlier_reset_accounts,
                 prefer_earlier_reset_window=prefer_earlier_reset_window,
                 routing_strategy=routing_strategy,
@@ -893,6 +894,7 @@ async def run_sticky_selection_path(
             try:
                 async with owner._repo_factory() as repos:
                     sticky_outcome = await owner._select_with_stickiness(
+                        mandatory_pool=required_account_id is not None,
                         states=selection_states,
                         account_map=account_map,
                         sticky_key=sticky_key,
@@ -1434,6 +1436,7 @@ async def _select_with_stickiness(
     traffic_class: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
     ignore_standard_quota: bool = False,
     allow_usage_exhaustion_error: bool = True,
+    mandatory_pool: bool = False,
     usage_exhaustion_states: Iterable[AccountState] | None = None,
     sticky_refresh_skip_deadline: datetime | None = None,
     overload_backoff_runtime: Mapping[str, RuntimeState] | None = None,
@@ -1445,6 +1448,7 @@ async def _select_with_stickiness(
         return _StickySelectionOutcome(
             selection=_select_account_preferring_budget_safe(
                 states,
+                mandatory_pool=mandatory_pool,
                 prefer_earlier_reset=prefer_earlier_reset_accounts,
                 prefer_earlier_reset_window=prefer_earlier_reset_window,
                 routing_strategy=routing_strategy,
@@ -1536,6 +1540,7 @@ async def _select_with_stickiness(
     def _choose_from(candidates: list[AccountState], *, selection_seed: str | None = None) -> SelectionResult:
         return _select_account_preferring_budget_safe(
             candidates,
+            mandatory_pool=mandatory_pool and len(candidates) == len(states),
             selection_seed=selection_seed,
             prefer_earlier_reset=prefer_earlier_reset_accounts,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
@@ -2259,6 +2264,7 @@ def _select_account_preferring_budget_safe(
     secondary_budget_threshold_pct: float = 100.0,
     apply_secondary_budget_threshold: bool = False,
     allow_backoff_fallback: bool = True,
+    mandatory_pool: bool = False,
     deterministic_probe: bool = False,
     traffic_class: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
     ignore_standard_quota: bool = False,
@@ -2314,8 +2320,10 @@ def _select_account_preferring_budget_safe(
             for state in state_list
             if state.routing_policy != ROUTING_POLICY_PRESERVE and not state_budget_threshold(state)
         ]
+        budget_safe_pool = budget_safe_states or state_list
         return select_account(
-            budget_safe_states or state_list,
+            budget_safe_pool,
+            mandatory_pool=mandatory_pool and len(budget_safe_pool) == len(state_list),
             status_census=status_census,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
@@ -2363,6 +2371,7 @@ def _select_account_preferring_budget_safe(
         selection_pool = preferred_states if len(preferred_states) != len(state_list) else state_list
         preferred = select_account(
             selection_pool,
+            mandatory_pool=mandatory_pool and selection_pool is state_list,
             status_census=status_census,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
@@ -2385,6 +2394,7 @@ def _select_account_preferring_budget_safe(
     if routing_strategy == "usage_weighted" and state_list:
         return select_account(
             state_list,
+            mandatory_pool=mandatory_pool,
             status_census=status_census,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
@@ -2401,6 +2411,7 @@ def _select_account_preferring_budget_safe(
         )
     return select_account(
         state_list,
+        mandatory_pool=mandatory_pool,
         prefer_earlier_reset=prefer_earlier_reset,
         prefer_earlier_reset_window=prefer_earlier_reset_window,
         routing_strategy=routing_strategy,

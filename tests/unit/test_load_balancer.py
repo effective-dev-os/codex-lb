@@ -4376,7 +4376,8 @@ def test_error_backoff_resets_error_count_when_expired():
     assert state.last_error_at is None
 
 
-def test_error_backoff_does_not_reset_when_still_active():
+def test_error_backoff_keeps_error_count_and_refuses_a_widenable_lone_pool():
+    """Live backoff keeps the count and still refuses, so callers can fail over."""
     now = 1_700_000_000.0
     state = AccountState(
         "a",
@@ -4388,6 +4389,46 @@ def test_error_backoff_does_not_reset_when_still_active():
     result = select_account([state], now=now)
     assert result.account is None
     assert state.error_count == 5
+
+
+def test_error_backoff_still_steers_away_when_another_candidate_is_healthy():
+    now = 1_700_000_000.0
+    backed_off = AccountState(
+        "flaky",
+        AccountStatus.ACTIVE,
+        used_percent=5.0,
+        error_count=5,
+        last_error_at=now - 60,
+    )
+    healthy = AccountState("healthy", AccountStatus.ACTIVE, used_percent=5.0)
+
+    result = select_account([backed_off, healthy], now=now, routing_strategy="round_robin")
+
+    assert result.account is not None
+    assert result.account.account_id == "healthy"
+
+
+def test_owner_pinned_candidate_in_backoff_is_served_instead_of_refused():
+    """An owner-restricted turn has nowhere to steer, so backoff must not refuse it.
+
+    Reproduces the 2026-09-15 incident: a continuity turn narrowed to its
+    owning account got a terminal "No available accounts" for 13 minutes
+    while the account itself was ACTIVE with healthy quota.
+    """
+    now = 1_700_000_000.0
+    owner = AccountState(
+        "owner",
+        AccountStatus.ACTIVE,
+        used_percent=7.0,
+        error_count=6,
+        last_error_at=now - 5,
+    )
+
+    result = select_account([owner], now=now, mandatory_pool=True)
+
+    assert result.error_message is None
+    assert result.account is not None
+    assert result.account.account_id == "owner"
 
 
 def test_error_backoff_expired_account_does_not_immediately_relock():

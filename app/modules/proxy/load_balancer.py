@@ -1680,12 +1680,14 @@ class LoadBalancer:
         traffic_class: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
         ignore_standard_quota: bool = False,
         allow_usage_exhaustion_error: bool = True,
+        mandatory_pool: bool = False,
         usage_exhaustion_states: Iterable[AccountState] | None = None,
         sticky_refresh_skip_deadline: datetime | None = None,
         redact_sensitive_details: bool = False,
         status_census: AccountStatusCensus | None = None,
     ) -> _StickySelectionOutcome:
         return await _run_select_with_stickiness(
+            mandatory_pool=mandatory_pool,
             states=states,
             account_map=account_map,
             sticky_key=sticky_key,

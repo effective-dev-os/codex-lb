@@ -525,6 +525,7 @@ def select_account(
     prefer_earlier_reset_window: ResetPreferenceWindow = "secondary",
     routing_strategy: RoutingStrategy = "capacity_weighted",
     allow_backoff_fallback: bool = True,
+    mandatory_pool: bool = False,
     deterministic_probe: bool = False,
     recovery_probe_only: bool = False,
     relative_availability_power: float = DEFAULT_RELATIVE_AVAILABILITY_POWER,
@@ -692,7 +693,27 @@ def select_account(
             and state.account_id not in in_error_backoff_ids
             for state in all_states
         )
-        if allow_backoff_fallback and (len(in_error_backoff) > 1 or (in_error_backoff and hard_blocked_exists)):
+        # Error backoff steers traffic away from a flaky account. A mandatory
+        # pool -- an owner-pinned continuity turn, whose candidate list no
+        # caller may widen -- has nowhere to steer: backing its only healthy
+        # candidate off refuses the turn outright instead of slowing it down,
+        # which kills the conversation rather than delaying it. A pool that a
+        # caller narrowed as a soft preference keeps the old behaviour so the
+        # caller can still fail over to the candidates it held back.
+        mandatory_pool_has_nowhere_to_steer = (
+            mandatory_pool
+            and bool(in_error_backoff)
+            and len(in_error_backoff) == len(all_states)
+            and all(
+                state.status == AccountStatus.ACTIVE and not _known_expired_reauth(state, current)
+                for state in in_error_backoff
+            )
+        )
+        if allow_backoff_fallback and (
+            len(in_error_backoff) > 1
+            or (in_error_backoff and hard_blocked_exists)
+            or mandatory_pool_has_nowhere_to_steer
+        ):
 
             def _backoff_expires_at(s: AccountState) -> float:
                 backoff = min(300, 30 * (2 ** (s.error_count - ERROR_BACKOFF_THRESHOLD)))

@@ -350,6 +350,34 @@ async def test_required_continuity_owner_miss_does_not_mark_healthy_pool_degrade
 
 
 @pytest.mark.asyncio
+async def test_required_continuity_owner_in_error_backoff_is_still_served(
+    selection_cache: AccountSelectionCache,
+) -> None:
+    """2026-09-15: a continuity turn was refused for 13 min over soft backoff.
+
+    The owner was ACTIVE with healthy quota, but its pool cannot be widened,
+    so error backoff had nowhere to steer and the refusal was unrecoverable --
+    Codex retried the same rejected replay every ~7s until the session died.
+    """
+    owner = _account("contract-backoff-owner")
+    alternate = _account("contract-backoff-alternate")
+    balancer, _, _, _ = _balancer([owner, alternate], selection_cache)
+    await balancer.record_error_backoff(owner)
+
+    selection = await balancer.select_account(
+        required_account_id=owner.id,
+        required_continuity_owner=True,
+        lease_kind="stream",
+        concurrency_caps=_CONCURRENCY_CAPS,
+    )
+
+    assert selection.error_message is None
+    assert selection.error_code is None
+    assert selection.account is not None
+    assert selection.account.id == owner.id
+
+
+@pytest.mark.asyncio
 async def test_deleted_required_continuity_owner_returns_typed_miss_without_global_health_change(
     selection_cache: AccountSelectionCache,
     monkeypatch: pytest.MonkeyPatch,
