@@ -11949,6 +11949,196 @@ async def test_create_http_bridge_session_idle_close_error_is_not_treated_as_dea
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("unsafe", ["delta", "output", "sequence", "replayed", "deadline", "pending", "billed"])
+async def test_http_bridge_connection_limit_refusal_settles_once_without_health_penalty(monkeypatch, unsafe):
+    clock = VirtualClock(monotonic_value=1_000_000.0)
+    service = proxy_service.ProxyService(cast(Any, nullcontext()), clock=clock)
+    state = _accepted_bridge_request_state(
+        started_at=clock.monotonic(),
+        bridge_request_deadline=clock.monotonic() + 60,
+        response_id=None,
+        response_event_count=0,
+        awaiting_response_created=True,
+    )
+    if unsafe == "delta":
+        state.previous_response_id = "resp_delta_anchor"
+    elif unsafe == "output":
+        state.downstream_visible = True
+    elif unsafe == "sequence":
+        state.last_downstream_sequence_number = 0
+    elif unsafe == "replayed":
+        state.replay_count = 1
+    elif unsafe == "deadline":
+        state.bridge_request_deadline = clock.monotonic() - 1
+    pending = deque([state])
+    if unsafe == "pending":
+        pending.append(_accepted_bridge_request_state(request_id="req_sibling", response_id="resp_sibling"))
+    session = _make_bridge_session(pending_requests=pending, queued_request_count=len(pending))
+    payload = {
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "code": "websocket_connection_limit_reached",
+            "message": "Create a new websocket connection.",
+        },
+    }
+    if unsafe == "billed":
+        payload["usage"] = {"output_tokens": 1}
+    health, settle, log, retry = AsyncMock(), AsyncMock(return_value=True), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(service, "_handle_stream_error", health)
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", settle)
+    monkeypatch.setattr(service, "_write_request_log", log)
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry)
+    monkeypatch.setattr(service, "_maybe_release_idle_http_bridge_session_lease", AsyncMock())
+
+    await service._process_http_bridge_upstream_text(session, json.dumps(payload))
+
+    retry.assert_not_awaited()
+    health.assert_not_awaited()
+    settle.assert_awaited_once()
+    assert settle.await_args.args[2].account_health_error is False
+    log.assert_awaited_once()
+    assert log.await_args.kwargs["upstream_error_code"] == "websocket_connection_limit_reached"
+    assert state.previous_response_id == ("resp_delta_anchor" if unsafe == "delta" else None)
+    assert session.upstream_control.retire_after_drain
+
+
+@pytest.mark.asyncio
+async def test_connection_limit_reconnect_goal_restart_cannot_select_another_account(monkeypatch):
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key=proxy_service._HTTPBridgeSessionKey("prompt_cache", "limit-goal-restart", None))
+    state = _accepted_bridge_request_state()
+    state.affinity_policy = replace(state.affinity_policy, abandon_unavailable_legacy_owner=True)
+    state.preferred_account_id = session.account.id
+    state.replay_required_account_id = session.account.id
+    select = AsyncMock(
+        return_value=proxy_service.AccountSelection(
+            account=cast(Any, SimpleNamespace(id="acc-alternate")), error_message=None, error_code=None
+        )
+    )
+    open_socket = AsyncMock()
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: SimpleNamespace(
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    prefer_earlier_reset_accounts=False,
+                    prefer_earlier_reset_window="secondary",
+                    routing_strategy="usage_weighted",
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(service, "_select_account_with_budget_compatible", select)
+    monkeypatch.setattr(service, "_open_upstream_websocket_with_budget", open_socket)
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await service._reconnect_http_bridge_session(
+            session, request_state=state, require_same_account=True, require_preferred_account=True
+        )
+
+    assert exc_info.value.payload["error"]["code"] == "previous_response_owner_unavailable"
+    assert select.await_args.kwargs["preferred_account_id"] == session.account.id
+    assert select.await_args.kwargs["fallback_on_preferred_account_unavailable"] is False
+    open_socket.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["contended_gate", "deadline_during_reconnect", "reconnect_failure"])
+async def test_http_bridge_connection_limit_replacement_stops_before_unsafe_send(monkeypatch, stop):
+    clock = VirtualClock(monotonic_value=1_000_000.0)
+    service = proxy_service.ProxyService(cast(Any, nullcontext()), clock=clock)
+    monkeypatch.setattr(service._durable_bridge, "lookup_retry_circuit", AsyncMock(return_value=None))
+    state = _accepted_bridge_request_state(
+        started_at=clock.monotonic(),
+        bridge_request_deadline=clock.monotonic() + 60,
+        account_response_create_lease=cast(Any, object()),
+    )
+    session = _make_bridge_session(pending_requests=deque([state]), queued_request_count=1)
+    send = AsyncMock()
+    session.upstream = cast(UpstreamWebSocket, SimpleNamespace(send_text=send, close=AsyncMock()))
+    if stop == "contended_gate":
+        await session.response_create_gate.acquire()
+
+    async def reconnect(*args, **kwargs):
+        if stop == "deadline_during_reconnect":
+            clock.advance(61)
+        if stop == "reconnect_failure":
+            raise RuntimeError("replacement unavailable")
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(service, "_reconnect_http_bridge_session", reconnect)
+    monkeypatch.setattr(service, "_release_request_state_account_response_create_lease", AsyncMock())
+
+    assert not await service._retry_http_bridge_precreated_request(
+        session, request_state=state, connection_limit_replay=True
+    )
+    send.assert_not_awaited()
+    assert state.replay_count == (0 if stop == "contended_gate" else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+@pytest.mark.parametrize("wait", ["reconnect", "create_lease"])
+@pytest.mark.parametrize("stop", ["detached", "draining", "abandoned"])
+async def test_http_bridge_connection_limit_replacement_rechecks_ownership(monkeypatch, accepted, wait, stop):
+    clock = VirtualClock(monotonic_value=1_000_000.0)
+    service = proxy_service.ProxyService(cast(Any, nullcontext()), clock=clock)
+    monkeypatch.setattr(service._durable_bridge, "lookup_retry_circuit", AsyncMock(return_value=None))
+    state = _accepted_bridge_request_state(
+        started_at=clock.monotonic(),
+        bridge_request_deadline=clock.monotonic() + 60,
+        response_id="resp-accepted-visible" if accepted else None,
+        response_event_count=2 if accepted else 0,
+        awaiting_response_created=not accepted,
+        account_response_create_lease=None if wait == "create_lease" else cast(Any, object()),
+    )
+    session = _make_bridge_session(pending_requests=deque([state]), queued_request_count=1)
+    send = AsyncMock()
+    session.upstream = cast(UpstreamWebSocket, SimpleNamespace(send_text=send, close=AsyncMock()))
+
+    def detach():
+        if stop == "detached":
+            session.pending_requests.remove(state)
+            session.queued_request_count = 0
+            state.event_queue = None
+        elif stop == "draining":
+            state.draining_until_terminal = True
+        else:
+            state.terminal_settlement_phase = "abandoned"
+
+    async def reconnect(*args, **kwargs):
+        if wait == "reconnect":
+            detach()
+
+    async def acquire_lease(**kwargs):
+        detach()
+        return cast(Any, object())
+
+    release_lease = AsyncMock()
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: SimpleNamespace(get=AsyncMock(return_value=_bridge_selection_settings())),
+    )
+    monkeypatch.setattr(service, "_reconnect_http_bridge_session", reconnect)
+    monkeypatch.setattr(service, "_acquire_account_response_create_lease_or_overload", acquire_lease)
+    monkeypatch.setattr(service, "_release_request_state_account_response_create_lease", release_lease)
+
+    assert not await service._retry_http_bridge_precreated_request(
+        session, request_state=state, connection_limit_replay=True
+    )
+    send.assert_not_awaited()
+    release_lease.assert_awaited_once_with(state)
+    assert state.response_create_admission is None
+    assert state.replay_count == 1
+
+
+@pytest.mark.asyncio
 async def test_reconnect_http_bridge_session_passes_dashboard_reset_window_to_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

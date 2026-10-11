@@ -13631,6 +13631,230 @@ def test_backend_responses_websocket_retries_accepted_output_free_capacity_error
     assert json.loads(recovered_upstream.sent_text[0])["input"] == json.loads(first_upstream.sent_text[0])["input"]
 
 
+@pytest.mark.parametrize("accepted", [False, True])
+@pytest.mark.parametrize("anchored", [False, True])
+def test_backend_responses_websocket_connection_limit_replays_on_same_account(
+    app_instance, monkeypatch, accepted, anchored
+):
+    error = _ws_event(
+        {
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "websocket_connection_limit_reached",
+                "message": "Create a new websocket connection.",
+            },
+        }
+    )
+    batches = []
+    if anchored:
+        batches.append(
+            [
+                _ws_event({"type": "response.created", "response": {"id": "resp_limit_anchor"}}),
+                _ws_event(
+                    {
+                        "type": "response.completed",
+                        "response": {"id": "resp_limit_anchor", "status": "completed", "output": []},
+                    }
+                ),
+            ]
+        )
+    batches.append([*(_accepted_output_free_prelude("resp_limit_accepted") if accepted else []), error])
+    first = _SequencedUpstreamWebSocket([], deferred_message_batches=batches)
+    replacement = _recovered_upstream("resp_limit_recovered")
+    failover = _TwoAccountWebSocketFailover(first, replacement)
+    failover.upstreams_by_account[failover.FIRST_ACCOUNT_ID].append(replacement)
+    failover.install(monkeypatch)
+
+    events, disconnect = failover.run_anchored_follow_up(app_instance) if anchored else failover.run(app_instance)
+
+    _assert_ws_single_response_lifecycle_completed(events, disconnect)
+    assert failover.connect_accounts == [failover.FIRST_ACCOUNT_ID, failover.FIRST_ACCOUNT_ID]
+    assert failover.required_at_connect[-1] == failover.FIRST_ACCOUNT_ID
+    assert failover.excluded_at_connect[-1] == set()
+    assert first.closed
+    assert len(replacement.sent_text) == 1
+    replay = json.loads(replacement.sent_text[0])
+    assert "previous_response_id" not in replay
+    assert replay["input"] == (
+        [failover.HISTORICAL_INPUT, failover.FOLLOW_UP_INPUT] if anchored else [failover.HISTORICAL_INPUT]
+    )
+    assert failover.stream_errors == []
+    assert len(failover.request_logs) == (2 if anchored else 1)
+    assert failover.request_logs[-1]["status"] == "success"
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+@pytest.mark.parametrize("wait", ["connect", "create_lease"])
+@pytest.mark.parametrize("stop", ["deadline", "settled"])
+def test_backend_responses_websocket_connection_limit_rechecks_before_send(
+    app_instance, monkeypatch, accepted, wait, stop
+):
+    error = _ws_event(
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "websocket_connection_limit_reached",
+                "message": "Create a new websocket connection.",
+            },
+        }
+    )
+    first = _SequencedUpstreamWebSocket(
+        [], deferred_message_batches=[[*(_accepted_output_free_prelude("resp_limit_wait") if accepted else []), error]]
+    )
+    replacement = _recovered_upstream("resp_limit_late")
+    failover = _TwoAccountWebSocketFailover(first, replacement)
+    failover.upstreams_by_account[failover.FIRST_ACCOUNT_ID].append(replacement)
+    failover.install(monkeypatch)
+    original_connect = proxy_module.ProxyService._connect_proxy_websocket
+    original_acquire = proxy_module.ProxyService._acquire_account_response_create_lease_or_overload
+    original_relay = proxy_module.ProxyService._relay_upstream_websocket_messages
+    current_state = None
+    relay_context = {}
+
+    async def stop_replay(service):
+        assert current_state is not None
+        assert current_state.precreated_replay_reason == "websocket_connection_limit_reached"
+        if stop == "deadline":
+            budget = proxy_module._stream_request_budget_seconds(
+                proxy_module.get_settings(), request_transport="websocket"
+            )
+            current_state.started_at = time.monotonic() - budget - 1
+        else:
+            await service._fail_pending_websocket_requests(
+                account_id_value=failover.FIRST_ACCOUNT_ID,
+                pending_requests=relay_context["pending_requests"],
+                pending_lock=relay_context["pending_lock"],
+                error_code="upstream_request_timeout",
+                error_message="Proxy request budget exhausted",
+                api_key=relay_context["api_key"],
+                websocket=relay_context["websocket"],
+                client_send_lock=relay_context["client_send_lock"],
+                response_create_gate=relay_context["response_create_gate"],
+                penalize_account=False,
+            )
+
+    async def connect(service, *args, request_state, **kwargs):
+        nonlocal current_state
+        current_state = request_state
+        result = await original_connect(service, *args, request_state=request_state, **kwargs)
+        if request_state.replay_count and wait == "create_lease" and not accepted:
+            await service._release_request_state_account_response_create_lease(request_state)
+        if request_state.replay_count and wait == "connect":
+            await stop_replay(service)
+        return result
+
+    async def acquire(service, **kwargs):
+        result = await original_acquire(service, **kwargs)
+        if current_state is not None and current_state.replay_count and wait == "create_lease":
+            await stop_replay(service)
+        return result
+
+    async def relay(service, websocket, *args, **kwargs):
+        relay_context.update(kwargs, websocket=websocket)
+        return await original_relay(service, websocket, *args, **kwargs)
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", connect)
+    monkeypatch.setattr(proxy_module.ProxyService, "_acquire_account_response_create_lease_or_overload", acquire)
+    monkeypatch.setattr(proxy_module.ProxyService, "_relay_upstream_websocket_messages", relay)
+
+    events, _ = failover.run(app_instance)
+
+    assert replacement.sent_text == []
+    terminal = events[-1]
+    terminal_error = terminal["response"]["error"] if terminal["type"] == "response.failed" else terminal["error"]
+    assert terminal_error["code"] == "upstream_request_timeout"
+    assert sum(event["type"] in {"error", "response.failed"} for event in events) == 1
+    assert failover.stream_errors == []
+    assert len(failover.request_logs) == 1
+
+
+def test_backend_responses_websocket_connection_limit_replays_only_once(app_instance, monkeypatch):
+    error = _ws_event(
+        {
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "websocket_connection_limit_reached",
+                "message": "Create a new websocket connection.",
+            },
+        }
+    )
+    first = _SequencedUpstreamWebSocket([], deferred_message_batches=[[error]])
+    replacement = _SequencedUpstreamWebSocket([], deferred_message_batches=[[error]])
+    failover = _TwoAccountWebSocketFailover(first, replacement)
+    failover.upstreams_by_account[failover.FIRST_ACCOUNT_ID].append(replacement)
+    failover.install(monkeypatch)
+
+    events, _ = failover.run(app_instance)
+
+    assert events[-1]["error"]["code"] == "websocket_connection_limit_reached"
+    assert failover.connect_accounts == [failover.FIRST_ACCOUNT_ID, failover.FIRST_ACCOUNT_ID]
+    assert len(first.sent_text) == len(replacement.sent_text) == 1
+    assert failover.stream_errors == []
+    assert len(failover.request_logs) == 1
+    assert failover.request_logs[0]["upstream_error_code"] == "websocket_connection_limit_reached"
+
+
+@pytest.mark.parametrize("barrier", ["output", "sequence", "delta"])
+def test_backend_responses_websocket_connection_limit_refuses_unsafe_replay(app_instance, monkeypatch, barrier):
+    error = _ws_event(
+        {
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "websocket_connection_limit_reached",
+                "message": "Create a new websocket connection.",
+            },
+        }
+    )
+    prelude = _accepted_output_free_prelude("resp_limit_unsafe")
+    if barrier == "sequence":
+        prelude = [
+            _ws_event({"type": "response.created", "sequence_number": 0, "response": {"id": "resp_limit_unsafe"}})
+        ]
+    if barrier == "output":
+        prelude.append(
+            _ws_event({"type": "response.output_text.delta", "response_id": "resp_limit_unsafe", "delta": "partial"})
+        )
+    if barrier == "delta":
+        batches = [
+            [
+                _ws_event({"type": "response.created", "response": {"id": "resp_limit_anchor"}}),
+                _ws_event(
+                    {
+                        "type": "response.completed",
+                        "response": {"id": "resp_limit_anchor", "status": "completed", "output": []},
+                    }
+                ),
+            ],
+            [error],
+        ]
+    else:
+        batches = [[*prelude, error]]
+    first = _SequencedUpstreamWebSocket([], deferred_message_batches=batches)
+    failover = _TwoAccountWebSocketFailover(first, _recovered_upstream("resp_unused"))
+    failover.install(monkeypatch)
+    requests = None
+    if barrier == "delta":
+        requests = [
+            failover.response_create([failover.HISTORICAL_INPUT]),
+            {**failover.response_create([failover.FOLLOW_UP_INPUT]), "previous_response_id": "resp_limit_anchor"},
+        ]
+
+    events, _ = failover.run(app_instance, requests=requests)
+
+    assert events[-1]["error"]["code"] == "websocket_connection_limit_reached"
+    assert failover.connect_accounts == [failover.FIRST_ACCOUNT_ID]
+    assert failover.stream_errors == []
+    assert len(failover.request_logs) == (2 if barrier == "delta" else 1)
+    assert failover.request_logs[-1]["upstream_error_code"] == "websocket_connection_limit_reached"
+
+
 def test_backend_responses_websocket_retries_accepted_output_free_abrupt_close_on_another_account(
     app_instance,
     monkeypatch,

@@ -47,9 +47,11 @@ from app.core.errors import (
     PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
     PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
+    WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE,
     OpenAIErrorEnvelope,
     OpenAIErrorParam,
     coerce_error_param,
+    is_websocket_connection_limit_error,
     normalize_public_error_param,
     openai_error,
     previous_response_stream_incomplete_error,
@@ -87,6 +89,7 @@ from app.modules.proxy._service.compact import (
     _sticky_key_from_compact_payload as _sticky_key_from_compact_payload,
 )
 from app.modules.proxy._service.http_bridge.accepted_replay import (
+    _terminal_payload_reports_output,
     _websocket_accepted_capacity_retry_error_code,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
@@ -969,6 +972,47 @@ def _websocket_event_error_message(event_type: str | None, payload: dict[str, Js
         return None
     stripped = message_value.strip()
     return stripped or None
+
+
+def _is_websocket_connection_limit_event(event_type: str | None, payload: dict[str, JsonValue] | None) -> bool:
+    return event_type in {"error", "response.failed"} and is_websocket_connection_limit_error(
+        _normalize_error_code(
+            _websocket_event_error_code(event_type, payload), _websocket_event_error_type(event_type, payload)
+        )
+    )
+
+
+def _websocket_connection_limit_replay_allowed(
+    request_state: _WebSocketRequestState,
+    *,
+    payload: dict[str, JsonValue] | None,
+    has_other_pending_requests: bool,
+) -> bool:
+    return (
+        not has_other_pending_requests
+        and request_state.last_downstream_sequence_number is None
+        and not request_state.draining_until_terminal
+        and request_state.terminal_settlement_phase != "abandoned"
+        and not _terminal_payload_reports_output(payload)
+        and not _websocket_event_error_param(_event_type_from_payload(None, payload), payload).malformed
+        and _websocket_request_can_replay_before_visible_output(request_state)
+    )
+
+
+def _prepare_websocket_connection_limit_replay(
+    request_state: _WebSocketRequestState,
+    *,
+    account_id: str,
+) -> str | None:
+    request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+    if request_text is None:
+        return None
+    # Connection retirement is transport-local even when the full body is portable.
+    request_state.preferred_account_id = account_id
+    request_state.replay_required_account_id = account_id
+    request_state.precreated_replay_reason = WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+    request_state.precreated_replay_account_id = account_id
+    return request_text
 
 
 def _websocket_precreated_retry_error_code(

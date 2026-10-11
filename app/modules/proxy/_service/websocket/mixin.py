@@ -69,6 +69,7 @@ from app.core.errors import (
     PREVIOUS_RESPONSE_NOT_FOUND_CODE,
     PREVIOUS_RESPONSE_OWNER_UNAVAILABLE_MESSAGE,
     STREAM_INCOMPLETE_ANCHOR_NEUTRAL_MESSAGES,
+    WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE,
     OpenAIErrorEnvelope,
     OpenAIErrorParam,
     openai_error,
@@ -312,7 +313,10 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.observability import (
     _maybe_log_proxy_service_tier_trace as _maybe_log_proxy_service_tier_trace,
 )
-from app.modules.proxy._service.observability import _observe_terminal_stream_error_frame
+from app.modules.proxy._service.observability import (
+    _observe_terminal_stream_error_frame,
+    _record_websocket_connection_limit,
+)
 from app.modules.proxy._service.observability import (
     _record_continuity_fail_closed as _record_continuity_fail_closed,
 )
@@ -405,6 +409,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _find_websocket_request_state_by_response_id,
     _forget_websocket_stale_previous_response,
     _install_verified_fresh_replay,
+    _is_websocket_connection_limit_event,
     _is_websocket_response_create,
     _is_websocket_stale_previous_response,
     _match_websocket_request_state_for_anonymous_event,
@@ -415,6 +420,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _pop_matching_websocket_request_states,
     _pop_replayable_precreated_websocket_request_state,
     _pop_terminal_websocket_request_state,
+    _prepare_websocket_connection_limit_replay,
     _prepare_websocket_request_state_for_account_switch,
     _prepare_websocket_request_state_for_auth_replay,
     _record_or_defer_websocket_accepted_replay_health,
@@ -439,6 +445,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _websocket_capability_metadata_values,
     _websocket_client_previous_response_full_resend_is_retry_safe,
     _websocket_connect_deadline,
+    _websocket_connection_limit_replay_allowed,
     _websocket_continuity_anchor_for_payload,
     _websocket_continuity_error_fields,
     _websocket_continuity_response_ids,
@@ -2770,6 +2777,55 @@ class _WebSocketMixin:
                         account = None
                         continue
                     if text_data is not None:
+                        if (
+                            request_state is not None
+                            and request_state.precreated_replay_reason == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+                        ):
+                            # The replacement reader can relinquish this turn
+                            # while connect or create-lease acquisition awaits.
+                            async with pending_lock:
+                                replay_attached = (
+                                    request_state in pending_requests
+                                    and not request_state.draining_until_terminal
+                                    and request_state.terminal_settlement_phase != "abandoned"
+                                )
+                                replay_expired = clock.monotonic() >= _websocket_connect_deadline(
+                                    request_state,
+                                    _facade()._stream_request_budget_seconds(
+                                        runtime_settings, request_transport="websocket"
+                                    ),
+                                    now=clock.monotonic(),
+                                )
+                                if replay_attached and replay_expired:
+                                    pending_requests.remove(request_state)
+                                    request_state_to_fail = request_state
+                            if request_state_to_fail is not None:
+                                request_state.upstream_error_code_override = WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+                                request_state_failure_task = scheduler_for(proxy).create_task(
+                                    proxy._fail_pending_websocket_requests(
+                                        account=None,
+                                        account_id_value=account.id if account is not None else upstream_account_id,
+                                        pending_requests=deque([request_state_to_fail]),
+                                        pending_lock=anyio.Lock(),
+                                        error_code="upstream_request_timeout",
+                                        error_message="Proxy request budget exhausted",
+                                        api_key=api_key,
+                                        websocket=websocket,
+                                        client_send_lock=client_send_lock,
+                                        response_create_gate=response_create_gate,
+                                        downstream_activity=downstream_activity,
+                                        penalize_account=False,
+                                    ),
+                                    name="proxy-websocket-finalization-expired-connection-limit-replay",
+                                )
+                                _track_websocket_owned_task(proxy, request_state_failure_task)
+                                request_state_to_fail = None
+                                await asyncio.shield(request_state_failure_task)
+                                request_state_failure_task = None
+                                continue
+                            if not replay_attached:
+                                await proxy._release_request_state_account_response_create_lease(request_state)
+                                continue
                         archive_request_id = None if request_state is None else request_state.archive_request_id
                         if request_state is not None and payload is not None and _is_websocket_response_create(payload):
                             if account is None or not _bind_websocket_request_dispatch_owner(
@@ -5767,6 +5823,15 @@ class _WebSocketMixin:
         _record_response_event(request_state, event_type, now=clock.monotonic())
 
         if request_state is None:
+            if _is_websocket_connection_limit_event(event_type, payload):
+                upstream_control.reconnect_requested = True
+                upstream_control.retire_after_drain = True
+                _record_websocket_connection_limit(
+                    request_id=None,
+                    surface="websocket",
+                    outcome="refused",
+                    account_id=account.id,
+                )
             if is_previous_response_not_found_matching_event:
                 malformed_param = not is_previous_response_not_found_event
                 if not malformed_param:
@@ -5827,6 +5892,41 @@ class _WebSocketMixin:
                     request_state,
                     pending_requests,
                 )
+
+        if _is_websocket_connection_limit_event(event_type, payload):
+            upstream_control.reconnect_requested = True
+            request_state.upstream_error_code_override = WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+            request_state.failure_phase_override = "upstream"
+            request_state.failure_detail_override = WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+            deadline = _websocket_connect_deadline(
+                request_state,
+                _facade()._stream_request_budget_seconds(_facade().get_settings(), request_transport="websocket"),
+                now=clock.monotonic(),
+            )
+            replay_allowed = clock.monotonic() < deadline and _websocket_connection_limit_replay_allowed(
+                request_state, payload=payload, has_other_pending_requests=has_other_pending_requests
+            )
+            if replay_allowed:
+                await _stage_websocket_request_state_for_replay(
+                    request_state,
+                    create_gate=None,
+                    surface="websocket",
+                    trigger=WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE,
+                )
+                replay_allowed = (
+                    _prepare_websocket_connection_limit_replay(request_state, account_id=account.id) is not None
+                )
+            _record_websocket_connection_limit(
+                request_id=request_state.request_log_id or request_state.request_id,
+                surface="websocket",
+                outcome="replayed" if replay_allowed else "refused",
+                account_id=account.id,
+            )
+            if replay_allowed:
+                upstream_control.suppress_downstream_event = True
+                upstream_control.replay_request_state = request_state
+                return text
+            upstream_control.retire_after_drain = True
 
         retry_is_previous_response_not_found = is_previous_response_not_found_event
         retry_error_code = _websocket_precreated_retry_error_code(
@@ -6506,6 +6606,8 @@ class _WebSocketMixin:
             and request_state.previous_response_id is not None
             and error_message in STREAM_INCOMPLETE_ANCHOR_NEUTRAL_MESSAGES
         ):
+            settlement.account_health_error = False
+        if request_state.upstream_error_code_override == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE:
             settlement.account_health_error = False
         proxy._cancel_request_state_api_key_reservation_heartbeat(request_state)
         await _release_websocket_response_create_gate(

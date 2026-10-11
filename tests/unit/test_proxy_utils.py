@@ -38575,6 +38575,280 @@ async def test_process_upstream_websocket_text_retries_precreated_previous_respo
 
 
 @pytest.mark.asyncio
+async def test_process_upstream_websocket_text_retries_precreated_connection_limit_reached(monkeypatch, caplog):
+    from app.modules.proxy._service import observability
+
+    metric = MagicMock()
+    monkeypatch.setattr(observability, "websocket_connection_limit_total", metric)
+    caplog.set_level(logging.INFO)
+
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", AsyncMock())
+    handle_stream_error = AsyncMock()
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+    account = _make_account("acc_ws_connection_limit")
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "instructions": "",
+        "previous_response_id": "resp_anchor",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+    }
+    fresh_request_payload = dict(request_payload)
+    fresh_request_payload.pop("previous_response_id")
+    pending_request = proxy_service._WebSocketRequestState(
+        request_id="ws_req_connection_limit",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        response_create_sent_at=time.monotonic(),
+        transport="websocket",
+        awaiting_response_created=True,
+        request_text=json.dumps(request_payload, separators=(",", ":")),
+        previous_response_id="resp_anchor",
+        fresh_upstream_request_text=json.dumps(fresh_request_payload, separators=(",", ":")),
+        fresh_upstream_request_is_retry_safe=True,
+        preferred_account_id=account.id,
+    )
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+    upstream_text = json.dumps(
+        {
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "websocket_connection_limit_reached",
+                "message": "Responses websocket connection limit reached (60 minutes). "
+                "Create a new websocket connection to continue.",
+            },
+        },
+        separators=(",", ":"),
+    )
+
+    await service._process_upstream_websocket_text(
+        upstream_text,
+        account=account,
+        account_id_value=account.id,
+        pending_requests=deque([pending_request]),
+        pending_lock=anyio.Lock(),
+        api_key=None,
+        upstream_control=upstream_control,
+        response_create_gate=asyncio.Semaphore(1),
+    )
+
+    handle_stream_error.assert_not_awaited()
+    assert upstream_control.reconnect_requested is True
+    assert upstream_control.suppress_downstream_event is True
+    assert upstream_control.replay_request_state is pending_request
+    assert pending_request.replay_count == 1
+    assert pending_request.previous_response_id is None
+    assert pending_request.request_text == json.dumps(fresh_request_payload, separators=(",", ":"))
+    assert pending_request.preferred_account_id == account.id
+    assert pending_request.replay_required_account_id == account.id
+    metric.labels.assert_called_once_with(surface="websocket", outcome="replayed")
+    metric.labels.return_value.inc.assert_called_once_with()
+    assert "connection lifetime limit surface=websocket outcome=replayed" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unmatched", [False, True])
+async def test_unowned_websocket_connection_limit_retires_socket_without_settlement(monkeypatch, caplog, unmatched):
+    from app.modules.proxy._service import observability
+
+    metric = MagicMock()
+    monkeypatch.setattr(observability, "websocket_connection_limit_total", metric)
+    caplog.set_level(logging.INFO)
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    settle, health = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", settle)
+    monkeypatch.setattr(service, "_handle_stream_error", health)
+    account = _make_account("acc_unowned_limit")
+    pending = deque()
+    payload = {
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "code": "websocket_connection_limit_reached",
+            "message": "Reconnect.",
+        },
+    }
+    if unmatched:
+        payload["response_id"] = "resp_unknown"
+        pending.append(
+            proxy_service._WebSocketRequestState(
+                request_id="req_unrelated",
+                model="gpt-5.1",
+                service_tier=None,
+                reasoning_effort=None,
+                api_key_reservation=None,
+                started_at=time.monotonic(),
+                response_id="resp_unrelated",
+                awaiting_response_created=False,
+            )
+        )
+    control = proxy_service._WebSocketUpstreamControl()
+
+    text = await service._process_upstream_websocket_text(
+        json.dumps(payload),
+        account=account,
+        account_id_value=account.id,
+        pending_requests=pending,
+        pending_lock=anyio.Lock(),
+        api_key=None,
+        upstream_control=control,
+        response_create_gate=asyncio.Semaphore(1),
+    )
+
+    assert json.loads(text)["error"]["code"] == "websocket_connection_limit_reached"
+    assert control.reconnect_requested and control.retire_after_drain
+    assert control.replay_request_state is None
+    assert len(pending) == int(unmatched)
+    settle.assert_not_awaited()
+    health.assert_not_awaited()
+    metric.labels.assert_called_once_with(surface="websocket", outcome="refused")
+    metric.labels.return_value.inc.assert_called_once_with()
+    assert "connection lifetime limit surface=websocket outcome=refused" in caplog.text
+
+
+def test_connection_limit_reached_is_not_a_previous_response_rejection():
+    from app.core.errors import (
+        is_previous_response_not_found_error,
+        is_previous_response_not_found_public_shape,
+        is_websocket_connection_limit_error,
+    )
+
+    assert is_websocket_connection_limit_error("websocket_connection_limit_reached")
+    assert not is_websocket_connection_limit_error("websocket_stream_limit_reached")
+    assert not is_websocket_connection_limit_error("previous_response_not_found")
+    assert not is_previous_response_not_found_public_shape(
+        code="websocket_connection_limit_reached", param=None, message="Create a new websocket connection."
+    )
+    assert not is_previous_response_not_found_error(
+        code="websocket_connection_limit_reached",
+        param=None,
+        message="Responses websocket connection limit reached (60 minutes).",
+    )
+    assert not is_previous_response_not_found_error(
+        code="websocket_stream_limit_reached",
+        param="stream_id",
+        message="This WebSocket connection has reached its maximum number of distinct stream IDs (32).",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "delta",
+        "output",
+        "sequence",
+        "sequenced_prewarm",
+        "replayed",
+        "deadline",
+        "pending",
+        "billed",
+        "abandoned",
+        "draining",
+    ],
+)
+async def test_process_upstream_websocket_connection_limit_refusal_keeps_health_neutral(monkeypatch, unsafe):
+    clock = VirtualClock(monotonic_value=1_000_000.0)
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()), clock=clock)
+    account = _make_account("acc_limit_refused")
+    state = proxy_service._WebSocketRequestState(
+        request_id="req_limit_refused",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=clock.monotonic(),
+        response_create_sent_at=clock.monotonic(),
+        transport="websocket",
+        awaiting_response_created=True,
+        request_text='{"type":"response.create","model":"gpt-5.1","input":"hello"}',
+    )
+    if unsafe == "delta":
+        state.previous_response_id = "resp_delta_anchor"
+    elif unsafe == "output":
+        state.downstream_visible = True
+    elif unsafe == "sequence":
+        state.last_downstream_sequence_number = 0
+    elif unsafe == "sequenced_prewarm":
+        state.last_downstream_sequence_number = 0
+        state.generate_false_prewarm = True
+        state.response_id = "resp_prewarm"
+        state.awaiting_response_created = False
+        state.response_event_count = 1
+    elif unsafe == "replayed":
+        state.replay_count = 1
+    elif unsafe == "deadline":
+        state.started_at = clock.monotonic() - 100_000
+    elif unsafe == "abandoned":
+        state.terminal_settlement_phase = "abandoned"
+    elif unsafe == "draining":
+        state.draining_until_terminal = True
+    pending = deque([state])
+    if unsafe == "pending":
+        sibling = proxy_service._WebSocketRequestState(
+            request_id="sibling",
+            model="gpt-5.1",
+            service_tier=None,
+            reasoning_effort=None,
+            api_key_reservation=None,
+            started_at=time.monotonic(),
+            response_id="resp_other",
+            awaiting_response_created=False,
+        )
+        pending.append(sibling)
+    payload = {
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "code": "websocket_connection_limit_reached",
+            "message": "Create a new websocket connection.",
+        },
+    }
+    if unsafe == "billed":
+        payload["usage"] = {"output_tokens": 1}
+    health = AsyncMock()
+    settle = AsyncMock(return_value=True)
+    log = AsyncMock()
+    monkeypatch.setattr(service, "_handle_stream_error", health)
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", settle)
+    monkeypatch.setattr(service, "_write_request_log", log)
+    control = proxy_service._WebSocketUpstreamControl()
+    text = await service._process_upstream_websocket_text(
+        json.dumps(payload),
+        account=account,
+        account_id_value=account.id,
+        pending_requests=pending,
+        pending_lock=anyio.Lock(),
+        api_key=None,
+        upstream_control=control,
+        response_create_gate=asyncio.Semaphore(1),
+    )
+
+    assert control.replay_request_state is None
+    assert control.suppress_downstream_event is False
+    assert json.loads(text)["error"]["code"] == "websocket_connection_limit_reached"
+    health.assert_not_awaited()
+    if unsafe == "draining":
+        settle.assert_not_awaited()
+        log.assert_not_awaited()
+        return
+    settle.assert_awaited_once()
+    assert settle.await_args.args[2].account_health_error is False
+    log.assert_awaited_once()
+    assert log.await_args.kwargs["upstream_error_code"] == "websocket_connection_limit_reached"
+
+
+@pytest.mark.asyncio
 async def test_pop_replayable_precreated_request_refreshes_fresh_replay_fingerprint():
     original_input: list[JsonValue] = [
         {"role": "user", "content": "one"},

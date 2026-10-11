@@ -120,6 +120,7 @@ STREAM_INCOMPLETE_ANCHOR_NEUTRAL_MESSAGES = frozenset(
 # at-least-once.
 HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE = "bridge_eventless_timeout"
 PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found"
+WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached"
 PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE = "Previous response was not found; retry without previous_response_id."
 PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON = "previous_response_not_found_malformed_param"
 SYNTHETIC_TRANSPORT_FAILURE_MARKER = "_codex_lb_synthetic_transport_failure"
@@ -205,6 +206,10 @@ def sanitize_public_error_detail(error: Mapping[str, JsonValue]) -> dict[str, Js
     else:
         normalized["param"] = public_param
     return normalized
+
+
+def is_websocket_connection_limit_error(code: str | None) -> bool:
+    return code == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
 
 
 def is_previous_response_not_found_error(

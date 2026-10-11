@@ -53,7 +53,7 @@ from app.core.clients.thread_cache_identity import (
 )
 from app.core.clock import REAL_CLOCK, Clock, clock_for, scheduler_for
 from app.core.config.dashboard_overrides import with_dashboard_overrides
-from app.core.errors import openai_error
+from app.core.errors import WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE, openai_error
 from app.core.openai.parsing import parse_sse_event
 from app.core.openai.requests import (
     ResponsesRequest,
@@ -3713,6 +3713,7 @@ class _HTTPBridgeRequestSubmitMixin:
         *,
         request_state: _WebSocketRequestState | None = None,
         restart_reader: bool = False,
+        connection_limit_replay: bool = False,
     ) -> bool:
         # The admitted body's admission gate can claim the half-open probe;
         # any exit that never advances a send attempt past its baseline must
@@ -3726,6 +3727,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 session,
                 request_state=request_state,
                 restart_reader=restart_reader,
+                connection_limit_replay=connection_limit_replay,
                 admission_claimed_leases=admission_claimed_leases,
                 retry_send_baselines=retry_send_baselines,
             )
@@ -3751,6 +3753,7 @@ class _HTTPBridgeRequestSubmitMixin:
         *,
         request_state: _WebSocketRequestState | None = None,
         restart_reader: bool = False,
+        connection_limit_replay: bool = False,
         admission_claimed_leases: list[float] | None = None,
         retry_send_baselines: list[tuple[_WebSocketRequestState, int]] | None = None,
     ) -> bool:
@@ -3762,6 +3765,13 @@ class _HTTPBridgeRequestSubmitMixin:
         )
 
         def request_is_retryable(request_state: _WebSocketRequestState) -> bool:
+            if (
+                request_state.precreated_replay_reason == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+                and request_state.replay_count >= 1
+            ):
+                return False
+            if connection_limit_replay:
+                return _websocket_request_can_replay_before_visible_output(request_state)
             transport_only_unanchored_replay = bool(
                 request_state.precreated_replay_reason is None
                 and (
@@ -3922,7 +3932,26 @@ class _HTTPBridgeRequestSubmitMixin:
             if request_state.replay_count >= 1 and not additional_clean_close_retry:
                 return False
             account_bound_replay = False
-            if request_state.previous_response_id is not None:
+            if connection_limit_replay:
+                retry_deadline = request_state.bridge_request_deadline
+                if retry_deadline is None:
+                    retry_deadline = request_state.started_at + _http_bridge_request_budget_seconds(
+                        _service_get_settings()
+                    )
+                if clock.monotonic() >= retry_deadline:
+                    return False
+                request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+                if request_text is None:
+                    return False
+                request_state.preferred_account_id = session.account.id
+                request_state.replay_required_account_id = session.account.id
+                request_state.precreated_replay_reason = WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+                request_state.precreated_replay_account_id = session.account.id
+                account_bound_replay = True
+                require_preferred_reconnect = True
+                fresh_hard_request_account_switch_allowed = False
+                additional_clean_close_retry = False
+            elif request_state.previous_response_id is not None:
                 require_preferred_reconnect = False
                 if account_neutral_recovery:
                     request_state.preferred_account_id = session.account.id
@@ -3994,7 +4023,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 session.headers = {
                     key: value for key, value in session.headers.items() if key.lower() != "x-codex-turn-state"
                 }
-            if close_classification == "clean":
+            if close_classification == "clean" and not connection_limit_replay:
                 if not clean_close_retry_for_current_close:
                     return False
                 request_state.clean_close_retry_in_progress = True
@@ -4051,7 +4080,15 @@ class _HTTPBridgeRequestSubmitMixin:
             # below acquires a lease for the account actually selected.
             if fresh_hard_request_account_switch_allowed:
                 await self._release_request_state_account_response_create_lease(request_state)
-            if hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
+            if connection_limit_replay:
+                await self._reconnect_http_bridge_session(
+                    session,
+                    request_state=request_state,
+                    require_same_account=True,
+                    require_preferred_account=True,
+                    **reconnect_reader_kwargs,
+                )
+            elif hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
                 await self._reconnect_http_bridge_session(
                     session,
                     request_state=request_state,
@@ -4120,15 +4157,24 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_state.response_create_admission = None
                     await self._release_request_state_account_response_create_lease(request_state)
                     return False
+            if enforce_capacity_retry_deadline or connection_limit_replay:
                 async with session.pending_lock:
                     retry_consumer_attached = (
                         request_state in session.pending_requests
                         and request_state.event_queue is not None
                         and not request_state.draining_until_terminal
+                        and (
+                            not connection_limit_replay
+                            or (
+                                request_state.terminal_settlement_phase != "abandoned"
+                                and clock.monotonic() < retry_deadline
+                            )
+                        )
                     )
                 if not retry_consumer_attached:
-                    request_state.response_create_admission.release()
-                    request_state.response_create_admission = None
+                    if request_state.response_create_admission is not None:
+                        request_state.response_create_admission.release()
+                        request_state.response_create_admission = None
                     await self._release_request_state_account_response_create_lease(request_state)
                     return False
             request_text = self._http_bridge_text_with_account_installation_id(session, request_state, request_text)

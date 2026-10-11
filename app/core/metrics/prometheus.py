@@ -242,6 +242,12 @@ if PROMETHEUS_AVAILABLE:
         ["surface", "reason"],
         registry=REGISTRY,
     )
+    websocket_connection_limit_total = Counter(
+        "codex_lb_websocket_connection_limit_total",
+        "Upstream WebSocket connection lifetime limit recovery outcomes",
+        ["surface", "outcome"],
+        registry=REGISTRY,
+    )
     account_lease_acquired_total = Counter(
         "codex_lb_account_lease_acquired_total",
         "Total account pressure leases acquired by kind",
@@ -491,6 +497,7 @@ else:
     continuity_owner_resolution_total: CounterLike | None = None
     continuity_replay_rejected_total: CounterLike | None = None
     continuity_fail_closed_total: CounterLike | None = None
+    websocket_connection_limit_total: CounterLike | None = None
     account_lease_acquired_total: CounterLike | None = None
     account_lease_released_total: CounterLike | None = None
     account_lease_stale_reclaimed_total: CounterLike | None = None
@@ -562,6 +569,7 @@ __all__ = [
     "cap_partition_replicas",
     "circuit_breaker_state",
     "continuity_fail_closed_total",
+    "websocket_connection_limit_total",
     "event_loop_lag_seconds",
     "event_loop_lag_warnings_total",
     "continuity_owner_resolution_total",

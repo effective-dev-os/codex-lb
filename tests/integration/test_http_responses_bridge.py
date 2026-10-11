@@ -17773,6 +17773,176 @@ class _AcceptedOutputFreeCapacityErrorUpstreamWebSocket(_FakeBridgeUpstreamWebSo
             await self._messages.put(_FakeUpstreamMessage("text", text=json.dumps(event, separators=(",", ":"))))
 
 
+class _ConnectionLimitUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    def __init__(self, *, accepted: bool = False, first_turn_completes: bool = False, output: bool = False) -> None:
+        super().__init__("resp_limit_anchor")
+        self.accepted = accepted
+        self.first_turn_completes = first_turn_completes
+        self.output = output
+
+    async def send_text(self, text: str) -> None:
+        if self.first_turn_completes and not self.sent_text:
+            await super().send_text(text)
+            return
+        self.sent_text.append(text)
+        if self.accepted:
+            for event_type in ("response.created", "response.in_progress"):
+                await self._messages.put(
+                    _FakeUpstreamMessage(
+                        "text",
+                        text=json.dumps(
+                            {"type": event_type, "response": {"id": "resp_limit_accepted", "status": "in_progress"}}
+                        ),
+                    )
+                )
+        if self.output:
+            await self._messages.put(
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {"type": "response.output_text.delta", "response_id": "resp_limit_accepted", "delta": "partial"}
+                    ),
+                )
+            )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "websocket_connection_limit_reached",
+                            "message": "Create a new websocket connection.",
+                        },
+                    }
+                ),
+            )
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+@pytest.mark.parametrize("anchored", [False, True])
+async def test_backend_responses_http_bridge_connection_limit_replays_on_same_account(
+    async_client, monkeypatch, accepted, anchored
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(async_client, "acc_bridge_connection_limit", "bridge-limit@example.com")
+    alternate_id = await _import_account(
+        async_client, "acc_bridge_limit_alternate", "bridge-limit-alternate@example.com"
+    )
+    first = _ConnectionLimitUpstreamWebSocket(accepted=accepted, first_turn_completes=anchored)
+    replacement = _FakeBridgeUpstreamWebSocket("resp_limit_recovered")
+    connect_accounts, exclusions = _install_two_account_bridge_failover(
+        monkeypatch,
+        first_account=await _get_account(account_id),
+        second_account=await _get_account(alternate_id),
+        upstreams=[first, replacement],
+    )
+    health = AsyncMock()
+    monkeypatch.setattr(proxy_module.ProxyService, "_handle_stream_error", health)
+    history = [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
+    body = {
+        "model": "gpt-5.1",
+        "instructions": "Return exactly OK.",
+        "input": history,
+        "prompt_cache_key": "bridge-limit-recovery",
+        "stream": True,
+    }
+    headers = {"session_id": "sid-bridge-limit"}
+    if anchored:
+        first_events = await _collect_sse_events(
+            async_client, "/backend-api/codex/responses", json_body=body, headers=headers
+        )
+        history = [
+            *history,
+            first_events[-1]["response"]["output"][0],
+            {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ]
+        body = {**body, "input": history, "previous_response_id": "resp_limit_anchor_1"}
+    events = await _collect_sse_events(async_client, "/backend-api/codex/responses", json_body=body, headers=headers)
+
+    _assert_single_response_lifecycle_completed(events)
+    assert connect_accounts == ["acc_bridge_connection_limit", "acc_bridge_connection_limit"]
+    assert not exclusions[-1]
+    assert first.closed
+    assert len(replacement.sent_text) == 1
+    replay = json.loads(replacement.sent_text[0])
+    assert "previous_response_id" not in replay
+    assert replay["input"] == history
+    health.assert_not_awaited()
+    async with SessionLocal() as session:
+        logs = (await session.execute(select(RequestLog).where(RequestLog.account_id == account_id))).scalars().all()
+    assert len(logs) == (2 if anchored else 1)
+    assert logs[-1].status == "success"
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_http_bridge_connection_limit_replays_only_once(async_client, monkeypatch):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(async_client, "acc_bridge_limit_once", "bridge-limit-once@example.com")
+    alternate_id = await _import_account(async_client, "acc_bridge_limit_once_alt", "bridge-limit-once-alt@example.com")
+    first, replacement = _ConnectionLimitUpstreamWebSocket(), _ConnectionLimitUpstreamWebSocket()
+    connects, _ = _install_two_account_bridge_failover(
+        monkeypatch,
+        first_account=await _get_account(account_id),
+        second_account=await _get_account(alternate_id),
+        upstreams=[first, replacement],
+    )
+    health = AsyncMock()
+    monkeypatch.setattr(proxy_module.ProxyService, "_handle_stream_error", health)
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json={"model": "gpt-5.1", "input": "hello", "stream": True, "prompt_cache_key": "limit-once"},
+    ) as response:
+        lines = [line async for line in response.aiter_lines()]
+    assert "websocket_connection_limit_reached" in "\n".join(lines)
+    assert connects == ["acc_bridge_limit_once", "acc_bridge_limit_once"]
+    assert len(first.sent_text) == len(replacement.sent_text) == 1
+    health.assert_not_awaited()
+    async with SessionLocal() as session:
+        logs = (await session.execute(select(RequestLog).where(RequestLog.account_id == account_id))).scalars().all()
+    assert len(logs) == 1
+    assert logs[0].upstream_error_code == "websocket_connection_limit_reached"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("barrier", ["output", "delta"])
+async def test_backend_responses_http_bridge_connection_limit_refuses_unsafe_replay(async_client, monkeypatch, barrier):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(async_client, "acc_bridge_limit_refused", "bridge-limit-refused@example.com")
+    first = _ConnectionLimitUpstreamWebSocket(
+        accepted=barrier == "output", output=barrier == "output", first_turn_completes=barrier == "delta"
+    )
+    connects, _ = _install_two_account_bridge_failover(
+        monkeypatch,
+        first_account=await _get_account(account_id),
+        second_account=await _get_account(account_id),
+        upstreams=[first],
+    )
+    health = AsyncMock()
+    monkeypatch.setattr(proxy_module.ProxyService, "_handle_stream_error", health)
+    body = {"model": "gpt-5.1", "input": "hello", "stream": True, "prompt_cache_key": "limit-refused"}
+    headers = {"session_id": "sid-limit-refused"}
+    if barrier == "delta":
+        await _collect_sse_events(async_client, "/backend-api/codex/responses", json_body=body, headers=headers)
+        body = {**body, "input": "continue", "previous_response_id": "resp_limit_anchor_1"}
+    async with async_client.stream("POST", "/backend-api/codex/responses", json=body, headers=headers) as response:
+        text = (await response.aread()).decode()
+
+    assert "websocket_connection_limit_reached" in text
+    assert connects == ["acc_bridge_limit_refused"]
+    health.assert_not_awaited()
+    async with SessionLocal() as session:
+        logs = (await session.execute(select(RequestLog).where(RequestLog.account_id == account_id))).scalars().all()
+    assert len(logs) == (2 if barrier == "delta" else 1)
+    failed = next(log for log in logs if log.status == "error")
+    assert failed.upstream_error_code == "websocket_connection_limit_reached"
+
+
 class _AcceptedOutputFreeAbruptCloseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     """Upstream ACCEPTS the request (created + in_progress) then the transport dies."""
 

@@ -16,6 +16,7 @@ from app.core.metrics.prometheus import (
     http_bridge_routing_total,
     upstream_reasoning_replay_400_total,
     upstream_transport_decisions_total,
+    websocket_connection_limit_total,
 )
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest, canonicalized_tools
 from app.core.types import JsonValue
@@ -39,6 +40,18 @@ def _service_global(name: str, fallback: Any) -> Any:
 
 def _service_get_settings() -> Any:
     return cast(Callable[[], Any], _service_global("get_settings", get_settings))()
+
+
+def _record_websocket_connection_limit(*, request_id: str | None, surface: str, outcome: str, account_id: str) -> None:
+    if websocket_connection_limit_total is not None:
+        websocket_connection_limit_total.labels(surface=surface, outcome=outcome).inc()
+    logger.info(
+        "WebSocket connection lifetime limit surface=%s outcome=%s account_id=%s request_id=%s",
+        surface,
+        outcome,
+        account_id,
+        request_id,
+    )
 
 
 def record_http_bridge_routing(*, stage: str, reason: str) -> None:

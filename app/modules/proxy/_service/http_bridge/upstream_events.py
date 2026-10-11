@@ -38,7 +38,11 @@ from app.core.clients.proxy_websocket import (
     is_account_neutral_websocket_error_code,
 )
 from app.core.clock import REAL_CLOCK, REAL_SCHEDULER, Clock, Scheduler, clock_for, scheduler_for
-from app.core.errors import response_failed_event
+from app.core.errors import (
+    WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE,
+    is_websocket_connection_limit_error,
+    response_failed_event,
+)
 from app.core.openai.models import OpenAIEvent
 from app.core.openai.parsing import (
     _LIFECYCLE_EVENT_TYPES,
@@ -66,6 +70,7 @@ from app.modules.proxy._service.http_bridge.accepted_replay import (
     _http_bridge_accepted_anchored_replay_candidate,
     _http_bridge_accepted_capacity_retry_allowed,
     _stage_websocket_request_state_for_replay,
+    _terminal_payload_reports_output,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
@@ -147,6 +152,9 @@ from app.modules.proxy._service.observability import (
 )
 from app.modules.proxy._service.observability import (
     _interesting_header_keys as _interesting_header_keys,
+)
+from app.modules.proxy._service.observability import (
+    _record_websocket_connection_limit,
 )
 from app.modules.proxy._service.observability import (
     _tools_hash as _tools_hash,
@@ -3273,6 +3281,63 @@ class _HTTPBridgeUpstreamEventsMixin:
                 _record_response_event(terminal_request_state, event_type, now=clock.monotonic())
 
         status_request_state = terminal_request_state or matched_request_state
+        if event_type in {"error", "response.failed"} and is_websocket_connection_limit_error(
+            _normalize_error_code(
+                _websocket_event_error_code(event_type, payload), _websocket_event_error_type(event_type, payload)
+            )
+        ):
+            connection_limit_retried = False
+            if status_request_state is not None:
+                status_request_state.upstream_error_code_override = WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+                status_request_state.failure_phase_override = "upstream"
+                status_request_state.failure_detail_override = WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+                request_deadline = status_request_state.bridge_request_deadline
+                if request_deadline is None:
+                    request_deadline = status_request_state.started_at + _http_bridge_request_budget_seconds(
+                        _service_get_settings()
+                    )
+                async with session.pending_lock:
+                    error_param = _websocket_event_error_param(event_type, payload)
+                    replay_allowed = (
+                        clock.monotonic() < request_deadline
+                        and not session.pending_requests
+                        and status_request_state.last_downstream_sequence_number is None
+                        and not status_request_state.draining_until_terminal
+                        and status_request_state.terminal_settlement_phase != "abandoned"
+                        and (error_param is None or not error_param.malformed)
+                        and not _terminal_payload_reports_output(payload)
+                        and _websocket_request_can_replay_before_visible_output(status_request_state)
+                    )
+                    if replay_allowed:
+                        session.pending_requests.appendleft(status_request_state)
+                        session.queued_request_count += 1
+                if replay_allowed:
+                    connection_limit_retried = await self._retry_http_bridge_precreated_request(
+                        session, request_state=status_request_state, connection_limit_replay=True
+                    )
+                    if not connection_limit_retried:
+                        async with session.pending_lock:
+                            if status_request_state in session.pending_requests:
+                                session.pending_requests.remove(status_request_state)
+                                session.queued_request_count = max(0, session.queued_request_count - 1)
+                        status_request_state.upstream_error_code_override = WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+                if not connection_limit_retried:
+                    session.upstream_control.reconnect_requested = True
+                    session.upstream_control.retire_after_drain = True
+            else:
+                session.upstream_control.reconnect_requested = True
+                session.upstream_control.retire_after_drain = True
+            _record_websocket_connection_limit(
+                request_id=(status_request_state.request_log_id or status_request_state.request_id)
+                if status_request_state
+                else None,
+                surface="http_bridge",
+                outcome="replayed" if connection_limit_retried else "refused",
+                account_id=session.account.id,
+            )
+            if connection_limit_retried:
+                return
+
         if status_request_state is None and is_previous_response_not_found_event:
             session.upstream_control.reconnect_requested = True
             return
