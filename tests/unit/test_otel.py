@@ -571,6 +571,7 @@ class _DummyScheduler:
 
 @pytest.mark.asyncio
 async def test_lifespan_drains_actual_audit_and_cancelled_fleet_tasks_before_resource_close(
+    db_setup,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -843,6 +844,7 @@ async def test_lifespan_drains_actual_audit_and_cancelled_fleet_tasks_before_res
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dispose_failure", [False, True], ids=["clean-dispose", "failed-dispose"])
 async def test_lifespan_marks_bridge_membership_stale_and_records_clean_shutdown(
+    db_setup,
     monkeypatch: pytest.MonkeyPatch,
     dispose_failure: bool,
 ):
