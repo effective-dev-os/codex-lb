@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -975,3 +976,98 @@ async def test_collect_completion_registers_call_id_when_output_index_already_ma
     assert len(tool_calls) == 1
     assert _tool_call_name(tool_calls[0]) == "get_weather"
     assert json.loads(_tool_call_args(tool_calls[0])) == {"city": "Paris"}
+
+
+@pytest.mark.parametrize("include_usage", [False, True])
+@pytest.mark.parametrize("terminal", ["response.completed", "response.incomplete"])
+def test_independent_chat_streams_have_unique_stable_completion_ids(include_usage: bool, terminal: str):
+    lines = [
+        'data: {"type":"response.output_text.delta","delta":"hi"}\n\n',
+        (
+            'data: {"type":"response.output_tool_call.delta","call_id":"call_identity",'
+            '"name":"lookup","arguments":"{}"}\n\n'
+        ),
+        "data: "
+        + json.dumps(
+            {
+                "type": terminal,
+                "response": {
+                    "id": "provider_response",
+                    "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                },
+            }
+        )
+        + "\n\n",
+    ]
+    streams = [
+        [
+            json.loads(chunk[5:])
+            for chunk in iter_chat_chunks(lines, model="gpt-5.2", include_usage=include_usage)
+            if chunk.strip() != "data: [DONE]"
+        ]
+        for _ in range(2)
+    ]
+    ids = [{chunk["id"] for chunk in stream} for stream in streams]
+    assert all(len(values) == 1 for values in ids)
+    assert ids[0].isdisjoint(ids[1])
+    for stream in streams:
+        assert any(chunk["choices"] and chunk["choices"][0]["delta"].get("tool_calls") for chunk in stream)
+        assert any(chunk["choices"] and chunk["choices"][0].get("finish_reason") == "tool_calls" for chunk in stream)
+        if include_usage:
+            assert stream[-1]["choices"] == []
+            assert stream[-1]["usage"]["total_tokens"] == 5
+
+
+@pytest.mark.asyncio
+async def test_concurrent_chat_streams_keep_one_completion_id_across_per_line_adaptation():
+    async def source():
+        for line in (
+            'data: {"type":"response.output_text.delta","delta":"hi"}\n\n',
+            (
+                'data: {"type":"response.output_tool_call.delta","call_id":"call_concurrent",'
+                '"name":"lookup","arguments":"{}"}\n\n'
+            ),
+            (
+                'data: {"type":"response.completed","response":{"id":"provider_response",'
+                '"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}\n\n'
+            ),
+        ):
+            await asyncio.sleep(0)
+            yield line
+
+    async def consume():
+        return [
+            json.loads(chunk[5:])
+            async for chunk in stream_chat_chunks(source(), model="gpt-5.2", include_usage=True)
+            if chunk.strip() != "data: [DONE]"
+        ]
+
+    streams = await asyncio.gather(consume(), consume())
+    ids = [{chunk["id"] for chunk in stream} for stream in streams]
+    assert all(len(values) == 1 for values in ids)
+    assert ids[0].isdisjoint(ids[1])
+    assert all(stream[-1]["usage"]["total_tokens"] == 5 for stream in streams)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_id", [None, ""])
+async def test_collect_completion_without_provider_id_has_unique_fallback(provider_id: str | None):
+    async def source():
+        yield "data: " + json.dumps({"type": "response.completed", "response": {"id": provider_id}}) + "\n\n"
+
+    first, second = await asyncio.gather(
+        collect_chat_completion(source(), model="gpt-5.2"), collect_chat_completion(source(), model="gpt-5.2")
+    )
+    assert isinstance(first, ChatCompletion) and isinstance(second, ChatCompletion)
+    assert first.id != second.id
+    assert first.id.startswith("chatcmpl_") and second.id.startswith("chatcmpl_")
+
+
+@pytest.mark.asyncio
+async def test_collect_completion_preserves_provider_response_id():
+    async def source():
+        yield 'data: {"type":"response.completed","response":{"id":"provider_valid_response"}}\n\n'
+
+    completion = await collect_chat_completion(source(), model="gpt-5.2")
+    assert isinstance(completion, ChatCompletion)
+    assert completion.id == "provider_valid_response"
