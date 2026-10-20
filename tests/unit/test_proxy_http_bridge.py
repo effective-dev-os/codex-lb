@@ -12037,7 +12037,9 @@ async def test_stream_via_http_bridge_preserves_context_after_owner_unavailable(
             "error": {
                 "type": "server_error",
                 "code": owner_error_code,
-                "message": "Previous response owner account is unavailable. Retrying will not help — start a new conversation.",
+                "message": (
+                    "Previous response owner account is unavailable. Retrying will not help — start a new conversation."
+                ),
             }
         },
     )
@@ -24133,10 +24135,7 @@ async def test_http_bridge_retry_circuit_reports_half_open_wait_when_blocked() -
 
     cooldown = await service._http_bridge_precreated_retry_cooldown_seconds(hard_session)
     assert cooldown > 30.0, "blocked half-open probe must report the real remaining wait, not ~0s"
-    assert (
-        cooldown
-        <= http_bridge_retry_circuit_module._HTTP_BRIDGE_RETRY_CIRCUIT_HALF_OPEN_LEASE_SECONDS
-    )
+    assert cooldown <= http_bridge_retry_circuit_module._HTTP_BRIDGE_RETRY_CIRCUIT_HALF_OPEN_LEASE_SECONDS
 
 
 @pytest.mark.asyncio

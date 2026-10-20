@@ -1203,6 +1203,33 @@
         "code",
         "test"
       ]
+    },
+    {
+      "login": "ayusavin",
+      "name": "Arseniy Savin",
+      "avatar_url": "https://avatars.githubusercontent.com/u/55656230?v=4",
+      "profile": "https://github.com/ayusavin",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "felixcake618",
+      "name": "Felix Cake",
+      "avatar_url": "https://avatars.githubusercontent.com/u/91266981?v=4",
+      "profile": "https://github.com/felixcake618",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "TheFoolThatDoesntBelongToThisEra",
+      "name": "⃟",
+      "avatar_url": "https://avatars.githubusercontent.com/u/252236154?v=4",
+      "profile": "https://github.com/TheFoolThatDoesntBelongToThisEra",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "contributorsPerLine": 7,

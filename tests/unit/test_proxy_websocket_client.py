@@ -515,6 +515,7 @@ async def test_connect_responses_websocket_connect_timeout_rotates_shared_transp
     assert exc_info.value.retryable_same_contract is True
     assert is_confirmed_pre_dispatch_transport_error(exc_info.value) is True
     rotate.assert_awaited_once()
+    assert rotate.await_args is not None
     assert rotate.await_args.kwargs["transport"] == "websocket"
 
 
