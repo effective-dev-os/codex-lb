@@ -38843,8 +38843,10 @@ async def test_process_upstream_websocket_connection_limit_refusal_keeps_health_
         log.assert_not_awaited()
         return
     settle.assert_awaited_once()
+    assert settle.await_args is not None
     assert settle.await_args.args[2].account_health_error is False
     log.assert_awaited_once()
+    assert log.await_args is not None
     assert log.await_args.kwargs["upstream_error_code"] == "websocket_connection_limit_reached"
 
 

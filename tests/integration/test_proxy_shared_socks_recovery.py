@@ -101,6 +101,7 @@ async def test_keyed_responses_shared_socks_timeout_recovers_owner_and_settles_o
         assert limits[0].current_value == 2
         error_health.assert_not_awaited()
         route_backoff.assert_not_awaited()
+        assert rotate.await_args is not None
         rotate.assert_awaited_once_with(
             transport="stream", request_id=rotate.await_args.kwargs["request_id"], failed_session=session
         )

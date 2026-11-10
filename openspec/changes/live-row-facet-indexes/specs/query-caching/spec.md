@@ -17,6 +17,13 @@ When `GET /api/request-logs/options` is requested without user-supplied filters,
 - **WHEN** the options endpoint is called with no filters
 - **THEN** values appearing only on soft-deleted rows MUST NOT appear in any facet
 
+#### Scenario: SQLite facet traversal does not require planner statistics
+
+- **GIVEN** SQLite request logs with many repeated visible rows, the standard facet indexes, and no planner statistics
+- **WHEN** the unfiltered options endpoint is called
+- **THEN** facet traversal MUST use the facet's ordered values and equality-constrained eligibility checks
+- **AND** adding duplicate visible rows MUST NOT cause each recursive step to rescan the entire live-row cohort
+
 #### Scenario: Soft-deleted cohorts do not lengthen facet probes
 
 - **GIVEN** live request-log rows spread over several models, api keys and statuses, soft-deleted rows sharing those values, and a large soft-deleted cohort on a model, api-key id and error code that no live row carries

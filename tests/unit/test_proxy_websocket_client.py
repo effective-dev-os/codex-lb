@@ -710,6 +710,7 @@ async def test_connect_responses_websocket_connect_timeout_rotates_shared_transp
     assert exc_info.value.status_code == 502
     assert _proxy_error_code(exc_info.value) == "upstream_unavailable"
     rotate.assert_awaited_once()
+    assert rotate.await_args is not None
     assert rotate.await_args.kwargs["transport"] == "websocket"
 
 

@@ -76,4 +76,5 @@ nav:
   - Traffic Parity: traffic-parity.md
   - Development:
       - Rust Migration Architecture: rust-architecture.md
+      - Architectural Decisions: adr/fork-decisions.md
   - Troubleshooting: troubleshooting.md

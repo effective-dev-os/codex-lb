@@ -11997,8 +11997,10 @@ async def test_http_bridge_connection_limit_refusal_settles_once_without_health_
     retry.assert_not_awaited()
     health.assert_not_awaited()
     settle.assert_awaited_once()
+    assert settle.await_args is not None
     assert settle.await_args.args[2].account_health_error is False
     log.assert_awaited_once()
+    assert log.await_args is not None
     assert log.await_args.kwargs["upstream_error_code"] == "websocket_connection_limit_reached"
     assert state.previous_response_id == ("resp_delta_anchor" if unsafe == "delta" else None)
     assert session.upstream_control.retire_after_drain
@@ -12041,6 +12043,7 @@ async def test_connection_limit_reconnect_goal_restart_cannot_select_another_acc
         )
 
     assert exc_info.value.payload["error"]["code"] == "previous_response_owner_unavailable"
+    assert select.await_args is not None
     assert select.await_args.kwargs["preferred_account_id"] == session.account.id
     assert select.await_args.kwargs["fallback_on_preferred_account_unavailable"] is False
     open_socket.assert_not_awaited()

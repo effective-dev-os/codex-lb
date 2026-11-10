@@ -11,7 +11,8 @@ from aiohttp_socks import ProxyConnector, ProxyTimeoutError
 from python_socks import ProxyTimeoutError as PythonSocksProxyTimeoutError
 
 from app.core.clients import proxy
-from app.core.clients.codex import CodexTransportError
+from app.core.clients.codex import CodexClient, CodexTransportError
+from app.core.config.settings import Settings
 from app.core.openai.requests import ResponsesRequest
 from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
 
@@ -108,7 +109,7 @@ async def test_dedicated_route_does_not_inherit_shared_socks_failure_scope(monke
                     account_id="account-dedicated",
                     session=cast(aiohttp.ClientSession, session),
                     route=route,
-                    codex_client=client,
+                    codex_client=cast(CodexClient, client),
                     raise_for_status=True,
                     upstream_stream_transport_override="http",
                 )
@@ -189,7 +190,9 @@ async def test_shared_socks_error_after_response_headers_does_not_gain_replay(mo
     try:
         with pytest.raises(ProxyTimeoutError) as raised:
             async with proxy._service_circuit_breaker_context(
-                response_context(), settings=_settings(), shared_proxy_session=cast(aiohttp.ClientSession, session)
+                response_context(),
+                settings=cast(Settings, _settings()),
+                shared_proxy_session=cast(aiohttp.ClientSession, session),
             ):
                 raise error
         assert raised.value is error
