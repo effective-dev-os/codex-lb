@@ -1,7 +1,7 @@
 # files-upload-protocol Specification
 
 ## Purpose
-TBD - created by archiving change add-backend-api-files-protocol. Update Purpose after archive.
+Governs the native Codex file upload protocol (`POST /backend-api/files` and the finalize/status endpoint) that lets clients upload a large attachment once and reference it by `file_id` in later turns instead of hitting the responses message-size ceiling. File routes must share the proxy's account selection, authentication, and request-log plumbing, and finalize ownership must be durable across replicas so follow-up calls reach the account that registered the upload.
 ## Requirements
 ### Requirement: Native file upload registration endpoint
 
@@ -54,6 +54,30 @@ The system SHALL expose `POST /backend-api/files/{file_id}/uploaded` as an authe
 - **WHEN** upstream returns 404 for an unknown `file_id`
 - **THEN** the service returns HTTP 404 with an OpenAI-format error envelope
 
+### Requirement: File finalize uses durable replica-shared ownership
+
+When `POST /backend-api/files/{file_id}/uploaded` references a live durable file pin, the service MUST resolve that pin from the shared database and route finalization only through the owning account. The owner decision MUST NOT use a process-local cache. Expiry, reclaim, and cleanup MUST use database-authoritative time. If durable owner resolution fails, the service MUST fail closed before selecting or invoking an unpinned fallback account.
+
+#### Scenario: another replica finalizes through the durable owner
+
+- **GIVEN** one replica registered `file_xyz` through `account_a`
+- **WHEN** another replica handles `POST /backend-api/files/file_xyz/uploaded`
+- **THEN** it MUST resolve the shared durable pin
+- **AND** it MUST finalize only through `account_a`
+
+#### Scenario: finalize owner lookup failure does not fall back
+
+- **GIVEN** `file_xyz` requires a durable owner decision
+- **WHEN** the shared database lookup fails
+- **THEN** finalization MUST fail before any unpinned account selection or upstream invocation
+
+#### Scenario: an expired identifier can be reclaimed using database time
+
+- **GIVEN** the durable pin for `file_xyz` has expired according to the database clock
+- **WHEN** a later upload claims `file_xyz` through `account_b`
+- **THEN** the durable owner MUST become `account_b`
+- **AND** every replica's next finalize decision MUST resolve `account_b`
+
 ### Requirement: File proxy routes share account-selection and request-log plumbing
 
 File proxy routes MUST select an upstream account using the same load-balancer / freshness / 401-retry pattern as `/backend-api/transcribe`, and MUST persist a request-log entry on every attempt. Log entries MUST use synthetic model identifiers `files-create` (for `POST /backend-api/files`) and `files-finalize` (for `POST /backend-api/files/{file_id}/uploaded`) so dashboard request-log queries can filter file activity. Transport MUST be recorded as HTTP. File requests MUST NOT count against per-model API key limits unless the API key explicitly allows the synthetic model identifiers.
@@ -81,4 +105,19 @@ The system MUST apply the same `validate_proxy_api_key` and dashboard `apiKeyAut
 
 - **WHEN** dashboard `apiKeyAuthEnabled` is true and a client posts to `/backend-api/files/{file_id}/uploaded` without a valid API key
 - **THEN** the service returns HTTP 401 with `error.code = "invalid_api_key"`
+
+### Requirement: Daybreak capability intent fails closed before file routing
+
+`POST /backend-api/files` and `POST /backend-api/files/{file_id}/uploaded` MUST require a valid proxy API key whenever `X-Codex-LB-Required-Capability` is present, even when deployment-wide API-key authentication is disabled. After authentication they MUST return HTTP 400 with `error.code = "required_capability_transport_unsupported"` before usage reservation, account selection, upload registration, status polling, or upstream dispatch. Headerless file requests MUST retain their existing behavior.
+
+#### Scenario: Authenticated carrier is denied before file account selection
+
+- **WHEN** a valid proxy API key sends a file-create or file-finalize request with the Daybreak carrier
+- **THEN** the route returns HTTP 400 `required_capability_transport_unsupported`
+- **AND** no reservation, account selection, upload registration, polling loop, or upstream request begins
+
+#### Scenario: Headerless file behavior remains unchanged
+
+- **WHEN** a file-create or file-finalize request omits the required-capability carrier
+- **THEN** the existing authentication, validation, reservation, routing, and response behavior remains in effect
 

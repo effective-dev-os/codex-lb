@@ -10,11 +10,13 @@ import type {
   AccountTrendsResponse,
   AccountUsageResetCredits,
 } from "@/features/accounts/schemas";
+import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
+import { useSmoothPercent } from "@/hooks/use-smooth-percent";
 import { quotaBarColor, quotaBarTrack } from "@/utils/account-status";
 import {
   formatCompactNumber,
   formatCurrency,
-  formatLocalDateTimeSeconds,
+  formatDateTimeInline,
   formatPercentNullable,
   formatQuotaResetLabel,
   formatResetRelative,
@@ -66,12 +68,12 @@ function QuotaRow({
                   : "text-red-600 dark:text-red-400",
           )}
         >
-          {formatPercentNullable(percent)}
+          {formatPercentNullable(percent, 1)}
         </span>
       </div>
       <div className={cn("h-1.5 w-full overflow-hidden rounded-full", quotaBarTrack(clamped))}>
         <div
-          className={cn("h-full rounded-full transition-all duration-500 ease-out", quotaBarColor(clamped))}
+          className={cn("h-full rounded-full transition-colors duration-500 ease-out", quotaBarColor(clamped))}
           style={{ width: `${clamped}%` }}
         />
       </div>
@@ -173,6 +175,7 @@ function ResetCreditsRow({
   onReset?: (accountId: string) => void;
 }) {
   const { t } = useTranslation();
+  const dateDisplayFormat = useDateDisplayFormatStore((state) => state.dateDisplayFormat);
   if (resetCredits == null && !loading && !unavailable) {
     return null;
   }
@@ -195,7 +198,9 @@ function ResetCreditsRow({
       <span className="flex min-w-0 flex-1 items-center justify-end gap-2">
         {nearestExpiresAt && expiryCountdown ? (
           <span className="min-w-0 max-w-[min(18rem,42vw)] truncate text-[11px] text-muted-foreground">
-            {t("accounts.usage.resetCredits.expires", { time: formatLocalDateTimeSeconds(nearestExpiresAt) })}{" "}
+            {t("accounts.usage.resetCredits.expires", {
+              time: formatDateTimeInline(nearestExpiresAt, dateDisplayFormat),
+            })}{" "}
             <span className="tabular-nums">({expiryCountdown.label})</span>
           </span>
         ) : null}
@@ -229,19 +234,22 @@ export function AccountUsagePanel({
   onReset,
 }: AccountUsagePanelProps) {
   const { t } = useTranslation();
-  const primary = account.usage?.primaryRemainingPercent ?? null;
-  const secondary = account.usage?.secondaryRemainingPercent ?? null;
-  const monthly = account.usage?.monthlyRemainingPercent ?? null;
+  const primaryState = useSmoothPercent(account.usage?.primaryRemainingPercent ?? null);
+  const secondaryState = useSmoothPercent(account.usage?.secondaryRemainingPercent ?? null);
+  const monthlyState = useSmoothPercent(account.usage?.monthlyRemainingPercent ?? null);
+  const primary = primaryState.percent;
+  const secondary = secondaryState.percent;
+  const monthly = monthlyState.percent;
   const requestUsage = account.requestUsage ?? null;
   const hasRequestUsage = (requestUsage?.requestCount ?? 0) > 0;
-  const weeklyOnly = account.windowMinutesPrimary == null && account.windowMinutesSecondary != null;
+  const hasPrimaryWindow = account.windowMinutesPrimary != null || primaryState.everKnown;
+  const hasSecondaryWindow = account.windowMinutesSecondary != null || secondaryState.everKnown;
+  const hasMonthlyWindow = account.windowMinutesMonthly != null || monthlyState.everKnown;
+  const weeklyOnly = !hasPrimaryWindow && hasSecondaryWindow;
   const primaryTrendPoints = trends?.primary ?? [];
   const secondaryTrendPoints = trends?.secondary ?? [];
   const secondaryScheduledTrendPoints = trends?.secondaryScheduled ?? [];
-  const monthlyOnly =
-    account.windowMinutesMonthly != null &&
-    account.windowMinutesPrimary == null &&
-    account.windowMinutesSecondary == null;
+  const monthlyOnly = hasMonthlyWindow && !hasPrimaryWindow && !hasSecondaryWindow;
   const hasTrends =
     primaryTrendPoints.length > 0 || secondaryTrendPoints.length > 0 || secondaryScheduledTrendPoints.length > 0;
 

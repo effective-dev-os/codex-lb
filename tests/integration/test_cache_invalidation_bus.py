@@ -25,6 +25,7 @@ from app.core.cache.invalidation import (
     NAMESPACE_ACCOUNT_ROUTING,
     NAMESPACE_ACCOUNT_SELECTION,
     NAMESPACE_API_KEY,
+    NAMESPACE_DASHBOARD_USERS,
     NAMESPACE_FIREWALL,
     NAMESPACE_MODEL_REGISTRY,
     NAMESPACE_RESET_CREDITS,
@@ -34,7 +35,7 @@ from app.core.cache.invalidation import (
     get_cache_invalidation_poller,
     set_cache_invalidation_poller,
 )
-from app.core.config.settings_cache import SettingsCache
+from app.core.config.settings_cache import SettingsCache, get_settings_cache
 from app.core.metrics.prometheus import (
     PROMETHEUS_AVAILABLE,
     cache_invalidation_bump_failures_total,
@@ -50,6 +51,7 @@ from app.modules.proxy.account_cache import (
     is_account_routing_unavailable,
     mark_account_routing_unavailable,
 )
+from app.modules.settings.repository import SettingsRepository
 
 if TYPE_CHECKING:
     from app.modules.proxy._service.http_bridge.helpers import _HTTPBridgeSession
@@ -107,7 +109,7 @@ async def _namespace_version(namespace: str) -> int | None:
 
 
 def _fake_bridge_session(account: Account) -> "_HTTPBridgeSession":
-    return cast("_HTTPBridgeSession", SimpleNamespace(account=account))
+    return cast("_HTTPBridgeSession", SimpleNamespace(account=account, access_token_expires_at=None))
 
 
 def _make_replica_b_routing() -> tuple[RoutingAvailabilityCache, CacheInvalidationPoller]:
@@ -218,9 +220,9 @@ async def test_failed_prime_recovery_stops_stale_bridge_session_reuse(db_setup, 
 
 
 @pytest.mark.asyncio
-async def test_reauth_on_peer_clears_local_routing_marker(db_setup, poller_slot) -> None:
-    """A routing-unavailable marker set locally is cleared when another replica
-    re-authenticates the account (previously permanent until restart)."""
+async def test_reauth_status_clears_legacy_local_routing_marker(db_setup, poller_slot) -> None:
+    """A converged REAUTH_REQUIRED snapshot is request-routable and clears any
+    stale local overlay left by an older replica's hard-blocking behavior."""
     account_id = "acct-bus-reauth"
     await _insert_account(account_id)
 
@@ -231,18 +233,21 @@ async def test_reauth_on_peer_clears_local_routing_marker(db_setup, poller_slot)
     await routing_cache.refresh_from_db()
     await local_poller._poll_once()
 
-    # Local permanent refresh failure: committed status write + local marker.
+    # Simulate an old replica committing REAUTH_REQUIRED and adding the former
+    # routing-unavailable overlay.
     await _set_account_status(account_id, AccountStatus.REAUTH_REQUIRED)
     mark_account_routing_unavailable(account_id)
     assert is_account_routing_unavailable(account_id) is True
 
-    # Replica A re-authenticates the account: committed status write + durable bump.
-    await _set_account_status(account_id, AccountStatus.ACTIVE)
+    # A current replica publishes the committed status. REAUTH_REQUIRED itself
+    # is now routable, so convergence clears the stale overlay.
     remote_poller = CacheInvalidationPoller(SessionLocal)
     assert await remote_poller.bump(NAMESPACE_ACCOUNT_ROUTING) is True
 
     await local_poller._poll_once()
     assert is_account_routing_unavailable(account_id) is False
+    reauth_session = _fake_bridge_session(_make_account(account_id, AccountStatus.REAUTH_REQUIRED))
+    assert _http_bridge_session_account_active(reauth_session) is True
 
 
 @pytest.mark.asyncio
@@ -308,23 +313,33 @@ async def test_selection_cache_invalidation_propagates_to_peer(db_setup, poller_
 
 @pytest.mark.asyncio
 async def test_password_setup_propagates_settings_to_peer(async_client, db_setup) -> None:
-    """Setting the dashboard password on replica A is visible to replica B's settings
-    cache after one poll cycle, without waiting for the 5s TTL."""
+    """First-run setup clears the bootstrap token, and replica B sees that after one poll.
+
+    The credential itself no longer lives in ``dashboard_settings``; the token
+    that setup invalidates does, and it is the settings fact that setup changes.
+    """
+
+    async with SessionLocal() as session:
+        row = await SettingsRepository(session).get_or_create()
+        row.bootstrap_token_encrypted, row.bootstrap_token_hash = b"token", b"token-hash"
+        await session.commit()
+    await get_settings_cache().invalidate()
+
     b_settings = SettingsCache()
     poller_b = CacheInvalidationPoller(SessionLocal)
     poller_b.on_invalidation(NAMESPACE_SETTINGS, lambda: b_settings.invalidate(propagate=False))
     await poller_b._poll_once()
 
-    assert (await b_settings.get()).password_hash is None
+    assert (await b_settings.get()).bootstrap_token_hash is not None
 
     response = await async_client.post("/api/dashboard-auth/password/setup", json={"password": "password123"})
     assert response.status_code == 200
 
     # Replica B still serves the stale row until its next poll (the defect window).
-    assert (await b_settings.get()).password_hash is None
+    assert (await b_settings.get()).bootstrap_token_hash is not None
 
     await poller_b._poll_once()
-    assert (await b_settings.get()).password_hash is not None
+    assert (await b_settings.get()).bootstrap_token_hash is None
 
 
 class _FlakySessionFactory:
@@ -382,8 +397,69 @@ def test_namespace_log_labels_cover_all_namespaces() -> None:
             NAMESPACE_RESET_CREDITS,
             NAMESPACE_MODEL_REGISTRY,
             NAMESPACE_UPSTREAM_ROUTE,
+            NAMESPACE_DASHBOARD_USERS,
         )
     }
+
+
+@pytest.mark.asyncio
+async def test_pending_bump_survives_a_cancelled_flush(db_setup, monkeypatch) -> None:
+    """The marker is cleared before the write is awaited, so a cancelled write
+    must restore it — otherwise the namespace is neither written nor pending
+    and no later cycle can retry it. (At process stop no cycle remains either
+    way; shutdown delivery is explicitly out of scope, and the restore there
+    only keeps the pending set honest.)"""
+    namespace = "test_flush_cancelled"
+    started = asyncio.Event()
+
+    async def never_finishes(ns: str) -> bool:
+        started.set()
+        await asyncio.Event().wait()
+        return True
+
+    poller = CacheInvalidationPoller(SessionLocal)
+    monkeypatch.setattr(poller, "bump", never_finishes)
+    poller.request_bump(namespace)
+
+    flush_task = asyncio.create_task(poller._flush_pending_bumps())
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    assert namespace not in poller._pending_bumps, "marker is cleared before the write, by design"
+
+    flush_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await flush_task
+
+    assert namespace in poller._pending_bumps
+    assert await _namespace_version(namespace) is None
+
+
+@pytest.mark.asyncio
+async def test_pending_bump_survives_a_raising_flush_and_does_not_starve_others(db_setup, monkeypatch) -> None:
+    """A raise is abnormal (bump() reports failure by returning False), so it
+    must not abort the flush: the loop is sorted, and a persistently raising
+    namespace sorting first would otherwise starve every namespace after it
+    on every cycle. The raiser stays pending; the rest still land."""
+    raising_namespace = "test_flush_raised_a"
+    healthy_namespace = "test_flush_raised_b"
+    real_bump = CacheInvalidationPoller.bump
+
+    poller = CacheInvalidationPoller(SessionLocal)
+
+    async def raising_for_one(ns: str) -> bool:
+        if ns == raising_namespace:
+            raise RuntimeError("driver exploded")
+        return await real_bump(poller, ns)
+
+    monkeypatch.setattr(poller, "bump", raising_for_one)
+    poller.request_bump(raising_namespace)
+    poller.request_bump(healthy_namespace)
+
+    await poller._flush_pending_bumps()
+
+    assert raising_namespace in poller._pending_bumps
+    assert await _namespace_version(raising_namespace) is None
+    assert healthy_namespace not in poller._pending_bumps
+    assert await _namespace_version(healthy_namespace) == 1
 
 
 @pytest.mark.asyncio
@@ -793,3 +869,58 @@ async def test_inflight_poll_does_not_clobber_concurrent_local_bump(db_setup) ->
     await source._poll_once()
     assert source_calls == []
     assert source._known_versions.get(NAMESPACE_RESET_CREDITS) == 2
+
+
+@pytest.mark.asyncio
+async def test_aborted_bump_is_retried_by_the_running_poller(db_setup, monkeypatch) -> None:
+    """End-to-end: the point of restoring the marker is that the background
+    poller actually retries. Without the restore the first raise loses the
+    namespace and no later cycle ever writes its version."""
+    namespace = "test_abort_retried_by_poller"
+    attempts = 0
+    real_bump = CacheInvalidationPoller.bump
+
+    poller = CacheInvalidationPoller(SessionLocal, poll_interval_seconds=0.01)
+
+    retry_settled = asyncio.Event()
+
+    async def failing_then_real(ns: str) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("driver exploded")
+        result = await real_bump(poller, ns)
+        # Signal only after bump() fully returns: the committed row can become
+        # visible while the shielded session cleanup is still running, and
+        # stopping the poller at that instant would cancel the retry mid-flight.
+        retry_settled.set()
+        return result
+
+    monkeypatch.setattr(poller, "bump", failing_then_real)
+    poller.request_bump(namespace)
+    await poller.start()
+    try:
+        await asyncio.wait_for(retry_settled.wait(), timeout=5.0)
+    finally:
+        await poller.stop()
+
+    assert attempts >= 2, "the poller must retry the aborted namespace"
+    assert await _namespace_version(namespace) == 1
+    assert namespace not in poller._pending_bumps
+
+
+@pytest.mark.asyncio
+async def test_lifespan_registers_a_settings_refresh_on_the_bus(app_instance) -> None:
+    """The settings namespace must both expire and reload the snapshot.
+
+    Readers that cannot await the cache — the conversation archive gate runs
+    per archived frame — otherwise keep the pre-change value on a replica that
+    is only carrying already-open streams.
+    """
+
+    async with app_instance.router.lifespan_context(app_instance):
+        poller = get_cache_invalidation_poller()
+        assert poller is not None
+        callbacks = poller._callbacks[NAMESPACE_SETTINGS]
+
+    assert get_settings_cache().refresh in callbacks

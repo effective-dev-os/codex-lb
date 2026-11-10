@@ -4,12 +4,15 @@ import asyncio
 import base64
 import contextlib
 import json
+import re
+from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
 from fastapi.responses import JSONResponse
+from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy import select, update
 
 import app.core.clients.proxy as core_proxy_module
@@ -22,11 +25,19 @@ from app.core.clients.proxy import ProxyResponseError
 from app.core.openai.model_registry import ReasoningLevel, UpstreamModel, get_model_registry
 from app.core.openai.models import OpenAIResponsePayload
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus, ApiKeyUsageReservation, LimitWindow, RequestLog, UsageHistory
+from app.db.models import (
+    Account,
+    AccountStatus,
+    ApiKeyLimit,
+    ApiKeyUsageReservation,
+    LimitWindow,
+    RequestLog,
+    UsageHistory,
+)
 from app.db.session import SessionLocal
 from app.modules.api_keys.last_used_coalescer import get_api_key_last_used_coalescer
 from app.modules.api_keys.repository import ApiKeysRepository
-from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService, LimitRuleInput
+from app.modules.api_keys.service import ApiKeyCreateData, ApiKeyInvalidError, ApiKeysService, LimitRuleInput
 from app.modules.model_sources.forwarding import (
     SourceChatCompletion,
     SourceResponsesStream,
@@ -34,6 +45,7 @@ from app.modules.model_sources.forwarding import (
     SourceUsage,
     SourceUsageHolder,
 )
+from app.modules.request_logs.repository import RequestLogsRepository
 
 pytestmark = pytest.mark.integration
 
@@ -134,6 +146,29 @@ async def _create_model_source(
 
 
 @pytest.mark.asyncio
+async def test_api_key_collection_routes_accept_equivalent_slash_forms(async_client):
+    canonical_list = await async_client.get("/api/api-keys/")
+    unslashed_list = await async_client.get("/api/api-keys", follow_redirects=False)
+    unslashed_create = await async_client.post(
+        "/api/api-keys",
+        json={"name": "unslashed-key", "allowedModels": []},
+        follow_redirects=False,
+    )
+
+    assert {
+        "canonical_get": canonical_list.status_code,
+        "unslashed_get": unslashed_list.status_code,
+        "unslashed_post": unslashed_create.status_code,
+    } == {
+        "canonical_get": 200,
+        "unslashed_get": 200,
+        "unslashed_post": 200,
+    }
+    assert unslashed_list.json() == canonical_list.json()
+    assert unslashed_create.json()["key"].startswith("sk-clb-")
+
+
+@pytest.mark.asyncio
 async def test_api_keys_crud_and_regenerate(async_client):
     create = await async_client.post(
         "/api/api-keys/",
@@ -148,7 +183,7 @@ async def test_api_keys_crud_and_regenerate(async_client):
     assert create.status_code == 200
     payload = create.json()
     assert payload["name"] == "dev-key"
-    assert payload["key"].startswith("sk-clb-")
+    assert re.fullmatch(r"sk-clb-[0-9a-f]{48}", payload["key"])
     assert payload["accountAssignmentScopeEnabled"] is False
     assert payload["assignedAccountIds"] == []
     assert len(payload["limits"]) == 1
@@ -184,7 +219,7 @@ async def test_api_keys_crud_and_regenerate(async_client):
     assert regenerated.status_code == 200
     regenerated_payload = regenerated.json()
     assert regenerated_payload["id"] == key_id
-    assert regenerated_payload["key"].startswith("sk-clb-")
+    assert re.fullmatch(r"sk-clb-[0-9a-f]{48}", regenerated_payload["key"])
     assert regenerated_payload["key"] != first_key
 
     deleted = await async_client.delete(f"/api/api-keys/{key_id}")
@@ -777,10 +812,14 @@ async def test_api_key_enforces_model_and_reasoning_for_responses(async_client, 
 
 
 @pytest.mark.asyncio
-async def test_api_key_enforces_service_tier_for_responses(async_client, monkeypatch):
-    await _populate_test_registry()
-    model_ids = sorted(_TEST_MODELS)
-    forced_model = model_ids[0]
+@pytest.mark.parametrize(
+    ("enforced_service_tier", "expected_service_tier"),
+    [("fast", "priority"), ("ULTRAFAST", "ultrafast")],
+)
+async def test_api_key_enforces_service_tier_for_responses(
+    async_client, monkeypatch, enforced_service_tier, expected_service_tier
+):
+    forced_model = "gpt-5.6-sol"
 
     enable = await async_client.put(
         "/api/settings",
@@ -793,27 +832,47 @@ async def test_api_key_enforces_service_tier_for_responses(async_client, monkeyp
     )
     assert enable.status_code == 200
 
+    account_id = await _import_account(
+        async_client,
+        f"acc_enforced_{expected_service_tier}_service_tier",
+        f"enforced-{expected_service_tier}-service-tier@example.com",
+    )
+    advertising_model = replace(
+        _make_upstream_model(forced_model),
+        raw={"service_tiers": [{"slug": expected_service_tier}]},
+    )
+    await get_model_registry().update(
+        {"pro": [advertising_model]},
+        per_account_results={account_id: ("pro", [advertising_model])},
+        active_account_plans={account_id: "pro"},
+    )
+
     created = await async_client.post(
         "/api/api-keys/",
         json={
             "name": "enforced-service-tier",
             "allowedModels": [forced_model],
             "enforcedModel": forced_model,
-            "enforcedServiceTier": "fast",
+            "enforcedServiceTier": enforced_service_tier,
         },
     )
     assert created.status_code == 200
     key = created.json()["key"]
-    assert created.json()["enforcedServiceTier"] == "priority"
-
-    await _import_account(async_client, "acc_enforced_service_tier", "enforced-service-tier@example.com")
+    assert created.json()["enforcedServiceTier"] == expected_service_tier
 
     seen: dict[str, str | None] = {}
 
     async def fake_stream(payload, _headers, _access_token, _account_id, base_url=None, raise_for_status=False):
         seen["service_tier"] = payload.service_tier
         usage = {"input_tokens": 3, "output_tokens": 2}
-        event = {"type": "response.completed", "response": {"id": "resp_enforced_service_tier", "usage": usage}}
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_enforced_service_tier",
+                "service_tier": expected_service_tier,
+                "usage": usage,
+            },
+        }
         yield f"data: {json.dumps(event)}\n\n"
 
     monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
@@ -833,7 +892,15 @@ async def test_api_key_enforces_service_tier_for_responses(async_client, monkeyp
         assert response.status_code == 200
         _ = [line async for line in response.aiter_lines() if line]
 
-    assert seen["service_tier"] == "priority"
+    assert seen["service_tier"] == expected_service_tier
+
+    async with SessionLocal() as session:
+        result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
+        latest_log = result.scalars().first()
+        assert latest_log is not None
+        assert latest_log.requested_service_tier == expected_service_tier
+        assert latest_log.actual_service_tier == expected_service_tier
+        assert latest_log.service_tier == expected_service_tier
 
 
 @pytest.mark.asyncio
@@ -1338,7 +1405,7 @@ async def test_backend_codex_responses_routes_responses_capable_model_source(asy
     )
     observed: dict[str, object] = {}
 
-    async def fake_stream(source, payload):
+    async def fake_stream(source, payload, **_kwargs):
         observed["source_id"] = source.id
         observed["payload"] = dict(payload)
         usage_holder = SourceUsageHolder()
@@ -1381,7 +1448,7 @@ async def test_v1_responses_strips_replayed_tool_call_namespaces_for_model_sourc
     )
     observed: dict[str, object] = {}
 
-    async def fake_stream(source, payload):
+    async def fake_stream(source, payload, **_kwargs):
         observed["payload"] = dict(payload)
         usage_holder = SourceUsageHolder()
 
@@ -1456,7 +1523,7 @@ async def test_backend_codex_responses_filters_unsupported_model_source_tools(as
     )
     observed: dict[str, object] = {}
 
-    async def fake_stream(source, payload):
+    async def fake_stream(source, payload, **_kwargs):
         observed["source_id"] = source.id
         observed["payload"] = dict(payload)
         usage_holder = SourceUsageHolder()
@@ -1516,7 +1583,7 @@ async def test_backend_codex_responses_keeps_search_tools_for_capable_model_sour
     )
     observed: dict[str, object] = {}
 
-    async def fake_stream(source, payload):
+    async def fake_stream(source, payload, **_kwargs):
         observed["payload"] = dict(payload)
         usage_holder = SourceUsageHolder()
 
@@ -1570,7 +1637,7 @@ async def test_backend_codex_responses_keeps_legacy_alias_allowed_search_tool_ch
     )
     observed: dict[str, object] = {}
 
-    async def fake_stream(source, payload):
+    async def fake_stream(source, payload, **_kwargs):
         observed["payload"] = dict(payload)
         usage_holder = SourceUsageHolder()
 
@@ -1640,7 +1707,7 @@ async def test_backend_codex_responses_normalizes_allowed_tool_choice_alias_with
     )
     observed: dict[str, object] = {}
 
-    async def fake_stream(source, payload):
+    async def fake_stream(source, payload, **_kwargs):
         observed["payload"] = dict(payload)
         usage_holder = SourceUsageHolder()
 
@@ -1703,7 +1770,7 @@ async def test_backend_codex_responses_drops_tool_choice_referencing_dropped_sou
     )
     observed: dict[str, object] = {}
 
-    async def fake_stream(source, payload):
+    async def fake_stream(source, payload, **_kwargs):
         observed["payload"] = dict(payload)
         usage_holder = SourceUsageHolder()
 
@@ -1754,7 +1821,7 @@ async def test_backend_codex_responses_prunes_include_entries_of_dropped_source_
     )
     observed: dict[str, object] = {}
 
-    async def fake_stream(source, payload):
+    async def fake_stream(source, payload, **_kwargs):
         observed["payload"] = dict(payload)
         usage_holder = SourceUsageHolder()
 
@@ -1809,7 +1876,7 @@ async def test_v1_responses_filters_unsupported_model_source_tools(async_client,
     )
     observed: dict[str, object] = {}
 
-    async def fake_stream(source, payload):
+    async def fake_stream(source, payload, **_kwargs):
         observed["source_id"] = source.id
         observed["payload"] = dict(payload)
         usage_holder = SourceUsageHolder()
@@ -1952,6 +2019,64 @@ async def test_backend_codex_responses_file_pinned_payload_skips_model_source(as
 
 
 @pytest.mark.asyncio
+async def test_backend_codex_responses_recorded_previous_response_owner_skips_model_source(async_client, monkeypatch):
+    model = "external-codex-responses-prev-id"
+    previous_response_id = "resp_0ba42212936dca97016a0d52aec2588191bc2499d3088e4e3e"
+    await _create_model_source(
+        async_client,
+        name="codex-responses-prev-id",
+        model=model,
+        supports_responses=True,
+    )
+    account_id = await _import_account(async_client, "acct-prev-owner-codex", "prev-owner-codex@example.com")
+    async with SessionLocal() as session:
+        await RequestLogsRepository(session).add_log(
+            account_id=account_id,
+            request_id=previous_response_id,
+            model=model,
+            input_tokens=None,
+            output_tokens=None,
+            latency_ms=None,
+            status="success",
+            error_code=None,
+        )
+    observed: dict[str, object] = {}
+
+    async def fail_source(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("recorded subscription-owned previous_response_id must not use source routing")
+
+    async def fake_stream_responses(request, payload, context, api_key, **kwargs):
+        del request, context, api_key
+        observed["model"] = payload.model
+        observed["previous_response_id"] = payload.previous_response_id
+        observed["codex_session_affinity"] = kwargs.get("codex_session_affinity")
+        return JSONResponse({"ok": True})
+
+    monkeypatch.setattr(proxy_api, "stream_source_responses", fail_source)
+    monkeypatch.setattr(proxy_api, "_stream_responses", fake_stream_responses)
+
+    response = await async_client.post(
+        "/backend-api/codex/responses",
+        json={
+            "model": model,
+            "instructions": "continue",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "next"}]}],
+            "previous_response_id": previous_response_id,
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert observed == {
+        "model": model,
+        "previous_response_id": previous_response_id,
+        "codex_session_affinity": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_file_pinned_payload_skips_model_source(async_client, monkeypatch):
     model = "external-v1-responses-file-pin"
     await _create_model_source(
@@ -1991,6 +2116,223 @@ async def test_v1_responses_file_pinned_payload_skips_model_source(async_client,
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert observed["model"] == model
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_recorded_previous_response_owner_skips_model_source(async_client, monkeypatch):
+    model = "external-v1-responses-prev-id"
+    previous_response_id = "resp_03ac4d75eac7c5d1016a0a619e8a688191b5267ba7ffac3111"
+    await _create_model_source(
+        async_client,
+        name="v1-responses-prev-id",
+        model=model,
+        supports_responses=True,
+    )
+    account_id = await _import_account(async_client, "acct-prev-owner-v1", "prev-owner-v1@example.com")
+    async with SessionLocal() as session:
+        await RequestLogsRepository(session).add_log(
+            account_id=account_id,
+            request_id=previous_response_id,
+            model=model,
+            input_tokens=None,
+            output_tokens=None,
+            latency_ms=None,
+            status="success",
+            error_code=None,
+        )
+    observed: dict[str, object] = {}
+
+    async def fail_source(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("recorded subscription-owned previous_response_id must not use /v1 source routing")
+
+    async def fake_stream_responses(request, payload, context, api_key, **kwargs):
+        del request, context, api_key, kwargs
+        observed["model"] = payload.model
+        observed["previous_response_id"] = payload.previous_response_id
+        return JSONResponse({"ok": True})
+
+    monkeypatch.setattr(proxy_api, "stream_source_responses", fail_source)
+    monkeypatch.setattr(proxy_api, "_stream_responses", fake_stream_responses)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+            "previous_response_id": previous_response_id,
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert observed["model"] == model
+    assert observed["previous_response_id"] == previous_response_id
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_source_owned_previous_response_id_keeps_model_source(async_client, monkeypatch):
+    model = "external-v1-responses-source-prev"
+    previous_response_id = "resp_a3a82ffdf2f04456a7ca120deedc78dc47e172e56ed5338760"
+    source_id = await _create_model_source(
+        async_client,
+        name="v1-responses-source-prev",
+        model=model,
+        supports_responses=True,
+    )
+    observed: dict[str, object] = {}
+
+    async def fake_stream_source(source, payload, **_kwargs):
+        observed["source_id"] = source.id
+        observed["previous_response_id"] = payload.get("previous_response_id")
+        observed["model"] = payload.get("model")
+        usage_holder = SourceUsageHolder()
+
+        async def body():
+            usage_holder.usage = SourceUsage(input_tokens=1, output_tokens=1, cached_input_tokens=0)
+            yield (
+                b'data: {"type":"response.completed","response":{"id":"resp_v1_source_prev",'
+                b'"usage":{"input_tokens":1,"output_tokens":1}}\n\n'
+            )
+
+        return SourceResponsesStream(body=body(), usage_holder=usage_holder, upstream_status_code=200)
+
+    async def fail_subscription(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("source-owned previous_response_id must keep model-source routing")
+
+    monkeypatch.setattr(proxy_api, "stream_source_responses", fake_stream_source)
+    monkeypatch.setattr(proxy_api, "_stream_responses", fail_subscription)
+
+    async with async_client.stream(
+        "POST",
+        "/v1/responses",
+        json={
+            "model": model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+            "previous_response_id": previous_response_id,
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        lines = [line async for line in response.aiter_lines() if line]
+
+    assert observed["source_id"] == source_id
+    assert observed["previous_response_id"] == previous_response_id
+    assert observed["model"] == model
+    assert any("resp_v1_source_prev" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_backend_codex_responses_source_owned_previous_response_id_keeps_model_source(async_client, monkeypatch):
+    model = "external-codex-responses-source-prev"
+    previous_response_id = "resp_b4b93aaef3f15567b8db231effed89ed58f283f67fe6449871"
+    source_id = await _create_model_source(
+        async_client,
+        name="codex-responses-source-prev",
+        model=model,
+        supports_responses=True,
+    )
+    observed: dict[str, object] = {}
+
+    async def fake_stream_source(source, payload, **_kwargs):
+        observed["source_id"] = source.id
+        observed["previous_response_id"] = payload.get("previous_response_id")
+        observed["model"] = payload.get("model")
+        usage_holder = SourceUsageHolder()
+
+        async def body():
+            usage_holder.usage = SourceUsage(input_tokens=1, output_tokens=1, cached_input_tokens=0)
+            yield (
+                b'data: {"type":"response.completed","response":{"id":"resp_codex_source_prev",'
+                b'"usage":{"input_tokens":1,"output_tokens":1}}\n\n'
+            )
+
+        return SourceResponsesStream(body=body(), usage_holder=usage_holder, upstream_status_code=200)
+
+    async def fail_subscription(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("source-owned previous_response_id must keep model-source routing")
+
+    monkeypatch.setattr(proxy_api, "stream_source_responses", fake_stream_source)
+    monkeypatch.setattr(proxy_api, "_stream_responses", fail_subscription)
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json={
+            "model": model,
+            "instructions": "continue",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "next"}]}],
+            "previous_response_id": previous_response_id,
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        lines = [line async for line in response.aiter_lines() if line]
+
+    assert observed["source_id"] == source_id
+    assert observed["previous_response_id"] == previous_response_id
+    assert observed["model"] == model
+    assert any("resp_codex_source_prev" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_compaction_trigger_keeps_model_source(async_client, monkeypatch):
+    model = "external-v1-responses-compact"
+    source_id = await _create_model_source(
+        async_client,
+        name="v1-responses-compact",
+        model=model,
+        supports_responses=True,
+    )
+    observed: dict[str, object] = {}
+
+    async def fake_stream_source(source, payload, **_kwargs):
+        observed["source_id"] = source.id
+        observed["model"] = payload.get("model")
+        observed["input"] = payload.get("input")
+        usage_holder = SourceUsageHolder()
+
+        async def body():
+            usage_holder.usage = SourceUsage(input_tokens=1, output_tokens=1, cached_input_tokens=0)
+            yield (
+                b'data: {"type":"response.completed","response":{"id":"resp_v1_compact_source",'
+                b'"usage":{"input_tokens":1,"output_tokens":1}}\n\n'
+            )
+
+        return SourceResponsesStream(body=body(), usage_holder=usage_holder, upstream_status_code=200)
+
+    async def fail_subscription(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("v1 compaction_trigger must remain eligible for model sources")
+
+    monkeypatch.setattr(proxy_api, "stream_source_responses", fake_stream_source)
+    monkeypatch.setattr(proxy_api, "_stream_responses", fail_subscription)
+
+    async with async_client.stream(
+        "POST",
+        "/v1/responses",
+        json={
+            "model": model,
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+                {"type": "compaction_trigger"},
+            ],
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        lines = [line async for line in response.aiter_lines() if line]
+
+    assert observed["source_id"] == source_id
+    assert observed["model"] == model
+    assert observed["input"] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        {"type": "compaction_trigger"},
+    ]
+    assert any("resp_v1_compact_source" in line for line in lines)
 
 
 @pytest.mark.asyncio
@@ -2205,6 +2547,134 @@ async def test_api_key_update_accepts_extended_enforced_reasoning(async_client):
     )
     assert updated.status_code == 200
     assert updated.json()["enforcedReasoningEffort"] == "max"
+
+
+@pytest.mark.asyncio
+async def test_api_key_reasoning_effort_allowlist_is_normalized_and_enforced(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "bounded-reasoning-key",
+            "allowedReasoningEfforts": ["XHIGH", "low", "high", "low"],
+        },
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+    key = created.json()["key"]
+    assert created.json()["allowedReasoningEfforts"] == ["low", "high", "xhigh"]
+
+    conflicting_update = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={"enforcedReasoningEffort": "low"},
+    )
+    assert conflicting_update.status_code == 400
+    assert conflicting_update.json()["error"]["code"] == "invalid_api_key_payload"
+
+    empty_create = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "empty-reasoning-key", "allowedReasoningEfforts": []},
+    )
+    assert empty_create.status_code == 400
+
+    enabled = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enabled.status_code == 200
+
+    blocked = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "model-alpha",
+            "instructions": "hello",
+            "input": [],
+            "reasoning": {"effort": "max"},
+        },
+    )
+    assert blocked.status_code == 403
+    assert blocked.json()["error"] == {
+        "message": "This API key does not have access to reasoning effort 'max'",
+        "type": "permission_error",
+        "code": "reasoning_effort_not_allowed",
+        "param": "reasoning.effort",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/backend-api/codex/responses/compact", "/v1/responses/compact"])
+async def test_api_key_reasoning_allowlist_rejects_compact_before_upstream(async_client, monkeypatch, endpoint):
+    enabled = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enabled.status_code == 200
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "compact-allowlist-key", "allowedReasoningEfforts": ["low"]},
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    async def fail_upstream(*_args, **_kwargs):
+        raise AssertionError("compact upstream was reached after policy rejection")
+
+    monkeypatch.setattr(proxy_module, "core_compact_responses", fail_upstream)
+    response = await async_client.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "model-alpha", "instructions": "hi", "input": [], "reasoning": {"effort": "max"}},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "reasoning_effort_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_api_key_reasoning_allowlist_rejects_chat_completions_before_upstream(async_client, monkeypatch):
+    enabled = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enabled.status_code == 200
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "chat-allowlist-key", "allowedReasoningEfforts": ["low"]},
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    async def fail_upstream(*_args, **_kwargs):
+        raise AssertionError("chat completions upstream was reached after policy rejection")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fail_upstream)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "model-alpha",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "max",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "reasoning_effort_not_allowed"
 
 
 @pytest.mark.asyncio
@@ -3392,6 +3862,62 @@ async def test_update_key_same_policy_and_max_change_preserve_usage_state(async_
 
 
 @pytest.mark.asyncio
+async def test_update_limits_preserves_usage_committed_between_read_and_patch(
+    async_client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "preserve-interleaved-usage",
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 1000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+    concurrent_value = 777
+    concurrent_reset_at = utcnow() + timedelta(hours=6)
+
+    original_get_limits = ApiKeysRepository.get_limits_by_key
+    read_count = 0
+
+    async def interleave_after_initial_read(self, key_id: str):
+        nonlocal read_count
+        limits = await original_get_limits(self, key_id)
+        read_count += 1
+        if read_count == 1:
+            async with SessionLocal() as concurrent_session:
+                await concurrent_session.execute(
+                    update(ApiKeyLimit)
+                    .where(ApiKeyLimit.api_key_id == key_id)
+                    .values(current_value=concurrent_value, reset_at=concurrent_reset_at)
+                )
+                await concurrent_session.commit()
+        return limits
+
+    monkeypatch.setattr(ApiKeysRepository, "get_limits_by_key", interleave_after_initial_read)
+
+    updated = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 2000},
+            ],
+        },
+    )
+    assert updated.status_code == 200
+
+    async with SessionLocal() as session:
+        limits = await ApiKeysRepository(session).get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert limits[0].current_value == concurrent_value
+        assert limits[0].reset_at == concurrent_reset_at
+        assert limits[0].max_value == 2000
+
+
+@pytest.mark.asyncio
 async def test_update_key_reset_usage_requires_explicit_action(async_client):
     created = await async_client.post(
         "/api/api-keys/",
@@ -3558,6 +4084,10 @@ async def test_release_stale_usage_reservations_restores_reserved_usage(async_cl
         stale_second = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
         abandoned_before_first_heartbeat = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
         fresh = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+        assert stale is not None
+        assert stale_second is not None
+        assert abandoned_before_first_heartbeat is not None
+        assert fresh is not None
         await session.execute(
             update(ApiKeyUsageReservation)
             .where(ApiKeyUsageReservation.id.in_([stale.reservation_id, stale_second.reservation_id]))
@@ -3608,6 +4138,127 @@ async def test_release_stale_usage_reservations_restores_reserved_usage(async_cl
 
 
 @pytest.mark.asyncio
+async def test_limit_free_admission_creates_no_reservation_rows(async_client):
+    """Limit-free keys skip the reservation ledger: admission returns no
+    reservation, writes no rows, and stale-reservation reclamation has
+    nothing to release; limited keys keep creating reservations."""
+    del async_client
+    now = utcnow()
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        service = ApiKeysService(repo)
+        unlimited = await service.create_key(
+            ApiKeyCreateData(name="limit-free-admission", allowed_models=None, expires_at=None)
+        )
+        limited = await service.create_key(
+            ApiKeyCreateData(
+                name="limited-admission-regression",
+                allowed_models=None,
+                expires_at=None,
+                limits=[
+                    LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=50_000),
+                ],
+            )
+        )
+        unlimited_reservation = await service.enforce_limits_for_request(unlimited.id, request_model="gpt-5.1")
+        limited_reservation = await service.enforce_limits_for_request(limited.id, request_model="gpt-5.1")
+
+    assert unlimited_reservation is None
+    assert limited_reservation is not None
+    assert limited_reservation.has_applicable_limits is True
+
+    async with SessionLocal() as session:
+        rows = await session.execute(
+            select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == unlimited.id)
+        )
+        assert rows.scalars().all() == []
+        repo = ApiKeysRepository(session)
+        limited_row = await repo.get_usage_reservation(limited_reservation.reservation_id)
+        assert limited_row is not None
+        assert limited_row.status == "reserved"
+        # A future cutoff would reclaim any reserved row; the limit-free key
+        # contributed none, so only the limited key's reservation is released.
+        released_count = await repo.release_stale_usage_reservations(
+            cutoff=now + timedelta(hours=1),
+            max_age_cutoff=now + timedelta(hours=1),
+        )
+        assert released_count == 1
+
+
+@pytest.mark.asyncio
+async def test_enforce_limits_lazy_reset_and_expiry_with_narrowed_admission_load(async_client):
+    """Regression for the narrowed admission load (``get_for_limit_enforcement``).
+
+    The enforcement path loads only ``is_active``/``expires_at`` plus the
+    ``limits`` collection. The lazy expired-limit reset (which commits
+    mid-enforcement and refetches through the same narrowed load) and the
+    key-expiry rejection must behave exactly as with the full-graph load.
+    """
+    del async_client
+    now = utcnow()
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        service = ApiKeysService(repo)
+        created = await service.create_key(
+            ApiKeyCreateData(
+                name="narrowed-admission-load",
+                allowed_models=None,
+                expires_at=None,
+                limits=[
+                    LimitRuleInput(limit_type="total_tokens", limit_window="daily", max_value=50_000),
+                ],
+            )
+        )
+        limits = await repo.get_limits_by_key(created.id)
+        assert len(limits) == 1
+        # Exhausted AND expired: without the lazy reset the enforcement
+        # would reject; the reset must zero the counter and advance reset_at.
+        limits[0].current_value = 50_000
+        limits[0].reset_at = now - timedelta(hours=2)
+        await session.commit()
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        service = ApiKeysService(repo)
+        reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+        assert reservation is not None
+        assert reservation.has_applicable_limits is True
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(created.id)
+        assert len(limits) == 1
+        assert limits[0].reset_at > now
+        reserved = await repo.get_usage_reservation(reservation.reservation_id)
+        assert reserved is not None
+        assert reserved.status == "reserved"
+        assert limits[0].current_value == reserved.items[0].reserved_delta
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        # Fail-loud contract of the narrowed load: unlisted columns and the
+        # assignment relationships raise instead of lazy loading.
+        row = await repo.get_for_limit_enforcement(created.id)
+        assert row is not None
+        assert row.is_active is True
+        assert row.expires_at is None
+        assert len(row.limits) == 1
+        with pytest.raises(sqlalchemy_exc.InvalidRequestError):
+            _ = row.name
+        with pytest.raises(sqlalchemy_exc.InvalidRequestError):
+            _ = row.account_assignments
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        service = ApiKeysService(repo)
+        await repo.update(created.id, expires_at=now - timedelta(minutes=1))
+        with pytest.raises(ApiKeyInvalidError):
+            await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+
+
+@pytest.mark.asyncio
 async def test_release_stale_usage_reservations_max_age_ceiling_beats_orphaned_heartbeat(async_client, monkeypatch):
     """Issue #1594: a leaked heartbeat keeps refreshing ``updated_at`` forever.
 
@@ -3636,6 +4287,8 @@ async def test_release_stale_usage_reservations_max_age_ceiling_beats_orphaned_h
         )
         heartbeat_kept = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
         fresh = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+        assert heartbeat_kept is not None
+        assert fresh is not None
         # An orphaned heartbeat keeps the reservation's updated_at current
         # even though it was created past the hard age ceiling.
         await session.execute(

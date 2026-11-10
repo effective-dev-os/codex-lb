@@ -34,6 +34,22 @@ describe("AccountListItem", () => {
     expect(screen.getByText("Reset in 1d")).toBeInTheDocument();
   });
 
+  it("renders a guest-masked summary without ChatGPT account or workspace ids", () => {
+    const account = createAccountSummary({
+      email: "p***@example.com",
+      displayName: "p***@example.com",
+      chatgptAccountId: null,
+      workspaceId: null,
+      workspaceLabel: null,
+    });
+
+    render(<AccountListItem account={account} selected={false} onSelect={vi.fn()} />);
+
+    expect(screen.getByText("p***@example.com")).toBeInTheDocument();
+    expect(screen.getByText(/Personal \/ unknown workspace/)).toBeInTheDocument();
+    expect(screen.queryByText(/chatgpt_acc_primary/)).not.toBeInTheDocument();
+  });
+
   it("omits the 5h row for weekly-only accounts", () => {
     const account = createAccountSummary({
       usage: {
@@ -246,6 +262,30 @@ describe("AccountListItem", () => {
     render(<AccountListItem account={account} selected={false} onSelect={vi.fn()} />);
 
     expect(screen.queryByText("99+")).not.toBeInTheDocument();
+  });
+
+  it("explains that Active is the displayed status, not per-request eligibility", () => {
+    const account = createAccountSummary({ status: "active" });
+
+    render(<AccountListItem account={account} selected={false} onSelect={vi.fn()} />);
+
+    // The hint lives on the focusable row (accessible description for
+    // keyboard/screen-reader users) and on the badge for pointer hover.
+    const hints = screen.getAllByTitle(/Active is the account's displayed status/i);
+    expect(hints.length).toBeGreaterThan(0);
+    expect(screen.getByRole("button")).toHaveAttribute(
+      "title",
+      expect.stringMatching(/Active is the account's displayed status/i),
+    );
+  });
+
+  it("omits the eligibility hint for non-active statuses", () => {
+    const account = createAccountSummary({ status: "paused" });
+
+    render(<AccountListItem account={account} selected={false} onSelect={vi.fn()} />);
+
+    expect(screen.queryByTitle(/Active is the account's displayed status/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button")).not.toHaveAttribute("title");
   });
 
   it("hides the reset-credit badge when badge display is disabled", () => {

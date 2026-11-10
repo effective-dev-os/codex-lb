@@ -1,22 +1,40 @@
-import { act, fireEvent, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 
 import { renderWithProviders } from "@/test/utils";
-import type { ReportsResponse } from "@/features/reports/schemas";
+import type {
+  ReportsResponse,
+  ThreadIdentityFacet,
+  ThreadIdentityResponse,
+} from "@/features/reports/schemas";
 import { listAccounts } from "@/features/accounts/api";
+import { getRequestLogOptions } from "@/features/dashboard/api";
 import { getBrowserReportsTimeZone } from "@/features/reports/date";
-import { useReports } from "@/features/reports/hooks/use-reports";
-import { REPORT_CHART_VISIBILITY_STORAGE_KEY } from "@/features/reports/hooks/use-report-chart-visibility";
+import {
+  useReports,
+  useReportsOptions,
+  useThreadIdentity,
+} from "@/features/reports/hooks/use-reports";
+import {
+  REPORT_CHART_DEFINITIONS,
+  REPORT_CHART_VISIBILITY_STORAGE_KEY,
+} from "@/features/reports/hooks/use-report-chart-visibility";
 import { ReportsPage } from "./reports-page";
 
 vi.mock("@/features/accounts/api", () => ({
   listAccounts: vi.fn().mockResolvedValue({ accounts: [] }),
 }));
 
+vi.mock("@/features/dashboard/api", () => ({
+  getRequestLogOptions: vi.fn().mockResolvedValue({ accountIds: [], apiKeys: [], modelOptions: [], statuses: [] }),
+}));
+
 vi.mock("@/features/reports/hooks/use-reports", () => ({
   useReports: vi.fn(),
+  useReportsOptions: vi.fn(),
+  useThreadIdentity: vi.fn(),
 }));
 
 vi.mock("@/features/reports/date", async () => {
@@ -44,8 +62,11 @@ const EMPTY_REPORT: ReportsResponse = {
     totalCostUsd: 0,
     totalInputTokens: 0,
     totalOutputTokens: 0,
+    totalReasoningTokens: 0,
+    reasoningUsageKnownRequests: 0,
     totalCachedTokens: 0,
     totalRequests: 0,
+    totalCancelled: 0,
     totalErrors: 0,
     totalConversations: 0,
     activeAccounts: 0,
@@ -66,11 +87,43 @@ const EMPTY_REPORT: ReportsResponse = {
   byAccount: [],
 };
 
+const EMPTY_THREAD_IDENTITY_FACET: ThreadIdentityFacet = {
+  requests: 0,
+  requestShare: 0,
+  unattributedRequestShare: 0,
+  conversations: 0,
+  meanAccountsPerConversation: 0,
+  singleAccountConversationShare: 0,
+  turns: 0,
+  accountSwitchRate: 0,
+  cacheHitRatio: 0,
+  cacheSampleInputTokens: 0,
+  threadGroupingApproximate: false,
+};
+
+const useReportsOptionsMock = vi.mocked(useReportsOptions);
 const useReportsMock = vi.mocked(useReports);
+const useThreadIdentityMock = vi.mocked(useThreadIdentity);
 const listAccountsMock = vi.mocked(listAccounts);
+const getRequestLogOptionsMock = vi.mocked(getRequestLogOptions);
 const getBrowserReportsTimeZoneMock = vi.mocked(getBrowserReportsTimeZone);
 type UseReportsMockResult = ReturnType<typeof useReports>;
 const REPORTS_TIMEZONE_STORAGE_KEY = "codex-lb-reports-timezone";
+// Derived so adding a card to REPORT_CHART_DEFINITIONS does not leave these
+// assertions checking a stale count.
+const ALL_CHARTS_BUTTON = `Charts (${REPORT_CHART_DEFINITIONS.length})`;
+const THREAD_IDENTITY: ThreadIdentityResponse = {
+  available: true,
+  maxDays: 7,
+  windowDays: 7,
+  conversationMinRequests: 3,
+  switchMaxGapSeconds: 600,
+  cacheMinInputTokens: 5000,
+  totalRequests: 0,
+  unkeyedRequestShare: 0,
+  keyed: EMPTY_THREAD_IDENTITY_FACET,
+  unkeyed: { ...EMPTY_THREAD_IDENTITY_FACET, threadGroupingApproximate: true },
+};
 
 const asUseReportsResult = (
   value: Partial<UseReportsMockResult>,
@@ -79,10 +132,20 @@ const asUseReportsResult = (
 describe("ReportsPage", () => {
   beforeEach(() => {
     useReportsMock.mockReset();
+    useReportsOptionsMock.mockReset();
+    useThreadIdentityMock.mockReset();
+    useThreadIdentityMock.mockReturnValue({
+      data: THREAD_IDENTITY,
+      error: null,
+      refetch: vi.fn(),
+    } as unknown as ReturnType<typeof useThreadIdentity>);
+    useReportsOptionsMock.mockReturnValue({ data: { models: ["gpt-5.1", "gpt-5.2"], useragents: ["CLI", "SDK"] }, isLoading: false, refetch: vi.fn() } as unknown as ReturnType<typeof useReportsOptions>);
     listAccountsMock.mockReset();
+    getRequestLogOptionsMock.mockReset();
     getBrowserReportsTimeZoneMock.mockReset();
     window.localStorage.clear();
     listAccountsMock.mockResolvedValue({ accounts: [] });
+    getRequestLogOptionsMock.mockResolvedValue({ accountIds: [], apiKeys: [], modelOptions: [], statuses: [] });
     getBrowserReportsTimeZoneMock.mockReturnValue("America/Los_Angeles");
   });
 
@@ -111,7 +174,7 @@ describe("ReportsPage", () => {
     });
   });
 
-  it("passes the page-managed timezone state into both reports queries", () => {
+  it("passes the page-managed timezone state into the report and options queries", () => {
     useReportsMock.mockReturnValue(
       asUseReportsResult({
         data: EMPTY_REPORT,
@@ -131,8 +194,8 @@ describe("ReportsPage", () => {
       }),
       "America/Los_Angeles",
     );
-    expect(useReportsMock).toHaveBeenNthCalledWith(
-      2,
+    expect(useReportsOptionsMock).toHaveBeenNthCalledWith(
+      1,
       expect.objectContaining({
         startDate: expect.any(String),
         endDate: expect.any(String),
@@ -184,7 +247,7 @@ describe("ReportsPage", () => {
     renderWithProviders(<ReportsPage />);
 
     expect(useReportsMock).toHaveBeenNthCalledWith(1, expect.any(Object), "America/Los_Angeles");
-    expect(useReportsMock).toHaveBeenNthCalledWith(2, expect.any(Object), "America/Los_Angeles");
+    expect(useReportsOptionsMock).toHaveBeenNthCalledWith(1, expect.any(Object), "America/Los_Angeles");
   });
 
   it("uses the cached valid timezone for reports queries when live detection is unavailable", async () => {
@@ -213,7 +276,7 @@ describe("ReportsPage", () => {
     renderWithProviders(<ReportsPage />);
 
     expect(useReportsMock).toHaveBeenNthCalledWith(1, expect.any(Object), "Europe/Paris");
-    expect(useReportsMock).toHaveBeenNthCalledWith(2, expect.any(Object), "Europe/Paris");
+    expect(useReportsOptionsMock).toHaveBeenNthCalledWith(1, expect.any(Object), "Europe/Paris");
   });
 
   it("omits timezone for reports queries only when live and cached timezones are both invalid", async () => {
@@ -242,7 +305,7 @@ describe("ReportsPage", () => {
     renderWithProviders(<ReportsPage />);
 
     expect(useReportsMock).toHaveBeenNthCalledWith(1, expect.any(Object), undefined);
-    expect(useReportsMock).toHaveBeenNthCalledWith(2, expect.any(Object), undefined);
+    expect(useReportsOptionsMock).toHaveBeenNthCalledWith(1, expect.any(Object), undefined);
   });
 
   it("refreshes timezone state on focus, visibility changes, and interval ticks", async () => {
@@ -264,8 +327,8 @@ describe("ReportsPage", () => {
       expect.any(Object),
       "America/Los_Angeles",
     );
-    expect(useReportsMock).toHaveBeenNthCalledWith(
-      2,
+    expect(useReportsOptionsMock).toHaveBeenNthCalledWith(
+      1,
       expect.any(Object),
       "America/Los_Angeles",
     );
@@ -276,12 +339,12 @@ describe("ReportsPage", () => {
     });
 
     expect(useReportsMock).toHaveBeenNthCalledWith(
-      3,
+      2,
       expect.any(Object),
       "America/New_York",
     );
-    expect(useReportsMock).toHaveBeenNthCalledWith(
-      4,
+    expect(useReportsOptionsMock).toHaveBeenNthCalledWith(
+      2,
       expect.any(Object),
       "America/New_York",
     );
@@ -292,12 +355,12 @@ describe("ReportsPage", () => {
     });
 
     expect(useReportsMock).toHaveBeenNthCalledWith(
-      5,
+      3,
       expect.any(Object),
       undefined,
     );
-    expect(useReportsMock).toHaveBeenNthCalledWith(
-      6,
+    expect(useReportsOptionsMock).toHaveBeenNthCalledWith(
+      3,
       expect.any(Object),
       undefined,
     );
@@ -308,12 +371,12 @@ describe("ReportsPage", () => {
     });
 
     expect(useReportsMock).toHaveBeenNthCalledWith(
-      7,
+      4,
       expect.any(Object),
       "America/Chicago",
     );
-    expect(useReportsMock).toHaveBeenNthCalledWith(
-      8,
+    expect(useReportsOptionsMock).toHaveBeenNthCalledWith(
+      4,
       expect.any(Object),
       "America/Chicago",
     );
@@ -458,6 +521,7 @@ describe("ReportsPage", () => {
   });
 
   it("shows one shared catalog failure for model and user-agent options", async () => {
+    useReportsOptionsMock.mockReturnValue({ isLoading: false, error: new Error("shared catalog endpoint unavailable"), refetch: vi.fn() } as unknown as ReturnType<typeof useReportsOptions>);
     useReportsMock.mockImplementation((filters) =>
       filters.model || filters.useragent
         ? asUseReportsResult({
@@ -564,7 +628,7 @@ describe("ReportsPage", () => {
     }
   });
 
-  it("renders all five line charts by default", async () => {
+  it("renders every report chart by default", async () => {
     useReportsMock.mockReturnValue(
       asUseReportsResult({
         data: EMPTY_REPORT,
@@ -585,6 +649,32 @@ describe("ReportsPage", () => {
     ]) {
       expect(await screen.findByText(heading)).toBeInTheDocument();
     }
+  });
+
+  it("only queries thread identity while its card is visible", async () => {
+    const user = userEvent.setup();
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(<ReportsPage />);
+
+    expect(await screen.findByTestId("thread-identity-card")).toBeInTheDocument();
+    expect(useThreadIdentityMock.mock.calls.at(-1)?.[2]).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: ALL_CHARTS_BUTTON }));
+    await user.click(
+      screen.getByRole("menuitemcheckbox", { name: "Thread Identity & Cache Locality" }),
+    );
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByTestId("thread-identity-card")).not.toBeInTheDocument();
+    expect(useThreadIdentityMock.mock.calls.at(-1)?.[2]).toBe(false);
   });
 
   it("renders the selected Cost by Day and Queue Wait charts", async () => {
@@ -623,7 +713,7 @@ describe("ReportsPage", () => {
 
     renderWithProviders(<ReportsPage />);
 
-    await user.click(screen.getByRole("button", { name: "Charts (5)" }));
+    await user.click(screen.getByRole("button", { name: ALL_CHARTS_BUTTON }));
     for (const chartOption of screen.getAllByRole("menuitemcheckbox")) {
       await user.click(chartOption);
     }
@@ -660,16 +750,16 @@ describe("ReportsPage", () => {
 
     await screen.findByText("Cost by Day");
     const callCountBeforeToggle = useReportsMock.mock.calls.length;
-    const callsBeforeToggle = useReportsMock.mock.calls.slice(-2).map(
+    const callsBeforeToggle = useReportsMock.mock.calls.slice(-1).map(
       ([filters, timeZone]) => [filters, timeZone],
     );
-    await user.click(screen.getByRole("button", { name: "Charts (5)" }));
+    await user.click(screen.getByRole("button", { name: ALL_CHARTS_BUTTON }));
     await user.click(
       screen.getByRole("menuitemcheckbox", { name: "Queue Wait" }),
     );
 
     expect(useReportsMock.mock.calls.length).toBeGreaterThan(callCountBeforeToggle);
-    expect(useReportsMock.mock.calls.slice(-2)).toEqual(callsBeforeToggle);
+    expect(useReportsMock.mock.calls.slice(-1)).toEqual(callsBeforeToggle);
   });
 
   it("keeps the model and user-agent metric toggles independent", async () => {
@@ -712,7 +802,8 @@ describe("ReportsPage", () => {
     );
   });
 
-  it("shows account option load failures instead of hiding empty selector silently", async () => {
+  it("shows account option load failures with a retry button and recovers when retried", async () => {
+    const user = userEvent.setup();
     useReportsMock.mockImplementation(() =>
       asUseReportsResult({
         data: EMPTY_REPORT,
@@ -721,21 +812,195 @@ describe("ReportsPage", () => {
         refetch: vi.fn(),
       }),
     );
-    listAccountsMock.mockRejectedValueOnce(
-      new Error("accounts backend timeout"),
-    );
+    listAccountsMock
+      .mockRejectedValueOnce(new Error("accounts backend timeout"))
+      .mockResolvedValueOnce({ accounts: [] });
 
     renderWithProviders(<ReportsPage />);
 
-    expect(
-      await screen.findByText(
-        /Failed to load account options: accounts backend timeout/i,
-      ),
-    ).toBeInTheDocument();
+    const accountErrorText = await screen.findByText(
+      /Failed to load account options: accounts backend timeout/i,
+    );
+    expect(accountErrorText).toBeInTheDocument();
     expect(
       screen
         .getAllByRole("button", { name: /accounts/i })
         .find((button) => button.getAttribute("aria-haspopup") === "menu"),
     ).toBeInTheDocument();
+
+    const accountErrorContainer = accountErrorText.parentElement!.parentElement!;
+    const retryButton = within(accountErrorContainer).getByRole("button", { name: /retry/i });
+    await user.click(retryButton);
+
+    expect(listAccountsMock).toHaveBeenCalledTimes(2);
+    await waitFor(() => {
+      expect(
+        screen.queryByText(/Failed to load account options:/i),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  it("forwards initial apiKeyId filter to useReports hook calls", () => {
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(
+      <ReportsPage initialFilters={{ apiKeyId: ["key-123"] }} />,
+    );
+
+    expect(useReportsMock).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        apiKeyId: ["key-123"],
+      }),
+      "America/Los_Angeles",
+    );
+  });
+
+  it("shows API key option load failures with a retry button and recovers when retried", async () => {
+    const user = userEvent.setup();
+    useReportsMock.mockImplementation(() =>
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+    getRequestLogOptionsMock
+      .mockRejectedValueOnce(new Error("api keys backend timeout"))
+      .mockResolvedValueOnce({ accountIds: [], apiKeys: [], modelOptions: [], statuses: [] });
+
+    renderWithProviders(<ReportsPage />);
+
+    const apiKeyErrorText = await screen.findByText(
+      /Failed to load API key options: api keys backend timeout/i,
+    );
+    expect(apiKeyErrorText).toBeInTheDocument();
+    expect(
+      screen
+        .getAllByRole("button", { name: /api keys/i })
+        .find((button) => button.getAttribute("aria-haspopup") === "menu"),
+    ).toBeInTheDocument();
+
+    const apiKeyErrorContainer = apiKeyErrorText.parentElement!.parentElement!;
+    const retryButton = within(apiKeyErrorContainer).getByRole("button", { name: /retry/i });
+    await user.click(retryButton);
+
+    expect(getRequestLogOptionsMock).toHaveBeenCalledTimes(2);
+    await waitFor(() => {
+      expect(
+        screen.queryByText(/Failed to load API key options:/i),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  it("populates API key options from request log options including deleted keys with ID fallback", async () => {
+    const user = userEvent.setup();
+    useReportsMock.mockImplementation(() =>
+      asUseReportsResult({
+        data: EMPTY_REPORT,
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+    getRequestLogOptionsMock.mockResolvedValue({
+      accountIds: [],
+      apiKeys: [
+        { id: "key_active", name: "Active Key", keyPrefix: "sk-active" },
+        { id: "key_deleted", name: "key_deleted", keyPrefix: null },
+      ],
+      modelOptions: [],
+      statuses: [],
+    });
+
+    renderWithProviders(<ReportsPage />);
+
+    const trigger = await screen.findByRole("button", { name: /api keys/i });
+    await user.click(trigger);
+
+    expect(await screen.findByText(/Active Key/i)).toBeInTheDocument();
+    expect(await screen.findByText("key_deleted")).toBeInTheDocument();
+  });
+
+  it("exports CSV based on the filtered report dataset when API key filter is active", async () => {
+    const user = userEvent.setup();
+    const blobText = vi.fn(async () => "");
+    const createObjectURL = vi.spyOn(URL, "createObjectURL").mockImplementation((blob) => {
+      if (!(blob instanceof Blob)) {
+        throw new TypeError("expected Blob export payload");
+      }
+      blobText.mockImplementation(() => blob.text());
+      return "blob:daily-breakdown";
+    });
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    useReportsMock.mockReturnValue(
+      asUseReportsResult({
+        data: {
+          ...EMPTY_REPORT,
+          daily: [
+            {
+              date: "2030-01-15",
+              requests: 42,
+              conversations: 2,
+              inputTokens: 1000,
+              outputTokens: 200,
+              reasoningTokens: 0,
+              cachedInputTokens: 50,
+              costUsd: 0.15,
+              activeAccounts: 1,
+              cancelledCount: 0,
+              errorCount: 0,
+              medianTtftMs: 0,
+              medianTps: 0,
+              medianQueueMs: 0,
+            },
+          ],
+        },
+        isLoading: false,
+        isError: false,
+        refetch: vi.fn(),
+      }),
+    );
+
+    renderWithProviders(
+      <ReportsPage
+        initialFilters={{
+          startDate: "2030-01-15",
+          endDate: "2030-01-15",
+          apiKeyId: ["key-filtered"],
+        }}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: /csv/i }));
+
+    expect(createObjectURL).toHaveBeenCalledOnce();
+    const csvContent = await blobText();
+    expect(csvContent).toContain("2030-01-15,42,2,1000,200,0,50,0.1500,1,0,0");
+  });
+});
+
+
+describe("report speed availability", () => {
+  it("discloses omitted long-window speed metrics without showing zero speed charts", async () => {
+    useReportsMock.mockReturnValue(asUseReportsResult({ data: { ...EMPTY_REPORT, speedMetricsAvailable: false, speedMetricsMaxDays: 7 }, isLoading: false, refetch: vi.fn() }));
+    useReportsOptionsMock.mockReturnValue({ data: { models: [], useragents: [] }, refetch: vi.fn() } as unknown as ReturnType<typeof useReportsOptions>);
+    renderWithProviders(<ReportsPage />);
+    expect(await screen.findByText(/Speed metrics are available for date ranges of 7 days or less/)).toBeInTheDocument();
+    expect(screen.queryByText("Time to First Token")).not.toBeInTheDocument();
+    expect(screen.queryByText("Tokens per Second")).not.toBeInTheDocument();
+    expect(screen.queryByText("Queue Wait")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeInTheDocument();
+    expect(screen.getByText("Total Cost")).toBeInTheDocument();
   });
 });

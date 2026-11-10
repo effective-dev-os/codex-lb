@@ -3,9 +3,11 @@ import { ArrowDown, ArrowUp, ArrowUpDown, Download } from "lucide-react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
+import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
 import { buildContinuousDailyRows } from "../daily-series";
 import type { DailyReportRow } from "../schemas";
 import { formatReportBucketDate } from "../date";
+import { formatCurrency } from "@/utils/formatters";
 
 export type DailyDetailTableProps = {
   startDate: string;
@@ -15,7 +17,7 @@ export type DailyDetailTableProps = {
 
 const DAILY_BREAKDOWN_SCROLL_HEIGHT_CLASS = "max-h-[17.5rem]";
 
-type SortKey = "date" | "requests" | "conversations" | "inputTokens" | "outputTokens" | "costUsd" | "activeAccounts";
+type SortKey = "date" | "requests" | "conversations" | "inputTokens" | "outputTokens" | "reasoningTokens" | "costUsd" | "activeAccounts" | "cancelledCount" | "errorCount";
 type SortDirection = "asc" | "desc";
 
 function formatTokens(v: number): string {
@@ -27,6 +29,7 @@ function formatTokens(v: number): string {
 
 export function DailyDetailTable({ startDate, endDate, data }: DailyDetailTableProps) {
   const { t } = useTranslation();
+  const dateDisplayFormat = useDateDisplayFormatStore((state) => state.dateDisplayFormat);
   const [sort, setSort] = useState<{ key: SortKey; direction: SortDirection }>({
     key: "date",
     direction: "desc",
@@ -56,10 +59,13 @@ export function DailyDetailTable({ startDate, endDate, data }: DailyDetailTableP
           {t("reports.dailyBreakdown.csv")}
         </Button>
       </div>
-      <div className="overflow-x-auto">
-        <table className="w-full table-fixed text-xs min-w-[700px]">
+      <div
+        data-testid="daily-breakdown-scroll-body"
+        className={`${DAILY_BREAKDOWN_SCROLL_HEIGHT_CLASS} overflow-x-auto overflow-y-auto`}
+      >
+        <table className="w-full table-fixed text-xs min-w-[1000px]">
           <ColumnGroup />
-          <thead>
+          <thead className="sticky top-0 z-10 bg-card">
             <tr className="border-b text-left text-muted-foreground">
               <SortableHeader
                 align="left"
@@ -93,6 +99,12 @@ export function DailyDetailTable({ startDate, endDate, data }: DailyDetailTableP
                 onClick={() => toggleSort("outputTokens")}
               />
               <SortableHeader
+                label={t("reports.dailyBreakdown.columns.reasoningTokens")}
+                isActive={sort.key === "reasoningTokens"}
+                direction={sort.direction}
+                onClick={() => toggleSort("reasoningTokens")}
+              />
+              <SortableHeader
                 label={t("reports.dailyBreakdown.columns.cost")}
                 isActive={sort.key === "costUsd"}
                 direction={sort.direction}
@@ -104,51 +116,60 @@ export function DailyDetailTable({ startDate, endDate, data }: DailyDetailTableP
                 direction={sort.direction}
                 onClick={() => toggleSort("activeAccounts")}
               />
+              <SortableHeader
+                label={t("reports.dailyBreakdown.columns.cancelled")}
+                isActive={sort.key === "cancelledCount"}
+                direction={sort.direction}
+                onClick={() => toggleSort("cancelledCount")}
+              />
+              <SortableHeader
+                label={t("reports.dailyBreakdown.columns.errors")}
+                isActive={sort.key === "errorCount"}
+                direction={sort.direction}
+                onClick={() => toggleSort("errorCount")}
+              />
             </tr>
           </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr
+                key={row.date}
+                data-testid={`daily-breakdown-row-${row.date}`}
+                className="border-b border-border/50 last:border-0"
+              >
+                <td className="py-2.5 pr-4 font-medium text-foreground">
+                  {formatReportBucketDate(row.date, dateDisplayFormat)}
+                </td>
+                <td className="py-2.5 pr-4 text-right text-foreground">{row.requests}</td>
+                <td className="py-2.5 pr-4 text-right text-foreground">
+                  {row.conversations}
+                </td>
+                <td className="py-2.5 pr-4 text-right text-foreground">
+                  <span>{formatTokens(row.inputTokens)}</span>{" "}
+                  <span className="text-[11px] text-muted-foreground">
+                    ({formatTokens(row.cachedInputTokens)})
+                  </span>
+                </td>
+                <td className="py-2.5 pr-4 text-right text-foreground">
+                  {formatTokens(row.outputTokens)}
+                </td>
+                <td className="py-2.5 pr-4 text-right text-foreground">
+                  {row.reasoningTokens == null ? "—" : formatTokens(row.reasoningTokens)}
+                </td>
+                <td className="py-2.5 pr-4 text-right font-medium text-emerald-600 dark:text-emerald-400">
+                  {formatCurrency(row.costUsd)}
+                </td>
+                <td className="py-2.5 pr-4 text-right text-muted-foreground">
+                  {row.activeAccounts}
+                </td>
+                <td className="py-2.5 pr-4 text-right text-foreground">
+                  {row.cancelledCount}
+                </td>
+                <td className="py-2.5 text-right text-foreground">{row.errorCount}</td>
+              </tr>
+            ))}
+          </tbody>
         </table>
-        <div
-          data-testid="daily-breakdown-scroll-body"
-          className={`${DAILY_BREAKDOWN_SCROLL_HEIGHT_CLASS} overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden`}
-        >
-          <table className="w-full table-fixed text-xs min-w-[700px]">
-            <ColumnGroup />
-            <tbody>
-              {rows.map((row) => (
-                <tr
-                  key={row.date}
-                  data-testid={`daily-breakdown-row-${row.date}`}
-                  className="border-b border-border/50 last:border-0"
-                >
-                  <td className="py-2.5 pr-4 font-medium text-foreground">
-                    {formatDate(row.date)}
-                  </td>
-                  <td className="py-2.5 pr-4 text-right text-foreground">
-                    {row.requests}
-                  </td>
-                  <td className="py-2.5 pr-4 text-right text-foreground">
-                    {row.conversations}
-                  </td>
-                  <td className="py-2.5 pr-4 text-right text-foreground">
-                    <span>{formatTokens(row.inputTokens)}</span>{" "}
-                    <span className="text-[11px] text-muted-foreground">
-                      ({formatTokens(row.cachedInputTokens)})
-                    </span>
-                  </td>
-                  <td className="py-2.5 pr-4 text-right text-foreground">
-                    {formatTokens(row.outputTokens)}
-                  </td>
-                  <td className="py-2.5 pr-4 text-right font-medium text-emerald-600 dark:text-emerald-400">
-                    ${row.costUsd.toFixed(2)}
-                  </td>
-                  <td className="py-2.5 text-right text-muted-foreground">
-                    {row.activeAccounts}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
       </div>
     </div>
   );
@@ -199,19 +220,18 @@ function SortableHeader({
 function ColumnGroup() {
   return (
     <colgroup>
-      <col style={{ width: "16%" }} />
+      <col style={{ width: "14%" }} />
+      <col style={{ width: "8%" }} />
+      <col style={{ width: "10%" }} />
       <col style={{ width: "12%" }} />
       <col style={{ width: "12%" }} />
-      <col style={{ width: "16%" }} />
-      <col style={{ width: "16%" }} />
-      <col style={{ width: "14%" }} />
-      <col style={{ width: "14%" }} />
+      <col style={{ width: "13%" }} />
+      <col style={{ width: "9%" }} />
+      <col style={{ width: "8%" }} />
+      <col style={{ width: "7%" }} />
+      <col style={{ width: "7%" }} />
     </colgroup>
   );
-}
-
-function formatDate(iso: string): string {
-  return formatReportBucketDate(iso);
 }
 
 function sortRows(
@@ -222,6 +242,15 @@ function sortRows(
     const leftValue = left[sort.key];
     const rightValue = right[sort.key];
 
+    if (leftValue == null && rightValue == null) {
+      return 0;
+    }
+    if (leftValue == null) {
+      return 1;
+    }
+    if (rightValue == null) {
+      return -1;
+    }
     if (leftValue < rightValue) {
       return sort.direction === "asc" ? -1 : 1;
     }
@@ -241,13 +270,15 @@ function exportCSV(rows: DailyReportRow[], t: TFunction) {
     t("reports.dailyBreakdown.csvColumns.conversations"),
     t("reports.dailyBreakdown.csvColumns.inputTokens"),
     t("reports.dailyBreakdown.csvColumns.outputTokens"),
+    t("reports.dailyBreakdown.csvColumns.reasoningTokens"),
     t("reports.dailyBreakdown.csvColumns.cachedTokens"),
     t("reports.dailyBreakdown.csvColumns.costUsd"),
     t("reports.dailyBreakdown.csvColumns.activeAccounts"),
+    t("reports.dailyBreakdown.csvColumns.cancelled"),
     t("reports.dailyBreakdown.csvColumns.errors"),
   ];
   const lines = rows.map((r) =>
-    [r.date, r.requests, r.conversations, r.inputTokens, r.outputTokens, r.cachedInputTokens, r.costUsd.toFixed(4), r.activeAccounts, r.errorCount].join(","),
+    [r.date, r.requests, r.conversations, r.inputTokens, r.outputTokens, r.reasoningTokens ?? "", r.cachedInputTokens, r.costUsd.toFixed(4), r.activeAccounts, r.cancelledCount, r.errorCount].join(","),
   );
   const csv = [headers.join(","), ...lines].join("\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });

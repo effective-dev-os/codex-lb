@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, Depends, Request, Response
 
-from app.core.audit.service import AuditService
+from app.core.audit.service import AuditActor, AuditService, AuditTarget
+from app.core.auth.dashboard_access import DashboardPrincipal, Permission
 from app.core.auth.dependencies import (
+    require_dashboard_permission,
     require_dashboard_write_access,
     set_dashboard_error_format,
     validate_dashboard_session,
 )
-from app.core.exceptions import DashboardBadRequestError, DashboardNotFoundError
+from app.core.exceptions import DashboardBadRequestError, DashboardConflictError, DashboardNotFoundError
 from app.dependencies import ApiKeysContext, get_api_keys_context
+from app.modules.api_keys.repository import ApiKeyOwnerDisabledError
 from app.modules.api_keys.schemas import (
     ApiKeyAccountCostResponse,
     ApiKeyCreateRequest,
@@ -33,7 +36,13 @@ from app.modules.api_keys.service import (
 router = APIRouter(
     prefix="/api/api-keys",
     tags=["dashboard"],
-    dependencies=[Depends(validate_dashboard_session), Depends(set_dashboard_error_format)],
+    dependencies=[
+        Depends(validate_dashboard_session),
+        # The key inventory (policies, assignments, limits, usage) is not a
+        # guest-safe read; every route here needs api_keys:read at minimum.
+        Depends(require_dashboard_permission(Permission.API_KEYS_READ)),
+        Depends(set_dashboard_error_format),
+    ],
 )
 
 
@@ -46,9 +55,11 @@ def _to_response(row: ApiKeyData) -> ApiKeyResponse:
         apply_to_codex_model=row.apply_to_codex_model,
         enforced_model=row.enforced_model,
         enforced_reasoning_effort=row.enforced_reasoning_effort,
+        allowed_reasoning_efforts=row.allowed_reasoning_efforts,
         enforced_service_tier=row.enforced_service_tier,
         traffic_class=row.traffic_class,
         transport_policy_override=row.transport_policy_override,
+        thread_cache_identity_override=row.thread_cache_identity_override,
         usage_sections=row.usage_sections,
         expires_at=row.expires_at,
         is_active=row.is_active,
@@ -118,11 +129,13 @@ def _build_limit_inputs(payload: ApiKeyCreateRequest | ApiKeyUpdateRequest) -> l
     return limit_inputs
 
 
+@router.post("", response_model=ApiKeyCreateResponse, include_in_schema=False)
 @router.post("/", response_model=ApiKeyCreateResponse)
 async def create_api_key(
     request: Request,
+    response: Response,
     payload: ApiKeyCreateRequest = Body(...),
-    _write_access=Depends(require_dashboard_write_access),
+    principal: DashboardPrincipal = Depends(require_dashboard_write_access),
     context: ApiKeysContext = Depends(get_api_keys_context),
 ) -> ApiKeyCreateResponse:
     limit_inputs = _build_limit_inputs(payload)
@@ -135,9 +148,11 @@ async def create_api_key(
                 apply_to_codex_model=payload.apply_to_codex_model,
                 enforced_model=payload.enforced_model,
                 enforced_reasoning_effort=payload.enforced_reasoning_effort,
+                allowed_reasoning_efforts=payload.allowed_reasoning_efforts,
                 enforced_service_tier=payload.enforced_service_tier,
                 traffic_class=payload.traffic_class or "foreground",
                 transport_policy_override=payload.transport_policy_override,
+                thread_cache_identity_override=payload.thread_cache_identity_override,
                 usage_sections=(
                     payload.usage_sections
                     if payload.usage_sections is not None
@@ -155,14 +170,20 @@ async def create_api_key(
     AuditService.log_async(
         "api_key_created",
         actor_ip=request.client.host if request.client else None,
+        actor=AuditActor.from_principal(principal),
+        target=AuditTarget("api_key", created.id),
         details={"key_id": created.id},
     )
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
     return ApiKeyCreateResponse(
         **resp.model_dump(),
         key=created.key,
     )
 
 
+@router.get("", response_model=list[ApiKeyResponse], include_in_schema=False)
 @router.get("/", response_model=list[ApiKeyResponse])
 async def list_api_keys(
     context: ApiKeysContext = Depends(get_api_keys_context),
@@ -176,7 +197,7 @@ async def update_api_key(
     request: Request,
     key_id: str,
     payload: ApiKeyUpdateRequest = Body(...),
-    _write_access=Depends(require_dashboard_write_access),
+    principal: DashboardPrincipal = Depends(require_dashboard_write_access),
     context: ApiKeysContext = Depends(get_api_keys_context),
 ) -> ApiKeyResponse:
     fields = payload.model_fields_set
@@ -195,12 +216,16 @@ async def update_api_key(
         enforced_model_set="enforced_model" in fields,
         enforced_reasoning_effort=payload.enforced_reasoning_effort,
         enforced_reasoning_effort_set="enforced_reasoning_effort" in fields,
+        allowed_reasoning_efforts=payload.allowed_reasoning_efforts,
+        allowed_reasoning_efforts_set="allowed_reasoning_efforts" in fields,
         enforced_service_tier=payload.enforced_service_tier,
         enforced_service_tier_set="enforced_service_tier" in fields,
         traffic_class=payload.traffic_class,
         traffic_class_set="traffic_class" in fields,
         transport_policy_override=payload.transport_policy_override,
         transport_policy_override_set="transport_policy_override" in fields,
+        thread_cache_identity_override=payload.thread_cache_identity_override,
+        thread_cache_identity_override_set="thread_cache_identity_override" in fields,
         usage_sections=payload.usage_sections,
         usage_sections_set="usage_sections" in fields,
         expires_at=payload.expires_at,
@@ -221,10 +246,14 @@ async def update_api_key(
         raise DashboardNotFoundError(str(exc)) from exc
     except ApiKeyValidationError as exc:
         raise DashboardBadRequestError(str(exc), code="invalid_api_key_payload") from exc
+    except ApiKeyOwnerDisabledError as exc:
+        raise DashboardConflictError(str(exc), code="owner_disabled") from exc
     if "is_active" in fields and payload.is_active is False and row.is_active is False:
         AuditService.log_async(
             "api_key_revoked",
             actor_ip=request.client.host if request.client else None,
+            actor=AuditActor.from_principal(principal),
+            target=AuditTarget("api_key", key_id),
             details={"key_id": row.id},
         )
     return _to_response(row)
@@ -234,7 +263,7 @@ async def update_api_key(
 async def delete_api_key(
     request: Request,
     key_id: str,
-    _write_access=Depends(require_dashboard_write_access),
+    principal: DashboardPrincipal = Depends(require_dashboard_write_access),
     context: ApiKeysContext = Depends(get_api_keys_context),
 ) -> Response:
     try:
@@ -244,6 +273,8 @@ async def delete_api_key(
     AuditService.log_async(
         "api_key_revoked",
         actor_ip=request.client.host if request.client else None,
+        actor=AuditActor.from_principal(principal),
+        target=AuditTarget("api_key", key_id),
         details={"key_id": key_id},
     )
     return Response(status_code=204)
@@ -252,6 +283,7 @@ async def delete_api_key(
 @router.post("/{key_id}/regenerate", response_model=ApiKeyCreateResponse)
 async def regenerate_api_key(
     key_id: str,
+    response: Response,
     _write_access=Depends(require_dashboard_write_access),
     context: ApiKeysContext = Depends(get_api_keys_context),
 ) -> ApiKeyCreateResponse:
@@ -260,6 +292,9 @@ async def regenerate_api_key(
     except ApiKeyNotFoundError as exc:
         raise DashboardNotFoundError(str(exc)) from exc
     resp = _to_response(row)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
     return ApiKeyCreateResponse(
         **resp.model_dump(),
         key=row.key,

@@ -22,6 +22,7 @@ import {
   type AccountSortMode,
 } from "@/features/accounts/sorting";
 import { useAccountQuotaDisplayStore } from "@/hooks/use-account-quota-display";
+import { cn } from "@/lib/utils";
 import { formatSlug } from "@/utils/formatters";
 
 const STATUS_FILTER_OPTIONS = ["all", "active", "paused", "rate_limited", "quota_exceeded", "reauth_required", "deactivated"];
@@ -125,17 +126,19 @@ export function AccountList({
         </Select>
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <Button
-          type="button"
-          variant="link"
-          size="sm"
-          className="h-auto px-0 text-xs"
-          onClick={() => setHelpOpen((current) => !current)}
-        >
-          {t("accounts.list.needHelp")}
-          {helpOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-        </Button>
+      <div className={cn("flex flex-wrap items-center gap-3", readOnly ? "justify-end" : "justify-between")}>
+        {readOnly ? null : (
+          <Button
+            type="button"
+            variant="link"
+            size="sm"
+            className="h-auto px-0 text-xs"
+            onClick={() => setHelpOpen((current) => !current)}
+          >
+            {t("accounts.list.needHelp")}
+            {helpOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+          </Button>
+        )}
         <Button
           type="button"
           size="sm"
@@ -148,7 +151,7 @@ export function AccountList({
         </Button>
       </div>
 
-      {helpOpen ? <WindowsOauthHelp /> : null}
+      {helpOpen && !readOnly ? <WindowsOauthHelp /> : null}
 
       <div
         className="flex-1 min-h-0 space-y-1 overflow-y-auto p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
@@ -156,8 +159,12 @@ export function AccountList({
       >
         {filtered.length === 0 ? (
           <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed p-6 text-center">
-            <p className="text-sm font-medium text-muted-foreground">{t("accounts.list.noMatches")}</p>
-            <p className="text-xs text-muted-foreground/70">{t("accounts.list.adjustFilters")}</p>
+            <p className="text-sm font-medium text-muted-foreground">
+              {accounts.length === 0 ? t("accounts.list.emptyTitle") : t("accounts.list.noMatches")}
+            </p>
+            <p className="text-xs text-muted-foreground/70">
+              {accounts.length === 0 ? t("accounts.list.emptyDescription") : t("accounts.list.adjustFilters")}
+            </p>
           </div>
         ) : (
           filtered.map((account) => (
@@ -172,6 +179,12 @@ export function AccountList({
           ))
         )}
       </div>
+
+      {accounts.length > 0 ? (
+        <p className="px-1 text-[11px] leading-snug text-muted-foreground/80">
+          {t("accounts.list.statusEligibilityNote")}
+        </p>
+      ) : null}
 
       <AddAccountDialog
         open={chooserOpen}

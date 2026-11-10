@@ -64,6 +64,7 @@ const DashboardMetricsSchema = z.object({
   cachedInputTokens: z.number().nullable(),
   errorRate: z.number().nullable(),
   errorCount: z.number().nullable(),
+  cancelledCount: z.number().int().nonnegative().nullable().optional(),
   topError: z.string().nullable(),
   conversations: z.number().int().nullable().optional().default(null),
   conversationRequests: z.number().int().nonnegative().optional().default(0),
@@ -102,6 +103,24 @@ export const DepletionSchema = z.object({
   secondsUntilExhaustion: z.number().nullable().optional(),
 });
 
+const WeeklyCreditResetEventSchema = z.object({
+  at: z.iso.datetime({ offset: true }),
+  creditsReturned: z.number(),
+});
+
+const WeeklyCreditApiKeyAttributionSchema = z.object({
+  // Stable key id; absent on backends that predate per-key attribution ids.
+  apiKeyId: z.string().nullable().optional(),
+  name: z.string(),
+  requests: z.number().int().nonnegative(),
+  billableTokens: z.number().int().nonnegative(),
+  cachedTokens: z.number().int().nonnegative(),
+  dominantModel: z.string(),
+});
+
+const WeeklyCreditPaceStatusSchema = z.enum(["behind", "on_track", "ahead", "danger"]);
+const WeeklyCreditRunwayStatusSchema = z.enum(["safe", "tight", "runs_dry"]);
+
 const WeeklyCreditPaceSchema = z.object({
   totalFullCredits: z.number(),
   totalActualRemainingCredits: z.number(),
@@ -125,7 +144,19 @@ const WeeklyCreditPaceSchema = z.object({
   projectedMinimumRemainingCredits: z.number().nullable(),
   forecastBurnRateCreditsPerHour: z.number().nullable(),
   scheduledBurnRateCreditsPerHour: z.number(),
-  status: z.enum(["behind", "on_track", "ahead", "danger"]),
+  // Runway fields (additive; optional so older backends still parse).
+  headroomPercent: z.number().optional(),
+  headroomCredits: z.number().optional(),
+  burnRateRecentCreditsPerHour: z.number().nullable().optional(),
+  depletionEtaHours: z.number().nullable().optional(),
+  nextReliefInHours: z.number().nullable().optional(),
+  nextReliefCredits: z.number().nullable().optional(),
+  resetEvents: z.array(WeeklyCreditResetEventSchema).optional(),
+  runwayStatus: WeeklyCreditRunwayStatusSchema.optional(),
+  saturatedAccountCount: z.number().int().nonnegative().optional(),
+  topApiKeys: z.array(WeeklyCreditApiKeyAttributionSchema).optional(),
+  addProAccounts: z.number().int().nullable().optional(),
+  status: WeeklyCreditPaceStatusSchema,
   accountCount: z.number().int().nonnegative(),
   staleAccountCount: z.number().int().nonnegative(),
   inactiveAccountCount: z.number().int().nonnegative(),
@@ -183,6 +214,11 @@ export const RequestLogSchema = z.object({
   modelSourceKind: z.string().nullable().optional(),
   transport: z.string().nullable().optional().default(null),
   upstreamTransport: z.string().nullable().optional(),
+  upstreamProxyRouteMode: z.string().nullable().optional(),
+  upstreamProxyPoolId: z.string().nullable().optional(),
+  upstreamProxyEndpointId: z.string().nullable().optional(),
+  upstreamProxyFallbackUsed: z.boolean().nullable().optional(),
+  upstreamProxyFailClosedReason: z.string().nullable().optional(),
   useragent: z.string().nullable().optional().default(null),
   useragentGroup: z.string().nullable().optional().default(null),
   clientIp: z.string().nullable().optional().default(null),
@@ -241,9 +277,12 @@ export const RequestLogFilterOptionsSchema = z.object({
   statuses: z.array(z.string()),
 });
 
+const RequestLogTimeframeSchema = z.enum(["all", "1h", "24h", "7d"]);
+export type RequestLogTimeframe = z.infer<typeof RequestLogTimeframeSchema>;
+
 export const FilterStateSchema = z.object({
   search: z.string(),
-  timeframe: z.enum(["all", "1h", "24h", "7d"]),
+  timeframe: RequestLogTimeframeSchema,
   accountIds: z.array(z.string()),
   apiKeyIds: z.array(z.string()),
   modelOptions: z.array(z.string()),
@@ -267,6 +306,10 @@ export type RequestLogFilterOptions = z.infer<typeof RequestLogFilterOptionsSche
 export type FilterState = z.infer<typeof FilterStateSchema>;
 export type Depletion = z.infer<typeof DepletionSchema>;
 export type ServerWeeklyCreditPace = z.infer<typeof WeeklyCreditPaceSchema>;
+export type WeeklyCreditResetEvent = z.infer<typeof WeeklyCreditResetEventSchema>;
+export type WeeklyCreditApiKeyAttribution = z.infer<typeof WeeklyCreditApiKeyAttributionSchema>;
+export type WeeklyCreditPaceStatus = z.infer<typeof WeeklyCreditPaceStatusSchema>;
+export type WeeklyCreditRunwayStatus = z.infer<typeof WeeklyCreditRunwayStatusSchema>;
 
 export const DashboardViewSchema = z.enum(["request-logs", "conversations"]);
 export type DashboardView = z.infer<typeof DashboardViewSchema>;

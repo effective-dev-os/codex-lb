@@ -4,10 +4,12 @@ import { useTranslation } from "react-i18next";
 import { Checkbox } from "@/components/ui/checkbox";
 import { FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import type {
   ModelSourceDraft,
   ModelSourceFormValues,
 } from "@/features/model-sources/components/model-source-form";
+import { parseReasoningEffortsInput } from "@/features/model-sources/components/model-source-form";
 
 type ModelSourceFormFieldsProps = {
   control: Control<ModelSourceFormValues>;
@@ -21,11 +23,14 @@ const CAPABILITY_TOGGLES = [
   ["supportsChatCompletions", "modelSources.capabilities.chatCompletions"] as const,
   ["supportsResponses", "modelSources.capabilities.responses"] as const,
   ["supportsAudioTranscriptions", "modelSources.capabilities.audioTranscriptions"] as const,
+  ["supportsEmbeddings", "modelSources.capabilities.embeddings"] as const,
   ["supportsStreaming", "modelSources.capabilities.streaming"] as const,
   ["supportsTools", "modelSources.capabilities.tools"] as const,
   ["supportsVision", "modelSources.capabilities.vision"] as const,
   ["supportsReasoning", "modelSources.capabilities.reasoning"] as const,
 ];
+
+const DEFAULT_REASONING_EFFORTS = ["low", "medium", "high"];
 
 export function ModelSourceFormFields({
   control,
@@ -175,12 +180,91 @@ export function ModelSourceFormFields({
           <label key={key} className="flex items-center gap-2 rounded-md border p-2 text-sm">
             <Checkbox
               checked={draft[key]}
-              onCheckedChange={(checked) => updateDraft({ [key]: checked === true })}
+              onCheckedChange={(checked) =>
+                updateDraft({
+                  [key]: checked === true,
+                  ...(key === "supportsReasoning" && checked === true
+                    ? {
+                        reasoningEffortsInput:
+                          draft.reasoningEffortsInput || DEFAULT_REASONING_EFFORTS.join(", "),
+                        reasoningEfforts:
+                          draft.reasoningEfforts.length > 0
+                            ? draft.reasoningEfforts
+                            : DEFAULT_REASONING_EFFORTS,
+                        defaultReasoningEffort: draft.defaultReasoningEffort || "medium",
+                      }
+                    : {}),
+                })
+              }
             />
 	            {t(labelKey)}
           </label>
         ))}
       </div>
+
+      {draft.supportsReasoning ? (
+        <div className="space-y-3 rounded-md border p-3">
+          <div>
+            <div className="text-sm font-medium">{t("modelSources.fields.reasoningEfforts")}</div>
+            <p className="text-xs text-muted-foreground">
+              {t("modelSources.fields.reasoningEffortsDescription")}
+            </p>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground" htmlFor="model-source-reasoning-efforts">
+              {t("modelSources.fields.reasoningEfforts")}
+            </label>
+            <Input
+              id="model-source-reasoning-efforts"
+              aria-label={t("modelSources.fields.reasoningEfforts")}
+              value={draft.reasoningEffortsInput}
+              onChange={(event) => {
+                const reasoningEffortsInput = event.target.value;
+                const reasoningEfforts = parseReasoningEffortsInput(reasoningEffortsInput);
+                updateDraft({
+                  reasoningEffortsInput,
+                  reasoningEfforts,
+                  defaultReasoningEffort: reasoningEfforts.includes(draft.defaultReasoningEffort)
+                    ? draft.defaultReasoningEffort
+                    : (reasoningEfforts[0] ?? ""),
+                });
+              }}
+              placeholder={t("modelSources.fields.reasoningEffortsPlaceholder")}
+              autoComplete="off"
+            />
+          </div>
+
+          <div className="space-y-1">
+            <label
+              className="text-xs text-muted-foreground"
+              htmlFor="model-source-default-reasoning-effort"
+            >
+              {t("modelSources.fields.defaultReasoningEffort")}
+            </label>
+            <Select
+              value={draft.defaultReasoningEffort}
+              onValueChange={(value) => updateDraft({ defaultReasoningEffort: value })}
+              disabled={draft.reasoningEfforts.length === 0}
+            >
+              <SelectTrigger
+                id="model-source-default-reasoning-effort"
+                aria-label={t("modelSources.fields.defaultReasoningEffort")}
+                className="w-full"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {draft.reasoningEfforts.map((effort) => (
+                  <SelectItem key={effort} value={effort}>
+                    {effort}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+      ) : null}
     </>
   );
 }

@@ -22,7 +22,12 @@ def _clear_recent_count_cache_between_tests():
 
 
 @pytest.mark.asyncio
-async def test_add_log_ignores_closed_transaction(monkeypatch) -> None:
+async def test_add_log_ignores_closed_transaction(monkeypatch, db_setup) -> None:
+    # The insert now executes eagerly (Core insert instead of a unit-of-work
+    # flush inside commit), so the schema must exist; the contract under test
+    # is unchanged: a ResourceClosedError commit is swallowed and the built
+    # log row is still returned.
+    del db_setup
     async with SessionLocal() as session:
         repo = RequestLogsRepository(session)
 
@@ -74,6 +79,32 @@ async def test_add_log_persists_request_and_connection_kinds(db_setup) -> None:
         assert persisted is not None
         assert persisted.request_kind == "warmup"
         assert persisted.connection_request_kind == "prewarm"
+
+
+@pytest.mark.asyncio
+async def test_request_log_listing_preserves_optional_affinity_metadata(db_setup) -> None:
+    del db_setup
+    async with SessionLocal() as session:
+        repository = RequestLogsRepository(session)
+        await repository.add_log(
+            account_id=None,
+            request_id="affinity-observed",
+            model="gpt-5.4",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=1,
+            status="success",
+            error_code=None,
+            sticky_key_source="payload",
+            sticky_kind="prompt_cache",
+            sticky_key_hash="ba7816bf8f01cfea",
+        )
+    async with SessionLocal() as session:
+        result = await RequestLogsRepository(session).list_recent()
+        assert result.total == 1
+        assert result.logs[0].sticky_key_source == "payload"
+        assert result.logs[0].sticky_kind == "prompt_cache"
+        assert result.logs[0].sticky_key_hash == "ba7816bf8f01cfea"
 
 
 @pytest.mark.asyncio

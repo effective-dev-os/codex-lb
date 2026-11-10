@@ -3,17 +3,17 @@ from __future__ import annotations
 import asyncio
 import time
 from enum import Enum
-from typing import Awaitable, TypeVar
+from typing import Awaitable, Iterable, TypeVar
 
 import aiohttp
-
-from app.core.config.settings import Settings
 
 T = TypeVar("T")
 
 # Breaker tuning (fixed; issue #1340 / PRINCIPLES.md P2). ``CircuitBreaker``
 # keeps both as constructor fields so tests can exercise state transitions
-# with small values. ``circuit_breaker_enabled`` remains the single switch.
+# with small values. ``circuit_breaker_enabled`` remains the single switch; it
+# is dashboard-managed (C2-3 resilience toggles) and gates *use* per request
+# in the callers, not construction here.
 _FAILURE_THRESHOLD = 5
 _RECOVERY_TIMEOUT_SECONDS = 60
 
@@ -124,34 +124,16 @@ def _is_server_error(exc: Exception) -> bool:
     return True
 
 
-_circuit_breaker: CircuitBreaker | None = None
 _account_circuit_breakers: dict[str, CircuitBreaker] = {}
 
 
-def get_circuit_breaker(settings: Settings | None = None) -> CircuitBreaker | None:
-    global _circuit_breaker
+def get_circuit_breaker_for_account(account_id: str) -> CircuitBreaker:
+    """Return (creating on first use) the account's breaker.
 
-    if settings is None:
-        return _circuit_breaker
-
-    enabled = getattr(settings, "circuit_breaker_enabled", False)
-    if enabled and _circuit_breaker is None:
-        _circuit_breaker = CircuitBreaker(
-            failure_threshold=_FAILURE_THRESHOLD,
-            recovery_timeout_seconds=_RECOVERY_TIMEOUT_SECONDS,
-        )
-
-    return _circuit_breaker if enabled else None
-
-
-def get_circuit_breaker_for_account(
-    account_id: str,
-    settings: Settings,
-) -> CircuitBreaker | None:
-    enabled = getattr(settings, "circuit_breaker_enabled", False)
-    if not enabled:
-        return None
-
+    Construction is unconditional so flipping the dashboard toggle takes effect
+    on the next request without a restart; callers consult
+    ``current_resilience_toggles().circuit_breaker_enabled`` before using it.
+    """
     breaker = _account_circuit_breakers.get(account_id)
     if breaker is None:
         breaker = CircuitBreaker(
@@ -162,7 +144,15 @@ def get_circuit_breaker_for_account(
     return breaker
 
 
-def are_all_account_circuit_breakers_open() -> bool:
-    if not _account_circuit_breakers:
+def are_all_account_circuit_breakers_open(account_ids: Iterable[str]) -> bool:
+    """Whether every configured account is currently tripped OPEN.
+
+    Breakers are created lazily, so quantifying over the registry alone lets
+    the one account that has ever failed declare the whole fleet down. An
+    account without a breaker has never failed and counts as closed.
+    """
+    configured = list(account_ids)
+    if not configured:
         return False
-    return all(cb.state == CircuitState.OPEN for cb in _account_circuit_breakers.values())
+    breakers = [_account_circuit_breakers.get(account_id) for account_id in configured]
+    return all(breaker is not None and breaker.state == CircuitState.OPEN for breaker in breakers)

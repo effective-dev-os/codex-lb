@@ -5,6 +5,9 @@ import type { AccountListSort, AccountListSortKey } from "@/features/dashboard/c
 const ACCOUNT_BURNRATE_STORAGE_KEY = "codex-lb-account-burnrate-enabled";
 const ACCOUNT_VIEW_MODE_STORAGE_KEY = "codex-lb-dashboard-account-view-mode";
 const ACCOUNT_LIST_SORT_STORAGE_KEY = "codex-lb-dashboard-account-list-sort";
+const DASHBOARD_REFRESH_STORAGE_KEY = "codex-lb-dashboard-refresh-seconds";
+
+export type DashboardRefreshSeconds = 5 | 15 | 30 | 60;
 
 export type DashboardAccountViewMode = "cards" | "list";
 
@@ -12,14 +15,24 @@ type DashboardPreferencesState = {
   accountBurnrateEnabled: boolean;
   accountViewMode: DashboardAccountViewMode;
   accountListSort: AccountListSort;
+  refreshSeconds: DashboardRefreshSeconds;
   initialized: boolean;
   initializePreferences: () => void;
   setAccountBurnrateEnabled: (enabled: boolean) => void;
   setAccountViewMode: (mode: DashboardAccountViewMode) => void;
   setAccountListSort: (sort: AccountListSort) => void;
+  setRefreshSeconds: (seconds: DashboardRefreshSeconds) => void;
 };
 
-const ACCOUNT_LIST_SORT_KEYS: AccountListSortKey[] = ["account", "status", "plan", "quota", "credits", "warmup"];
+const ACCOUNT_LIST_SORT_KEYS: AccountListSortKey[] = [
+  "account",
+  "status",
+  "plan",
+  "quota",
+  "subscriptionCredits",
+  "purchasedCredits",
+  "warmup",
+];
 
 function isAccountListSortKey(value: unknown): value is AccountListSortKey {
   return typeof value === "string" && ACCOUNT_LIST_SORT_KEYS.includes(value as AccountListSortKey);
@@ -57,6 +70,9 @@ function readStoredAccountListSort(): AccountListSort {
   }
   try {
     const parsed = JSON.parse(stored) as { key?: unknown; direction?: unknown };
+    if (parsed.key === "credits") {
+      parsed.key = "purchasedCredits";
+    }
     if (
       isAccountListSortKey(parsed.key) &&
       (parsed.direction === "asc" || parsed.direction === "desc")
@@ -67,6 +83,16 @@ function readStoredAccountListSort(): AccountListSort {
     return null;
   }
   return null;
+}
+
+function readStoredRefreshSeconds(): DashboardRefreshSeconds | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const numeric = Number(window.localStorage.getItem(DASHBOARD_REFRESH_STORAGE_KEY));
+  return numeric === 5 || numeric === 15 || numeric === 30 || numeric === 60
+    ? numeric
+    : null;
 }
 
 function persistAccountBurnrateEnabled(enabled: boolean): void {
@@ -94,19 +120,29 @@ function persistAccountListSort(sort: AccountListSort): void {
   window.localStorage.setItem(ACCOUNT_LIST_SORT_STORAGE_KEY, JSON.stringify(sort));
 }
 
+function persistRefreshSeconds(seconds: DashboardRefreshSeconds): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.localStorage.setItem(DASHBOARD_REFRESH_STORAGE_KEY, String(seconds));
+}
+
 export const useDashboardPreferencesStore = create<DashboardPreferencesState>((set) => ({
   accountBurnrateEnabled: true,
   accountViewMode: "cards",
   accountListSort: null,
+  refreshSeconds: 15,
   initialized: false,
   initializePreferences: () => {
     const accountBurnrateEnabled = readStoredAccountBurnrateEnabled() ?? true;
     const accountViewMode = readStoredAccountViewMode() ?? "cards";
     const accountListSort = readStoredAccountListSort();
+    const refreshSeconds = readStoredRefreshSeconds() ?? 15;
     persistAccountBurnrateEnabled(accountBurnrateEnabled);
     persistAccountViewMode(accountViewMode);
     persistAccountListSort(accountListSort);
-    set({ accountBurnrateEnabled, accountViewMode, accountListSort, initialized: true });
+    persistRefreshSeconds(refreshSeconds);
+    set({ accountBurnrateEnabled, accountViewMode, accountListSort, refreshSeconds, initialized: true });
   },
   setAccountBurnrateEnabled: (enabled) => {
     persistAccountBurnrateEnabled(enabled);
@@ -119,5 +155,9 @@ export const useDashboardPreferencesStore = create<DashboardPreferencesState>((s
   setAccountListSort: (sort) => {
     persistAccountListSort(sort);
     set({ accountListSort: sort, initialized: true });
+  },
+  setRefreshSeconds: (seconds) => {
+    persistRefreshSeconds(seconds);
+    set({ refreshSeconds: seconds, initialized: true });
   },
 }));

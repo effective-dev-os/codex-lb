@@ -59,8 +59,11 @@ nav:
   - Client Setup: client-setup.md
   - Live Voice: live-voice.md
   - Conversations: conversations.md
+  - Usage Reporting: usage-reporting.md
   - Configuration: configuration.md
+  - Anonymous Telemetry: telemetry.md
   - Authentication: authentication.md
+  - Company Sign-In: sso.md
   - API Keys: api-keys.md
   - Routing: routing.md
   - Database: database.md
@@ -70,4 +73,8 @@ nav:
       - Remote Access: deployment/remote.md
   - Reference:
       - Settings: reference/settings.md
+  - Traffic Parity: traffic-parity.md
+  - Development:
+      - Rust Migration Architecture: rust-architecture.md
+      - Architectural Decisions: adr/fork-decisions.md
   - Troubleshooting: troubleshooting.md

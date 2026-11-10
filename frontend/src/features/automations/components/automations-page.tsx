@@ -27,6 +27,7 @@ import {
   resolveAccountDisplay,
 } from "@/features/automations/account-display";
 import { AutomationJobDialog } from "@/features/automations/components/automation-job-dialog";
+import { AutomationsPauseToggle } from "@/features/automations/components/automations-pause-toggle";
 import {
   AutomationJobsFilters,
   AutomationRunsFilters,
@@ -38,14 +39,16 @@ import {
 } from "@/features/automations/components/run-status-utils";
 import { getAutomationRunDetails } from "@/features/automations/api";
 import { useAutomationListing } from "@/features/automations/hooks/use-automation-listing";
+import { useAutomationsPaused } from "@/features/automations/hooks/use-automations-paused";
 import { useAutomations } from "@/features/automations/hooks/use-automations";
 import { formatScheduleTimeForInput } from "@/features/automations/time-utils";
 import { PaginationControls } from "@/features/dashboard/components/filters/pagination-controls";
 import { useDialogState } from "@/hooks/use-dialog-state";
+import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { useTimeFormatStore, type TimeFormatPreference } from "@/hooks/use-time-format";
 import { getErrorMessageOrNull } from "@/utils/errors";
-import { formatModelLabel, formatSlug, formatTimeLong } from "@/utils/formatters";
+import { formatDateTimeLines, formatModelLabel, formatSlug } from "@/utils/formatters";
 import type {
   AutomationJob,
   AutomationRun,
@@ -155,6 +158,7 @@ export function AutomationsPage() {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
 
   const timeFormat = useTimeFormatStore((state) => state.timeFormat);
+  const dateDisplayFormat = useDateDisplayFormatStore((state) => state.dateDisplayFormat);
   const blurred = usePrivacyStore((state) => state.blurred);
   const createDialog = useDialogState();
   const deleteDialog = useDialogState<AutomationJob>();
@@ -180,6 +184,8 @@ export function AutomationsPage() {
     deleteMutation,
     runNowMutation,
   } = useAutomations(null, { enableQueries: false });
+  // M2 background jobs: the backend refuses Run now while the scheduler is paused.
+  const automationsPaused = useAutomationsPaused() === true;
   const runDetailsQuery = useQuery({
     queryKey: ["automations", "run-details", selectedRunId],
     queryFn: () => getAutomationRunDetails(selectedRunId ?? ""),
@@ -415,11 +421,14 @@ export function AutomationsPage() {
 
   return (
     <div className="animate-fade-in-up space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">{t("automations.page.title")}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {t("automations.page.subtitle")}
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">{t("automations.page.title")}</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {t("automations.page.subtitle")}
+          </p>
+        </div>
+        <AutomationsPauseToggle />
       </div>
 
       {errorMessage ? <AlertMessage variant="error">{errorMessage}</AlertMessage> : null}
@@ -485,7 +494,7 @@ export function AutomationsPage() {
                   </TableHeader>
                   <TableBody>
                     {jobs.map((job) => {
-                      const nextRun = job.nextRunAt ? formatTimeLong(job.nextRunAt) : null;
+                      const nextRun = job.nextRunAt ? formatDateTimeLines(job.nextRunAt, dateDisplayFormat) : null;
                       const accountSummary = formatAccountsSummary(job.accountIds, accountDisplayIndex, job.accountScopeAll);
 	                      const scheduleSummary = formatScheduleSummary(
 	                        job.schedule.days,
@@ -553,8 +562,8 @@ export function AutomationsPage() {
                           <TableCell className="align-middle text-xs">
                             {nextRun ? (
                               <div className="space-y-0.5 leading-tight">
-                                <div className="text-foreground/95">{nextRun.time}</div>
-                                <div className="text-muted-foreground">{nextRun.date}</div>
+                                <div className="text-foreground/95">{nextRun.primary}</div>
+                                <div className="text-muted-foreground">{nextRun.secondary}</div>
                               </div>
                             ) : (
 	                              <span className="text-muted-foreground">{t("common.states.disabled")}</span>
@@ -611,9 +620,13 @@ export function AutomationsPage() {
                                 size="icon"
                                 variant="ghost"
                                 className="h-8 w-8"
-                                disabled={busy}
+                                disabled={busy || automationsPaused}
 	                                aria-label={t("automations.jobs.runNowAria", { name: job.name })}
-	                                title={t("automations.jobs.runNowTitle")}
+	                                title={
+	                                  automationsPaused
+	                                    ? t("automations.jobs.runNowPausedTitle")
+	                                    : t("automations.jobs.runNowTitle")
+	                                }
                                 onClick={() => {
                                   runNowDialog.show(job);
                                 }}
@@ -712,9 +725,9 @@ export function AutomationsPage() {
                   <TableBody>
                     {runs.map((run) => {
                       const effectiveStatus = (run.effectiveStatus ?? run.status) as AutomationRunStatus;
-                      const scheduled = formatTimeLong(run.scheduledFor);
-                      const started = formatTimeLong(run.startedAt);
-                      const finished = run.finishedAt ? formatTimeLong(run.finishedAt) : null;
+                      const scheduled = formatDateTimeLines(run.scheduledFor, dateDisplayFormat);
+                      const started = formatDateTimeLines(run.startedAt, dateDisplayFormat);
+                      const finished = run.finishedAt ? formatDateTimeLines(run.finishedAt, dateDisplayFormat) : null;
                       const accountDisplay = resolveAccountDisplay(run.accountId, accountDisplayIndex);
                       const hasGroupedAccounts = (run.totalAccounts ?? 0) > 1;
                       const groupedPending = run.pendingAccounts ?? 0;
@@ -747,21 +760,21 @@ export function AutomationsPage() {
                           <TableCell className="align-middle text-xs text-muted-foreground">{run.trigger}</TableCell>
                           <TableCell className="align-middle text-xs">
                             <div className="space-y-0.5 leading-tight">
-                              <div className="text-foreground/95">{scheduled.time}</div>
-                              <div className="text-muted-foreground">{scheduled.date}</div>
+                              <div className="text-foreground/95">{scheduled.primary}</div>
+                              <div className="text-muted-foreground">{scheduled.secondary}</div>
                             </div>
                           </TableCell>
                           <TableCell className="align-middle text-xs">
                             <div className="space-y-0.5 leading-tight">
-                              <div className="text-foreground/95">{started.time}</div>
-                              <div className="text-muted-foreground">{started.date}</div>
+                              <div className="text-foreground/95">{started.primary}</div>
+                              <div className="text-muted-foreground">{started.secondary}</div>
                             </div>
                           </TableCell>
                           <TableCell className="align-middle text-xs">
                             {finished ? (
                               <div className="space-y-0.5 leading-tight">
-                                <div className="text-foreground/95">{finished.time}</div>
-                                <div className="text-muted-foreground">{finished.date}</div>
+                                <div className="text-foreground/95">{finished.primary}</div>
+                                <div className="text-muted-foreground">{finished.secondary}</div>
                               </div>
                             ) : (
                               <span className="text-muted-foreground">-</span>

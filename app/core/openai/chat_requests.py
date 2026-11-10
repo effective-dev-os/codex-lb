@@ -3,16 +3,19 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, SkipValidation, field_validator, model_validator
 
 from app.core.openai.contracts import OpenAIMessage
-from app.core.openai.message_coercion import coerce_messages
+from app.core.openai.message_coercion import _content_parts, coerce_messages
 from app.core.openai.requests import (
+    PassthroughJsonList,
+    PassthroughJsonValue,
     ResponsesRequest,
     ResponsesTextControls,
     ResponsesTextFormat,
     normalize_reasoning_aliases,
     normalize_tool_type,
+    validate_passthrough_depth,
     validate_tool_types,
 )
 from app.core.types import JsonValue
@@ -20,12 +23,6 @@ from app.core.utils.json_guards import is_json_list, is_json_mapping
 
 _SUPPORTED_CHAT_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
 _TEXT_CONTENT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
-
-
-def _content_parts(content: JsonValue) -> list[JsonValue]:
-    if is_json_list(content):
-        return content
-    return [content]
 
 
 def _part_type(part: Mapping[str, JsonValue]) -> str | None:
@@ -46,10 +43,12 @@ class ChatCompletionsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str = Field(min_length=1)
-    messages: list[OpenAIMessage] | None = None
-    input: JsonValue | None = None
+    # Passthrough JSON (see ``PassthroughJsonValue``): shape checks live in
+    # the validators below, not in pydantic's type validation.
+    messages: SkipValidation[SerializeAsAny[list[OpenAIMessage] | None]] = None
+    input: PassthroughJsonValue = None
     instructions: str | None = None
-    tools: list[JsonValue] = Field(default_factory=list)
+    tools: PassthroughJsonList = Field(default_factory=list)
     tool_choice: str | dict[str, JsonValue] | None = None
     parallel_tool_calls: bool | None = None
     stream: bool | None = None
@@ -69,11 +68,23 @@ class ChatCompletionsRequest(BaseModel):
     store: bool | None = None
     stream_options: ChatStreamOptions | None = None
 
+    @field_validator("tools")
+    @classmethod
+    def _validate_tools_type(cls, value: list[JsonValue]) -> list[JsonValue]:
+        # Keep the array check at field level so the error names ``param="tools"``.
+        if not isinstance(value, list):
+            raise ValueError("tools must be an array")
+        validate_passthrough_depth(value)
+        return value
+
     @field_validator("messages")
     @classmethod
     def _reject_file_id(cls, value: list[OpenAIMessage] | None) -> list[OpenAIMessage] | None:
         if value is None:
             return value
+        if not isinstance(value, list):
+            raise ValueError("messages must be an array")
+        validate_passthrough_depth(value)
         for message in value:
             message_mapping = _json_mapping(message)
             if message_mapping is None:
@@ -124,27 +135,32 @@ class ChatCompletionsRequest(BaseModel):
     @model_validator(mode="after")
     def _validate_tools(self) -> "ChatCompletionsRequest":
         responses_shaped_payload = not self.messages and self.input is not None
-        self.tools = validate_tool_types(
+        validated = validate_tool_types(
             self.tools,
             allow_builtin_tools=responses_shaped_payload,
         )
+        if validated != self.tools:
+            self.tools = validated
         return self
 
     def to_responses_request(self) -> ResponsesRequest:
-        data = self.model_dump(mode="json", exclude_none=True)
-        messages = data.pop("messages", None)
+        # The passthrough fields are already plain JSON (shape-checked by the
+        # validators above), so attach them directly instead of deep-copying
+        # them through ``model_dump``.
+        data = self.model_dump(mode="json", exclude_none=True, exclude={"input", "messages", "tools"})
+        if self.input is not None:
+            data["input"] = self.input
+        tools_were_set = "tools" in self.model_fields_set
+        messages = self.messages
         data.pop("store", None)
         data.pop("n", None)
         data.pop("max_tokens", None)
         data.pop("max_completion_tokens", None)
         response_format = data.pop("response_format", None)
         stream_options = data.pop("stream_options", None)
-        raw_tools = data.pop("tools", [])
+        raw_tools = self.tools
         raw_tool_choice = data.pop("tool_choice", None)
-        reasoning_effort = data.pop("reasoning_effort", None)
         preserve_instruction_roles = _is_json_object_response_format(response_format)
-        if reasoning_effort is not None and "reasoning" not in data:
-            data["reasoning"] = {"effort": reasoning_effort}
         normalize_reasoning_aliases(data)
         if response_format is not None:
             _apply_response_format(data, response_format)
@@ -160,7 +176,8 @@ class ChatCompletionsRequest(BaseModel):
             # a missing or explicitly empty `messages` field.
             if not isinstance(data.get("instructions"), str):
                 data["instructions"] = ""
-            data["tools"] = raw_tools
+            if tools_were_set:
+                data["tools"] = raw_tools
             if raw_tool_choice is not None:
                 data["tool_choice"] = raw_tool_choice
             return ResponsesRequest.model_validate(data)
@@ -177,7 +194,8 @@ class ChatCompletionsRequest(BaseModel):
         )
         data["instructions"] = instructions
         data["input"] = input_items
-        data["tools"] = tools
+        if tools_were_set:
+            data["tools"] = tools
         if tool_choice is not None:
             data["tool_choice"] = tool_choice
         return ResponsesRequest.model_validate(data)

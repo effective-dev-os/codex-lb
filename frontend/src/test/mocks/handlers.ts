@@ -1,6 +1,10 @@
 import { HttpResponse, http } from "msw";
 import { z } from "zod";
 
+import type { InviteDescription } from "@/features/auth/schemas";
+import type { DashboardRole, DashboardUser } from "@/features/access/api";
+import type { AuditEntry, AuthProvider, RoleMapping } from "@/features/organisation/api";
+
 import {
   LIMIT_TYPES,
   LIMIT_WINDOWS,
@@ -20,6 +24,13 @@ import {
   createConversationDetails,
   createConversationsResponse,
   createDashboardAuthSession,
+  createDefaultAuthProviders,
+  createDefaultDashboardRoles,
+  createDefaultDashboardUsers,
+  createDefaultRefusedSignIns,
+  createPermissionDescriptors,
+  createSessionUser,
+  OPERATOR_PERMISSIONS,
   createDashboardOverview,
   createDashboardProjections,
   createDashboardSettings,
@@ -37,22 +48,79 @@ import {
   createQuotaPlannerSettings,
   createQuotaPlannerWarmupActionResponse,
   createRequestLogFilterOptions,
+  createTelemetryConsent,
+  createTelemetrySnapshotEnvelope,
+  createModelContextWindowOverrides,
   createUpstreamProxyAdmin,
   createRequestLogsResponse,
   type DashboardAuthSession,
   type DashboardSettings,
+  type ModelContextWindowOverrides,
   type ModelSource,
   type QuotaPlannerDecision,
   type QuotaPlannerForecast,
   type QuotaPlannerSettings,
   type RequestLogEntry,
+  type TelemetryConsent,
   type UpstreamProxyAdmin,
 } from "@/test/mocks/factories";
 
 const MODEL_OPTION_DELIMITER = ":::";
-const STATUS_ORDER = ["ok", "rate_limit", "quota", "error"] as const;
+const STATUS_ORDER = ["ok", "cancelled", "rate_limit", "quota", "error"] as const;
 
 // ── Zod schemas for mock request bodies ──
+
+export const MOCK_INVITE_TOKEN = "invite-token-valid";
+
+export const MOCK_ISSUED_INVITE_TOKEN = "invite-token-issued";
+
+const DashboardUserCreatePayloadSchema = z.looseObject({
+  username: z.string(),
+  displayName: z.string().optional(),
+  roleId: z.string(),
+  ssoOnly: z.boolean().optional(),
+  expectedIdentity: z.object({ provider: z.string(), providerKey: z.string(), subject: z.string() }).optional(),
+});
+
+const DashboardUserUpdatePayloadSchema = z.looseObject({
+  username: z.string().optional(),
+  roleId: z.string().optional(),
+  status: z.enum(["active", "disabled"]).optional(),
+  force: z.boolean().optional(),
+});
+
+const AuthProviderUpdatePayloadSchema = z.looseObject({
+  unknownIdentityRoleId: z.string().nullable().optional(),
+  noMatchRoleId: z.string().nullable().optional(),
+  linkByEmail: z.boolean().optional(),
+  skipRoleSync: z.boolean().optional(),
+});
+
+const RoleMappingCreatePayloadSchema = z.looseObject({
+  provider: z.string(),
+  providerKey: z.string(),
+  claimName: z.string(),
+  claimValue: z.string(),
+  roleId: z.string(),
+});
+
+const RoleMappingUpdatePayloadSchema = z.looseObject({
+  claimValue: z.string().optional(),
+  roleId: z.string().optional(),
+});
+
+const RoleMappingOrderPayloadSchema = z.looseObject({
+  provider: z.string(),
+  providerKey: z.string(),
+  ids: z.array(z.string()),
+});
+
+const InviteAcceptPayloadSchema = z.looseObject({
+  token: z.string(),
+  username: z.string().optional(),
+  password: z.string(),
+  displayName: z.string().optional(),
+});
 
 const OauthStartPayloadSchema = z.looseObject({
   forceMethod: z.string().optional(),
@@ -95,6 +163,10 @@ const AccountAliasPayloadSchema = z.object({
   alias: z.string().max(255).nullable(),
 });
 
+const TelemetryConsentPayloadSchema = z.object({
+  enabled: z.boolean(),
+});
+
 const AccountRoutingPolicyPayloadSchema = z.object({
   routingPolicy: z.enum(["normal", "burn_first", "preserve"]),
 });
@@ -102,7 +174,7 @@ const AccountRoutingPolicyPayloadSchema = z.object({
 const SettingsPayloadSchema = z.looseObject({
   stickyThreadsEnabled: z.boolean().optional(),
   upstreamStreamTransport: z
-    .enum(["default", "auto", "http", "websocket"])
+    .enum(["auto", "http", "websocket"])
     .optional(),
   httpDownstreamTransportPolicy: z
     .enum(["smart", "always_http", "always_websocket", "pinned"])
@@ -155,6 +227,7 @@ const ModelSourceCreatePayloadSchema = z.looseObject({
   supportsChatCompletions: z.boolean().optional(),
   supportsResponses: z.boolean().optional(),
   supportsAudioTranscriptions: z.boolean().optional(),
+  supportsEmbeddings: z.boolean().optional(),
   models: z
     .array(
       z.looseObject({
@@ -172,6 +245,7 @@ const ModelSourceCreatePayloadSchema = z.looseObject({
 
 const ModelSourceUpdatePayloadSchema = z.looseObject({
   isEnabled: z.boolean().optional(),
+  supportsEmbeddings: z.boolean().optional(),
 });
 
 const QuotaPlannerSettingsPayloadSchema = z.looseObject({
@@ -241,16 +315,46 @@ async function parseJsonBody<T>(
   }
 }
 
+/** Winner-first order onto the contiguous `N..1` priorities the server owns. */
+function renumberMappings(ordered: readonly RoleMapping[]): RoleMapping[] {
+  return ordered.map((mapping, index) => ({ ...mapping, priority: ordered.length - index }));
+}
+
+/**
+ * `admin` is reserved for the local break-glass account, whether or not a row
+ * currently holds the name.
+ *
+ * `DashboardUsersService._new_username` refuses it before it looks anything up,
+ * so the reservation outlives the row: once the bootstrap account is renamed
+ * away, no account — including that one — may take the name back. A mock that
+ * only checked for a duplicate would accept that rename and let a test prove a
+ * workflow production refuses.
+ */
+const RESERVED_USERNAME = "admin";
+
+function reservedUsernameRefusal(username: string | null | undefined): Response | null {
+  if (username !== RESERVED_USERNAME) return null;
+  return HttpResponse.json(
+    { error: { code: "validation_error", message: "'admin' is reserved for the local break-glass account" } },
+    { status: 422 },
+  );
+}
+
 type MockState = {
   accounts: AccountSummary[];
   requestLogs: RequestLogEntry[];
   conversations: ConversationEntry[];
   conversationDetails: ConversationDetails[];
   authSession: DashboardAuthSession;
+  inviteDescription: InviteDescription;
+  dashboardUsers: DashboardUser[];
+  dashboardRoles: DashboardRole[];
   settings: DashboardSettings;
+  telemetryConsent: TelemetryConsent;
   quotaPlannerSettings: QuotaPlannerSettings;
   quotaPlannerDecisions: QuotaPlannerDecision[];
   upstreamProxyAdmin: UpstreamProxyAdmin;
+  modelContextWindowOverrides: ModelContextWindowOverrides;
   quotaPlannerForecast: QuotaPlannerForecast;
   apiKeys: ApiKey[];
   automations: Array<{
@@ -313,6 +417,9 @@ type MockState = {
     }>
   >;
   modelSources: ModelSource[];
+  authProviders: AuthProvider[];
+  roleMappings: RoleMapping[];
+  refusedSignIns: AuditEntry[];
   firewallEntries: Array<{ ipAddress: string; createdAt: string }>;
   stickySessions: Array<{
     key: string;
@@ -339,15 +446,30 @@ function createInitialState(): MockState {
       }),
     ],
     authSession: createDashboardAuthSession(),
+    inviteDescription: {
+      roleName: "Operator",
+      inviterDisplayName: "admin",
+      suggestedUsername: "sarah",
+      usernameLocked: false,
+      expiresAt: "2026-02-01T18:00:00Z",
+    },
+    dashboardUsers: createDefaultDashboardUsers(),
+    dashboardRoles: createDefaultDashboardRoles(),
     settings: createDashboardSettings(),
+    telemetryConsent: createTelemetryConsent(),
     quotaPlannerSettings: createQuotaPlannerSettings(),
     quotaPlannerDecisions: [createQuotaPlannerDecision()],
     upstreamProxyAdmin: createUpstreamProxyAdmin(),
+    modelContextWindowOverrides: createModelContextWindowOverrides(),
     quotaPlannerForecast: createQuotaPlannerForecast(),
     apiKeys: createDefaultApiKeys(),
     automations: [],
     automationRuns: {},
     modelSources: createDefaultModelSources(),
+    authProviders: createDefaultAuthProviders(),
+    // Zero rules is the shipped default: the empty state is the common case.
+    roleMappings: [],
+    refusedSignIns: createDefaultRefusedSignIns(),
     firewallEntries: [],
     stickySessions: [],
   };
@@ -1118,38 +1240,6 @@ export const handlers = [
 		return HttpResponse.json({ status: "deleted" });
 	}),
 
-  http.post("/api/accounts/:accountId/export", ({ params }) => {
-    const accountId = String(params.accountId);
-    const account = findAccount(accountId);
-    if (!account) {
-      return HttpResponse.json(
-        { error: { code: "account_not_found", message: "Account not found" } },
-        { status: 404 },
-      );
-    }
-    return HttpResponse.json({
-      accountId: account.accountId,
-      email: account.email,
-      planType: account.planType,
-      status: account.status,
-      authJson: JSON.stringify(
-        {
-          auth_mode: "chatgpt",
-          OPENAI_API_KEY: null,
-          tokens: {
-            id_token: "id-token",
-            access_token: "access-token",
-            refresh_token: "refresh-token",
-            account_id: accountId,
-          },
-          last_refresh: "2026-01-01T12:00:00.000000Z",
-        },
-        null,
-        2,
-      ),
-    });
-  }),
-
   http.delete("/api/accounts/:accountId", ({ params }) => {
     const accountId = String(params.accountId);
     const exists = state.accounts.some(
@@ -1198,7 +1288,31 @@ export const handlers = [
     return HttpResponse.json(state.settings);
   }),
 
+  http.get("/api/settings/telemetry", ({ request }) => {
+    // include_preview=true is the on-demand path: the envelope is attached
+    // regardless of consent state.
+    if (new URL(request.url).searchParams.get("include_preview") === "true") {
+      return HttpResponse.json({
+        ...state.telemetryConsent,
+        preview: createTelemetrySnapshotEnvelope(),
+      });
+    }
+    return HttpResponse.json(state.telemetryConsent);
+  }),
 
+  http.put("/api/settings/telemetry", async ({ request }) => {
+    const payload = await parseJsonBody(request, TelemetryConsentPayloadSchema);
+    if (!payload) {
+      return HttpResponse.json(state.telemetryConsent);
+    }
+    state.telemetryConsent = createTelemetryConsent({
+      state: payload.enabled ? "enabled" : "disabled",
+      source: "persisted",
+      active: payload.enabled,
+      preview: null,
+    });
+    return HttpResponse.json(state.telemetryConsent);
+  }),
 
   http.get("/api/settings/upstream-proxy", () => {
     return HttpResponse.json(state.upstreamProxyAdmin);
@@ -1235,6 +1349,9 @@ export const handlers = [
       port: payload.port,
       username: payload.username ?? null,
       isActive: payload.isActive ?? true,
+      // Mirrors the server: credentials on http/socks5 cross the proxy hop unencrypted.
+      plaintextCredentials:
+        payload.scheme !== "https" && (payload.username != null || payload.password != null),
     };
     state.upstreamProxyAdmin = {
       ...state.upstreamProxyAdmin,
@@ -1543,6 +1660,59 @@ export const handlers = [
         reason: "admin_canceled",
       }),
     );
+  }),
+
+  http.get("/api/settings/model-context-window-overrides", () => {
+    return HttpResponse.json(state.modelContextWindowOverrides);
+  }),
+
+  http.put("/api/settings/model-context-window-overrides/:slug*", async ({ params, request }) => {
+    // `:slug*` and no trim: the backend routes the slug as a path segment
+    // (vendor/model) and rejects — never trims — a slug with whitespace.
+    const slug = decodeURIComponent(String(params.slug));
+    const payload = await parseJsonBody(request, z.object({ contextWindow: z.number().int().positive() }));
+    if (!payload) {
+      return HttpResponse.json(
+        { error: { code: "validation_error", message: "contextWindow must be a positive integer" } },
+        { status: 422 },
+      );
+    }
+    if (!slug || /\s/.test(slug)) {
+      return HttpResponse.json(
+        { error: { code: "invalid_model_slug", message: "Invalid model slug" } },
+        { status: 400 },
+      );
+    }
+    const existing = state.modelContextWindowOverrides.overrides.find((entry) => entry.slug === slug);
+    const others = state.modelContextWindowOverrides.overrides.filter((entry) => entry.slug !== slug);
+    state.modelContextWindowOverrides = {
+      overrides: [
+        ...others,
+        { slug, contextWindow: payload.contextWindow, source: "dashboard" as const, envValue: existing?.envValue ?? null },
+      ].sort((a, b) => a.slug.localeCompare(b.slug)),
+    };
+    return HttpResponse.json(state.modelContextWindowOverrides);
+  }),
+
+  http.delete("/api/settings/model-context-window-overrides/:slug*", ({ params }) => {
+    const slug = decodeURIComponent(String(params.slug));
+    const existing = state.modelContextWindowOverrides.overrides.find((entry) => entry.slug === slug);
+    if (!existing || existing.source !== "dashboard") {
+      return HttpResponse.json(
+        { error: { code: "model_context_window_override_not_found", message: "Override not found" } },
+        { status: 404 },
+      );
+    }
+    const others = state.modelContextWindowOverrides.overrides.filter((entry) => entry.slug !== slug);
+    state.modelContextWindowOverrides = {
+      overrides:
+        existing.envValue !== null
+          ? [...others, { slug, contextWindow: existing.envValue, source: "env" as const, envValue: existing.envValue }].sort(
+              (a, b) => a.slug.localeCompare(b.slug),
+            )
+          : others,
+    };
+    return HttpResponse.json(state.modelContextWindowOverrides);
   }),
 
   http.put("/api/settings", async ({ request }) => {
@@ -2054,12 +2224,423 @@ export const handlers = [
     return HttpResponse.json({ status: "ok" });
   }),
 
+  http.post("/api/dashboard-auth/step-up", () => {
+    const verifiedAt = Math.floor(Date.now() / 1000);
+    state.authSession = createDashboardAuthSession({
+      ...state.authSession,
+      stepUp: { verifiedAt, expiresAt: verifiedAt + 300, methods: state.authSession.stepUp?.methods ?? ["password"] },
+    });
+    return HttpResponse.json({ verifiedAt, expiresAt: verifiedAt + 300 });
+  }),
+
   http.post("/api/dashboard-auth/logout", () => {
     state.authSession = createDashboardAuthSession({
       ...state.authSession,
       authenticated: false,
     });
     return HttpResponse.json({ status: "ok" });
+  }),
+
+  http.post("/api/dashboard-auth/logout-all", () => {
+    state.authSession = createDashboardAuthSession({
+      ...state.authSession,
+      authenticated: false,
+      user: null,
+    });
+    return HttpResponse.json({ status: "ok" });
+  }),
+
+  // Invite acceptance (public). Only the fixed token is valid; every other
+  // token gets the single 404 the backend returns for unknown/expired/consumed.
+  http.get("/api/dashboard-auth/invite/:token", ({ params }) => {
+    if (params.token !== MOCK_INVITE_TOKEN) {
+      return HttpResponse.json(
+        { error: { code: "invite_not_found", message: "Invite not found" } },
+        { status: 404 },
+      );
+    }
+    return HttpResponse.json(state.inviteDescription);
+  }),
+
+  http.post("/api/dashboard-auth/invite/accept", async ({ request }) => {
+    const payload = await parseJsonBody(request, InviteAcceptPayloadSchema);
+    if (!payload || payload.token !== MOCK_INVITE_TOKEN) {
+      return HttpResponse.json(
+        { error: { code: "invite_not_found", message: "Invite not found" } },
+        { status: 404 },
+      );
+    }
+    if (state.authSession.user) {
+      return HttpResponse.json(
+        { error: { code: "already_signed_in", message: "Sign out before accepting an invite" } },
+        { status: 409 },
+      );
+    }
+    state.authSession = createDashboardAuthSession({
+      authenticated: true,
+      passwordRequired: true,
+      totpRequiredOnLogin: false,
+      totpConfigured: false,
+      permissions: OPERATOR_PERMISSIONS,
+      user: createSessionUser({
+        id: "user_invited",
+        username: payload.username ?? state.inviteDescription.suggestedUsername,
+        displayName: payload.displayName ?? null,
+        role: { id: "role_operator", slug: "operator", name: "Operator", kind: "preset" },
+      }),
+      login: {
+        usernameField: "shown",
+        providers: [{ kind: "password", providerKey: "default", label: "Password", loginUrl: null }],
+        localLogin: "enabled",
+        pendingIdentity: false,
+      },
+    });
+    return HttpResponse.json(state.authSession);
+  }),
+
+  // ── Dashboard users / roles (`users:manage`) ──
+  // Refusals mirror the service invariants the People tab has to surface.
+
+  http.get("/api/dashboard-users", () => {
+    return HttpResponse.json(state.dashboardUsers);
+  }),
+
+  http.post("/api/dashboard-users", async ({ request }) => {
+    const payload = await parseJsonBody(request, DashboardUserCreatePayloadSchema);
+    if (!payload) {
+      return HttpResponse.json({ error: { code: "validation_error", message: "Invalid payload" } }, { status: 422 });
+    }
+    const reservedOnCreate = reservedUsernameRefusal(payload.username);
+    if (reservedOnCreate) return reservedOnCreate;
+    if (state.dashboardUsers.some((user) => user.username === payload.username)) {
+      return HttpResponse.json(
+        { error: { code: "username_taken", message: "Username is already taken" } },
+        { status: 409 },
+      );
+    }
+    const role = state.dashboardRoles.find((candidate) => candidate.id === payload.roleId);
+    if (!role || !role.assignableToUsers) {
+      return HttpResponse.json(
+        { error: { code: "role_not_assignable", message: "Role cannot be assigned" } },
+        { status: 422 },
+      );
+    }
+    const expiresAt = new Date(Date.now() + 24 * 3600_000).toISOString();
+    const user: DashboardUser = {
+      id: `user_${payload.username}`,
+      username: payload.username,
+      displayName: payload.displayName ?? null,
+      email: null,
+      role: { id: role.id, slug: role.slug, name: role.name, kind: role.kind },
+      roleSource: "manual",
+      status: "invited",
+      isBreakGlass: false,
+      totpConfigured: false,
+      hasPassword: false,
+      createdAt: new Date().toISOString(),
+      lastLoginAt: null,
+      pendingInvite: payload.ssoOnly ? { expiresAt: null, ssoOnly: true } : { expiresAt, ssoOnly: false },
+    };
+    state.dashboardUsers = [...state.dashboardUsers, user];
+    // An SSO-only account has no link: the token never leaves the server.
+    const invite = payload.ssoOnly ? null : { token: MOCK_ISSUED_INVITE_TOKEN, expiresAt };
+    return HttpResponse.json({ user, invite }, { status: 201 });
+  }),
+
+  http.get("/api/dashboard-users/invites", () => {
+    return HttpResponse.json(
+      state.dashboardUsers
+        .filter((user) => user.status === "invited" && user.pendingInvite)
+        .map((user) => ({
+          userId: user.id,
+          username: user.username,
+          roleId: user.role.id,
+          expiresAt: user.pendingInvite?.expiresAt ?? null,
+          createdByUserId: "user_admin",
+          ssoOnly: user.pendingInvite?.ssoOnly ?? false,
+        })),
+    );
+  }),
+
+  http.patch("/api/dashboard-users/:userId", async ({ params, request }) => {
+    const payload = await parseJsonBody(request, DashboardUserUpdatePayloadSchema);
+    const user = state.dashboardUsers.find((candidate) => candidate.id === params.userId);
+    if (!user || !payload) {
+      return HttpResponse.json({ error: { code: "user_not_found", message: "User not found" } }, { status: 404 });
+    }
+    const changesAccess = Boolean(payload.roleId && payload.roleId !== user.role.id) || Boolean(payload.status);
+    // A rename is neither: it is allowed on any account, including the caller's own.
+    // The reservation is checked on the name that was sent, before the "did it
+    // actually change" filter, because the service validates it the same way --
+    // so even the bootstrap account re-sending its own `admin` is refused.
+    const reservedOnRename = reservedUsernameRefusal(payload.username);
+    if (reservedOnRename) return reservedOnRename;
+    const renamesTo = payload.username && payload.username !== user.username ? payload.username : null;
+    if (renamesTo && state.dashboardUsers.some((candidate) => candidate.username === renamesTo)) {
+      return HttpResponse.json(
+        { error: { code: "username_taken", message: "Username is already taken" } },
+        { status: 409 },
+      );
+    }
+    if (user.id === state.authSession.user?.id && changesAccess) {
+      return HttpResponse.json(
+        { error: { code: "self_modification_forbidden", message: "You cannot change your own account" } },
+        { status: 409 },
+      );
+    }
+    if (user.status === "invited" && payload.status) {
+      return HttpResponse.json(
+        { error: { code: "invite_pending", message: "This account has not accepted its invite yet" } },
+        { status: 409 },
+      );
+    }
+    const otherActiveAdmins = state.dashboardUsers.filter(
+      (candidate) => candidate.id !== user.id && candidate.status === "active" && candidate.role.slug === "admin",
+    );
+    const demotes = user.role.slug === "admin" && ((payload.roleId && payload.roleId !== user.role.id) || payload.status === "disabled");
+    if (demotes && otherActiveAdmins.length === 0) {
+      return HttpResponse.json(
+        { error: { code: "last_admin_protected", message: "At least one active admin must remain" } },
+        { status: 409 },
+      );
+    }
+    // A role the company login manages needs the take-over to be explicit.
+    if (user.roleSource !== "manual" && payload.roleId && payload.roleId !== user.role.id && !payload.force) {
+      return HttpResponse.json(
+        { error: { code: "role_managed_externally", message: "This role is managed by the sign-in provider" } },
+        { status: 409 },
+      );
+    }
+    const role = payload.roleId ? state.dashboardRoles.find((candidate) => candidate.id === payload.roleId) : null;
+    const updated: DashboardUser = {
+      ...user,
+      username: renamesTo ?? user.username,
+      role: role ? { id: role.id, slug: role.slug, name: role.name, kind: role.kind } : user.role,
+      status: payload.status ?? user.status,
+      roleSource: payload.force ? "manual" : user.roleSource,
+    };
+    state.dashboardUsers = state.dashboardUsers.map((candidate) => (candidate.id === user.id ? updated : candidate));
+    return HttpResponse.json(updated);
+  }),
+
+  http.delete("/api/dashboard-users/:userId", ({ params }) => {
+    const user = state.dashboardUsers.find((candidate) => candidate.id === params.userId);
+    if (!user) {
+      return HttpResponse.json({ error: { code: "user_not_found", message: "User not found" } }, { status: 404 });
+    }
+    if (user.id === state.authSession.user?.id) {
+      return HttpResponse.json(
+        { error: { code: "self_modification_forbidden", message: "You cannot delete your own account" } },
+        { status: 409 },
+      );
+    }
+    const otherActiveAdmins = state.dashboardUsers.filter(
+      (candidate) => candidate.id !== user.id && candidate.status === "active" && candidate.role.slug === "admin",
+    );
+    if (user.status === "active" && user.role.slug === "admin" && otherActiveAdmins.length === 0) {
+      return HttpResponse.json(
+        { error: { code: "last_admin_protected", message: "At least one active admin must remain" } },
+        { status: 409 },
+      );
+    }
+    state.dashboardUsers = state.dashboardUsers.filter((candidate) => candidate.id !== user.id);
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  http.post("/api/dashboard-users/:userId/invite", ({ params }) => {
+    const user = state.dashboardUsers.find((candidate) => candidate.id === params.userId);
+    if (!user || user.status !== "invited") {
+      return HttpResponse.json(
+        { error: { code: "invite_not_pending", message: "No pending invite" } },
+        { status: 409 },
+      );
+    }
+    const expiresAt = new Date(Date.now() + 24 * 3600_000).toISOString();
+    state.dashboardUsers = state.dashboardUsers.map((candidate) =>
+      candidate.id === user.id ? { ...candidate, pendingInvite: { expiresAt, ssoOnly: false } } : candidate,
+    );
+    return HttpResponse.json({ token: MOCK_ISSUED_INVITE_TOKEN, expiresAt });
+  }),
+
+  http.delete("/api/dashboard-users/:userId/invite", ({ params }) => {
+    const user = state.dashboardUsers.find((candidate) => candidate.id === params.userId);
+    if (!user || user.status !== "invited") {
+      return HttpResponse.json(
+        { error: { code: "invite_not_pending", message: "No pending invite" } },
+        { status: 409 },
+      );
+    }
+    state.dashboardUsers = state.dashboardUsers.filter((candidate) => candidate.id !== user.id);
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  http.post("/api/dashboard-users/:userId/reset-totp", ({ params }) => {
+    const user = state.dashboardUsers.find((candidate) => candidate.id === params.userId);
+    if (!user) {
+      return HttpResponse.json({ error: { code: "user_not_found", message: "User not found" } }, { status: 404 });
+    }
+    if (user.id === state.authSession.user?.id) {
+      return HttpResponse.json(
+        { error: { code: "self_modification_forbidden", message: "Disable your own TOTP from Settings" } },
+        { status: 409 },
+      );
+    }
+    state.dashboardUsers = state.dashboardUsers.map((candidate) =>
+      candidate.id === params.userId ? { ...candidate, totpConfigured: false } : candidate,
+    );
+    return HttpResponse.json({ status: "ok" });
+  }),
+
+  http.post("/api/dashboard-users/:userId/revoke-sessions", () => {
+    return HttpResponse.json({ status: "ok" });
+  }),
+
+  // ── Organisation: sign-in providers, group-to-role rules, refusals ──
+
+  http.get("/api/auth-providers", () => {
+    return HttpResponse.json(state.authProviders);
+  }),
+
+  http.patch("/api/auth-providers/:providerId", async ({ params, request }) => {
+    const payload = await parseJsonBody(request, AuthProviderUpdatePayloadSchema);
+    const provider = state.authProviders.find((candidate) => candidate.id === params.providerId);
+    if (!provider || !payload) {
+      return HttpResponse.json(
+        { error: { code: "provider_not_found", message: "Provider not found" } },
+        { status: 404 },
+      );
+    }
+    const updated: AuthProvider = {
+      ...provider,
+      unknownIdentityRoleId:
+        payload.unknownIdentityRoleId === undefined
+          ? provider.unknownIdentityRoleId
+          : payload.unknownIdentityRoleId,
+      noMatchRoleId: payload.noMatchRoleId === undefined ? provider.noMatchRoleId : payload.noMatchRoleId,
+      linkByEmail: payload.linkByEmail ?? provider.linkByEmail,
+      skipRoleSync: payload.skipRoleSync ?? provider.skipRoleSync,
+    };
+    state.authProviders = state.authProviders.map((candidate) =>
+      candidate.id === provider.id ? updated : candidate,
+    );
+    return HttpResponse.json(updated);
+  }),
+
+  http.get("/api/role-mappings", () => {
+    return HttpResponse.json(state.roleMappings);
+  }),
+
+  // The rules surface serves its own, smaller roles read: this group is
+  // `security:write`, and the full list is `users:manage`.
+  http.get("/api/role-mappings/assignable-roles", () => {
+    return HttpResponse.json(
+      state.dashboardRoles
+        .filter((role) => role.assignableToUsers)
+        .map(({ id, slug, name, description, kind, locked }) => ({ id, slug, name, description, kind, locked })),
+    );
+  }),
+
+  http.post("/api/role-mappings", async ({ request }) => {
+    const payload = await parseJsonBody(request, RoleMappingCreatePayloadSchema);
+    if (!payload) {
+      return HttpResponse.json({ error: { code: "validation_error", message: "Invalid payload" } }, { status: 422 });
+    }
+    const claimValue = payload.claimValue.trim().toLowerCase();
+    if (
+      state.roleMappings.some(
+        (mapping) => mapping.claimName === payload.claimName && mapping.claimValue === claimValue,
+      )
+    ) {
+      return HttpResponse.json(
+        { error: { code: "mapping_exists", message: "A rule for that value already exists" } },
+        { status: 409 },
+      );
+    }
+    const created: RoleMapping = {
+      id: `mapping_${claimValue}`,
+      provider: payload.provider,
+      providerKey: payload.providerKey,
+      claimName: payload.claimName,
+      claimValue,
+      roleId: payload.roleId,
+      priority: 1,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    // Appended at the bottom, then renumbered winner-first like the server does.
+    state.roleMappings = renumberMappings([...state.roleMappings, created]);
+    return HttpResponse.json(state.roleMappings.find((mapping) => mapping.id === created.id), { status: 201 });
+  }),
+
+  http.put("/api/role-mappings/order", async ({ request }) => {
+    const payload = await parseJsonBody(request, RoleMappingOrderPayloadSchema);
+    if (!payload) {
+      return HttpResponse.json({ error: { code: "validation_error", message: "Invalid payload" } }, { status: 422 });
+    }
+    const known = new Set(state.roleMappings.map((mapping) => mapping.id));
+    if (payload.ids.length !== known.size || payload.ids.some((id) => !known.has(id))) {
+      return HttpResponse.json(
+        { error: { code: "order_stale", message: "The order must list every rule exactly once" } },
+        { status: 409 },
+      );
+    }
+    const byId = new Map(state.roleMappings.map((mapping) => [mapping.id, mapping]));
+    state.roleMappings = renumberMappings(payload.ids.map((id) => byId.get(id) as RoleMapping));
+    return HttpResponse.json(state.roleMappings);
+  }),
+
+  http.patch("/api/role-mappings/:mappingId", async ({ params, request }) => {
+    const payload = await parseJsonBody(request, RoleMappingUpdatePayloadSchema);
+    const mapping = state.roleMappings.find((candidate) => candidate.id === params.mappingId);
+    if (!mapping || !payload) {
+      return HttpResponse.json(
+        { error: { code: "mapping_not_found", message: "Rule not found" } },
+        { status: 404 },
+      );
+    }
+    const updated: RoleMapping = {
+      ...mapping,
+      claimValue: payload.claimValue?.trim().toLowerCase() ?? mapping.claimValue,
+      roleId: payload.roleId ?? mapping.roleId,
+    };
+    state.roleMappings = state.roleMappings.map((candidate) =>
+      candidate.id === mapping.id ? updated : candidate,
+    );
+    return HttpResponse.json(updated);
+  }),
+
+  http.delete("/api/role-mappings/:mappingId", ({ params }) => {
+    if (!state.roleMappings.some((mapping) => mapping.id === params.mappingId)) {
+      return HttpResponse.json(
+        { error: { code: "mapping_not_found", message: "Rule not found" } },
+        { status: 404 },
+      );
+    }
+    state.roleMappings = renumberMappings(
+      state.roleMappings.filter((mapping) => mapping.id !== params.mappingId),
+    );
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  http.get("/api/audit-logs", ({ request }) => {
+    const url = new URL(request.url);
+    const action = url.searchParams.get("action");
+    const reason = url.searchParams.get("reason");
+    return HttpResponse.json(
+      state.refusedSignIns.filter(
+        (entry) =>
+          (action === null || entry.action === action) &&
+          (reason === null || entry.details?.["reason"] === reason),
+      ),
+    );
+  }),
+
+  http.get("/api/dashboard-roles", () => {
+    return HttpResponse.json(state.dashboardRoles);
+  }),
+
+  http.get("/api/dashboard-roles/permissions", () => {
+    return HttpResponse.json(createPermissionDescriptors());
   }),
 
   http.get("/api/models", () => {
@@ -2088,6 +2669,7 @@ export const handlers = [
       supportsChatCompletions: payload?.supportsChatCompletions ?? true,
       supportsResponses: payload?.supportsResponses ?? false,
       supportsAudioTranscriptions: payload?.supportsAudioTranscriptions ?? false,
+      supportsEmbeddings: payload?.supportsEmbeddings ?? false,
       models: (payload?.models ?? [{ model: `model-${sequence}` }]).map(
         (model, index) => ({
           id: index + 1,
@@ -2127,6 +2709,9 @@ export const handlers = [
     const updated = createModelSource({
       ...existing,
       ...(payload?.isEnabled !== undefined ? { isEnabled: payload.isEnabled } : {}),
+      ...(payload?.supportsEmbeddings !== undefined
+        ? { supportsEmbeddings: payload.supportsEmbeddings }
+        : {}),
       updatedAt: new Date().toISOString(),
     });
     state.modelSources = state.modelSources.map((source) =>

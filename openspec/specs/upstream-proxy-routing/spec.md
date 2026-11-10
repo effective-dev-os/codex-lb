@@ -1,7 +1,7 @@
 # upstream-proxy-routing Specification
 
 ## Purpose
-TBD - created by archiving change add-codex-proxy-pool-egress. Update Purpose after archive.
+Governs how account-scoped upstream traffic to ChatGPT/OpenAI/Codex leaves the process. Every upstream call for an account bound to a proxy pool must use that pool and fail closed before any network open when the route is unavailable, because a partial per-request proxy setting would let other surfaces leak through the default pool or direct egress. It also fixes the TLS fingerprint contract, the route metadata recorded in request logs, pool membership validation, and how proxy credentials are carried and validated.
 ## Requirements
 ### Requirement: Account-bound upstream traffic must use the bound proxy pool
 When an account has an explicit upstream proxy pool binding, every ChatGPT/OpenAI/Codex upstream operation using that account's credentials MUST resolve a route from the bound pool before opening a network connection.
@@ -39,22 +39,50 @@ Affected Codex upstream HTTP and websocket calls MUST use the Codex upstream cli
 - **THEN** the client MUST reject the call before opening a network connection.
 
 ### Requirement: Route metadata must be persisted for migrated upstream calls
-Request logs for migrated upstream calls MUST record route mode, proxy pool id, proxy endpoint id, same-pool fallback use, and fail-closed reason where applicable.
+
+Request logs for migrated upstream calls MUST record route mode, proxy pool id, proxy endpoint id, same-pool fallback use, and fail-closed reason where applicable. The request-log API and dashboard request details MUST expose those credential-safe values to operators and MUST NOT expose proxy credentials.
 
 #### Scenario: Fail-closed reason recorded
 - **GIVEN** route resolution fails closed before network open
 - **WHEN** the request log is written
 - **THEN** the log MUST include the fail-closed reason without proxy credentials.
 
+#### Scenario: Fail-closed route is diagnosable from request details
+- **GIVEN** route resolution fails closed before network open
+- **AND** the request log records the route mode and fail-closed reason
+- **WHEN** an operator opens that request in the dashboard
+- **THEN** the request details show the recorded route mode and fail-closed reason
+- **AND** no proxy credentials are included
+
+#### Scenario: Successful routed request exposes its selected route
+- **GIVEN** a request log records a proxy pool id, proxy endpoint id, and same-pool fallback use
+- **WHEN** the request-log API returns that row
+- **THEN** all three values are present unchanged
+
 ### Requirement: Codex installation metadata must be account-owned
-Codex `response.create` requests sent through account-scoped bridge or websocket transports MUST use the selected local account's stored `x-codex-installation-id` value in `client_metadata`.
+
+Codex `response.create` requests sent through account-scoped HTTP/SSE, bridge,
+or WebSocket transports MUST use the selected local account's stored
+`x-codex-installation-id` value in `client_metadata`. For the observed Codex CLI
+0.150.1 Responses wire profile, the same value MUST NOT be synthesized as a
+standalone upstream HTTP request or WebSocket handshake header. Header location
+is part of the wire profile and MUST be selected per transport rather than
+inferred from the existence of an account installation id.
 
 #### Scenario: Client-supplied installation id is replaced
+
 - **GIVEN** a client sends `client_metadata.x-codex-installation-id`
 - **AND** codex-lb selects account `A`
 - **WHEN** codex-lb sends the upstream `response.create` request
 - **THEN** the upstream `client_metadata.x-codex-installation-id` MUST equal account `A`'s stored installation id
 - **AND** it MUST NOT equal the client-supplied value.
+
+#### Scenario: Profiled Responses egress omits standalone installation header
+
+- **GIVEN** codex-lb selects an account with a stored installation id
+- **WHEN** it opens a Codex CLI 0.150.1-profiled Responses HTTP/SSE request or WebSocket connection
+- **THEN** the selected account installation id MUST be present in each `response.create.client_metadata`
+- **AND** `x-codex-installation-id` MUST be absent from the standalone upstream request or handshake headers.
 
 ### Requirement: Upstream proxy pool membership must reject duplicates
 Dashboard upstream proxy pool member mutations MUST reject attempts to add an endpoint that is already a member of the target pool with a validation error instead of surfacing a database integrity failure.
@@ -95,3 +123,148 @@ failure.
 - **GIVEN** a routed WebSocket context manager enters successfully
 - **WHEN** the client returns the opened WebSocket and its context to the caller
 - **THEN** the caller can exit the returned context using the existing ownership contract
+
+### Requirement: Cached route resolution preserves fail-closed semantics
+
+Any cache in front of upstream-route resolution MUST store the resolver's outcome verbatim — a resolved route, a permitted direct-egress `None`, or a fail-closed error with its reason. A cache hit MUST reproduce that outcome exactly: it MUST NOT convert a fail-closed outcome or a routed outcome into direct egress, and it MUST NOT substitute a different pool or endpoint than the resolver chose. Cache staleness MUST be bounded by invalidation on admin mutations (same-replica: before the mutating response returns; peers: within one cache-invalidation poll interval) with a TTL backstop for out-of-band edits.
+
+#### Scenario: Cached fail-closed outcome keeps failing closed
+
+- **GIVEN** an account-bound pool with no active usable endpoint whose fail-closed resolution outcome is cached
+- **WHEN** further upstream operations are attempted for that account
+- **THEN** each operation MUST fail before opening an upstream network connection with the same fail-closed reason
+- **AND** it MUST NOT use the default pool, environment proxy, or direct egress
+
+#### Scenario: New binding takes effect without a direct-egress window on the mutating replica
+
+- **GIVEN** an account whose cached resolution outcome is direct-egress `None`
+- **WHEN** an operator saves an active proxy binding for that account
+- **THEN** the mutating replica's cached outcome MUST be invalidated before the binding response returns, so subsequent requests on that replica resolve the bound pool
+
+### Requirement: Confirmed account-proxy connection failures fail over safely
+
+When an account-routed transport reports that it could not connect to the selected proxy endpoint and proves that the upstream request was not dispatched, the service MUST classify the failure with sanitized structured pre-dispatch provenance. For a route with another usable endpoint in the same proxy pool, the client MUST try that endpoint before moving accounts, including for a non-idempotent request. If the pool cannot connect, movable Responses requests MUST exclude the failed account and retry another eligible account within the existing request budget and attempt limits.
+
+This behavior MUST cover raw HTTP/SSE, native Responses WebSocket, and the HTTP responses bridge. Before recording transient account backoff, the service MUST release response-create and stream leases held for the failed account. A request-scoped API-key reservation MUST remain singular across an internal pre-dispatch failover, MUST settle or release at the terminal request outcome before the account-health write, and MUST NOT be reacquired solely for the internal failover. If neither settlement nor fallback release can be confirmed, the service MUST leave the health write unapplied. HTTP-bridge startup cleanup MUST release only an unowned current request lifecycle, and each reservation lifecycle MUST drain only its own health writes after confirmed settlement or release. The confirmed failure MUST place the account at the existing bounded transient error-backoff floor, but MUST NOT pause, deactivate, rate-limit, or quota-penalize it.
+
+The service MUST NOT replay a request when dispatch is unknown or when the request depends on hard previous-response, turn-state, uploaded-file, single-account, or other required account ownership. If no eligible replacement account exists, the service MUST preserve the original sanitized upstream-unavailable failure instead of replacing it with a generated `no_accounts` error.
+
+#### Scenario: POST uses a healthy endpoint from the same proxy pool
+
+- **GIVEN** a non-idempotent Responses POST is routed through a proxy pool with two endpoints
+- **AND** connecting to the first endpoint fails before request dispatch
+- **WHEN** the second endpoint is reachable
+- **THEN** the service sends the request through the second endpoint
+- **AND** it does not move the request to another account
+
+#### Scenario: movable request retries another account
+
+- **GIVEN** two eligible accounts and the first account's complete proxy route refuses connections before dispatch
+- **WHEN** a fresh Responses request has no hard account ownership
+- **THEN** the service releases the first account's response-create and stream leases
+- **AND** it settles or releases any request-scoped API-key reservation before the account-health write
+- **AND** it records bounded transient backoff for the first account
+- **AND** it excludes the first account and completes through the second account
+- **AND** no failure event from the first attempt is forwarded downstream
+
+#### Scenario: hard account ownership fails closed
+
+- **GIVEN** a Responses request depends on a previous-response owner or an account-scoped uploaded file
+- **AND** the required account's proxy refuses the connection before dispatch
+- **WHEN** another account is otherwise eligible
+- **THEN** the service does not send the request to the other account
+- **AND** it returns the sanitized upstream-unavailable failure for the required account
+
+#### Scenario: ambiguous transport failure is not replayed
+
+- **WHEN** a POST transport failure cannot prove that request dispatch was impossible
+- **THEN** the service does not use that failure as authorization to retry another proxy endpoint or account
+
+#### Scenario: empty replacement pool preserves the original failure
+
+- **GIVEN** a movable request has a confirmed pre-dispatch proxy connection failure
+- **AND** no other eligible account can be selected
+- **THEN** the client receives the original sanitized upstream-unavailable failure
+- **AND** the failure is not replaced with `no_accounts`
+
+### Requirement: Routed aiohttp egress carries proxy credentials outside the proxy URL
+
+When the Codex upstream client dispatches a routed HTTP request or WebSocket
+connect through aiohttp, it MUST pass a credential-free proxy URL
+(`scheme://host:port`) and MUST carry the endpoint username and password as a
+`Proxy-Authorization` Basic header whose bytes are identical to the header
+aiohttp derives from URL userinfo (latin1 encoding). The client MUST NOT place
+proxy credentials in the aiohttp proxy URL. Because aiohttp forwards proxy
+headers only on the CONNECT tunnel, a route whose ordered pool contains any
+credentialed endpoint MUST fail closed for a non-TLS (`http`/`ws`) upstream
+target before any connection is opened and ahead of every transport branch
+(aiohttp, native egress, SOCKS), surfacing as a credential-free connect-phase
+transport error, so a credential-free fallback endpoint cannot absorb the
+misconfigured primary. Route resolution MUST fail closed for a proxy username
+containing `:`. Native egress and SOCKS transports keep carrying credentials
+through their existing URL and field inputs.
+
+#### Scenario: Credentialed https endpoint uses Proxy-Authorization
+
+- **GIVEN** a resolved `https` proxy endpoint with a username and password
+- **WHEN** the Codex upstream client sends a routed request or opens a routed WebSocket through aiohttp
+- **THEN** the aiohttp `proxy` argument contains no userinfo
+- **AND** the CONNECT request carries a `Proxy-Authorization` header whose value is byte-identical to the userinfo-derived token
+- **AND** the aiohttp connection-key repr and the proxy-error message text contain neither the password nor its Basic token
+- **AND** the proxy-error repr, which carries the tunnel request headers, renders with `Basic [REDACTED]` through the log formatters (see `proxy-runtime-observability`)
+
+#### Scenario: Credentialed route to a plaintext target fails closed
+
+- **GIVEN** a resolved route whose primary proxy endpoint carries credentials and whose fallback does not
+- **WHEN** the Codex upstream client is asked to reach an `http` or `ws` upstream URL, for an idempotent or non-idempotent request or a WebSocket open, whether or not a native egress helper is available
+- **THEN** the client fails before dispatch with a credential-free connect-phase transport error
+- **AND** no endpoint in the pool, including the credential-free fallback, receives the request on any transport
+
+#### Scenario: Username with a colon is rejected at resolution
+
+- **WHEN** a proxy endpoint username contains `:`
+- **THEN** route resolution fails closed with reason `invalid_proxy_username`
+
+### Requirement: Dashboard rejects and reports proxy usernames the resolver cannot encode
+
+The dashboard MUST reject an upstream proxy endpoint whose username contains
+`:` at creation with a 400 error coded `invalid_proxy_username`, mirroring the
+resolver rule (RFC 7617 Basic credentials cannot encode a colon in the
+user-id). The endpoint test route MUST report a resolver rejection of an
+already persisted endpoint as a failed probe carrying the resolver reason
+rather than surfacing an unhandled error.
+
+#### Scenario: Colon username is rejected at creation
+
+- **WHEN** an operator creates an upstream proxy endpoint whose username contains `:`
+- **THEN** the request is rejected with a 400 error coded `invalid_proxy_username`
+
+#### Scenario: Endpoint test reports a persisted row the resolver rejects
+
+- **GIVEN** a persisted endpoint the resolver rejects (for example a username containing `:`)
+- **WHEN** the endpoint test route is invoked for it
+- **THEN** the response reports `ok: false` with the resolver reason as `error` and no status code
+- **AND** no probe is sent
+
+### Requirement: Plaintext proxy credentials are surfaced, not blocked
+
+An upstream proxy endpoint whose scheme is `http`, `socks5`, or `socks5h` and which has a username or password MUST be accepted by endpoint creation and by route resolution. The upstream proxy admin API MUST report `plaintextCredentials: true` for such an endpoint and `false` for an `https` endpoint or a credential-free endpoint, and MUST NOT include the password in any response. Route resolution MUST emit exactly one warning per such endpoint per process, identifying the endpoint by id, scheme, host, and port without the credential.
+
+#### Scenario: Operator creates a credentialed http proxy endpoint
+
+- **WHEN** an operator creates an endpoint with scheme `http` and a username and password
+- **THEN** the request succeeds
+- **AND** the created endpoint and the admin listing report `plaintextCredentials: true`
+
+#### Scenario: Credentialed https endpoint is not flagged
+
+- **WHEN** an operator creates an endpoint with scheme `https` and a username and password
+- **THEN** the created endpoint reports `plaintextCredentials: false`
+
+#### Scenario: Resolver warns once per endpoint
+
+- **GIVEN** a credentialed `http` endpoint
+- **WHEN** it is resolved twice in the same process
+- **THEN** exactly one warning is logged for it
+- **AND** the warning contains neither the username nor the password
+

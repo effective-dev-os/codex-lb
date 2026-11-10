@@ -9,14 +9,21 @@ from __future__ import annotations
 
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
 
 from app.core.balancer import AccountState, RoutingCost, RoutingCostsByAccount, RoutingStrategy
+from app.core.clock import REAL_CLOCK, Clock
 from app.db.models import Account, AccountStatus, StickySessionKind
+from app.modules.proxy._load_balancer.sticky_selection import (
+    _STICKY_EXISTING_UNSET,
+    _sticky_refresh_write_skippable,
+)
 from app.modules.proxy.load_balancer import LoadBalancer
+from tests.simulation.virtual_time import VirtualClock
 
 pytestmark = pytest.mark.unit
 
@@ -77,6 +84,9 @@ async def _invoke_stickiness(
     relative_availability_power: float = 2.0,
     relative_availability_top_k: int = 5,
     routing_costs_by_account_id: RoutingCostsByAccount | None = None,
+    sticky_refresh_skip_deadline: datetime | None = None,
+    sticky_existing_account_id: str | None | object = _STICKY_EXISTING_UNSET,
+    clock: Clock = REAL_CLOCK,
 ):
     """Wrapper that calls production LoadBalancer._select_with_stickiness.
 
@@ -88,7 +98,7 @@ async def _invoke_stickiness(
     async def mock_repo_factory():
         yield AsyncMock()
 
-    lb = LoadBalancer(mock_repo_factory)
+    lb = LoadBalancer(mock_repo_factory, clock=clock)
     account_map = {s.account_id: cast(Account, AsyncMock()) for s in states}
 
     outcome = await lb._select_with_stickiness(
@@ -107,8 +117,16 @@ async def _invoke_stickiness(
         relative_availability_top_k=relative_availability_top_k,
         sticky_repo=sticky_repo,
         routing_costs_by_account_id=routing_costs_by_account_id,
+        sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
+        sticky_existing_account_id=sticky_existing_account_id,
     )
-    if outcome.mutation is not None:
+    # Mirror the production persist site (run_sticky_selection_path): a pure
+    # same-owner freshness rewrite is omitted only after revalidating its
+    # observed skip deadline at write time.
+    if outcome.mutation is not None and not _sticky_refresh_write_skippable(
+        outcome.mutation,
+        initialize_seed_key=None,
+    ):
         await lb._persist_sticky_mutation(
             sticky_repo=sticky_repo,
             sticky_key=sticky_key,
@@ -116,6 +134,10 @@ async def _invoke_stickiness(
             mutation=outcome.mutation,
         )
     return outcome.selection
+
+
+def _future_deadline(seconds: float = 10.0) -> datetime:
+    return datetime.now(tz=timezone.utc).replace(tzinfo=None) + timedelta(seconds=seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +184,24 @@ async def test_all_accounts_unavailable_does_not_overwrite_sticky():
     )
 
     assert result.account is None
+    repo.upsert.assert_not_called()
+    repo.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_expired_reauth_sticky_owner_falls_back_without_rebinding_prompt_cache():
+    expired = AccountState(
+        "a",
+        AccountStatus.REAUTH_REQUIRED,
+        access_token_expires_at=time.time() - 1,
+    )
+    fallback = _active("b")
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness([expired, fallback], "key1", repo)
+
+    assert result.account is not None
+    assert result.account.account_id == "b"
     repo.upsert.assert_not_called()
     repo.delete.assert_not_called()
 
@@ -533,6 +573,24 @@ async def test_grace_period_returns_pinned_when_reset_imminent():
 
 
 @pytest.mark.asyncio
+async def test_grace_period_uses_injected_selection_clock():
+    clock = VirtualClock(epoch_value=time.time() + 1_000_000.0)
+    acc_a = _rate_limited("a", reset_at=clock.time() + 5.0)
+    acc_b = _active("b")
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "key-injected-clock",
+        repo,
+        clock=clock,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+
+
+@pytest.mark.asyncio
 async def test_grace_period_keeps_rate_limited_pinned_account_even_when_usage_is_100_pct():
     now = time.time()
     acc_a = _rate_limited("a", reset_at=now + 5, used_percent=100.0)
@@ -671,8 +729,8 @@ async def test_paused_pinned_account_persists_fallback():
 
 
 @pytest.mark.asyncio
-async def test_reauth_required_pinned_account_persists_fallback():
-    """REAUTH_REQUIRED is hard-blocked — same rebind behaviour as PAUSED."""
+async def test_reauth_required_pinned_account_preserves_owner():
+    """REAUTH_REQUIRED keeps the existing request-routable owner."""
     acc_a = AccountState("a", AccountStatus.REAUTH_REQUIRED, deactivation_reason="token expired")
     acc_b = _active("b")
     repo = _make_sticky_repo(existing_account_id="a")
@@ -685,8 +743,8 @@ async def test_reauth_required_pinned_account_persists_fallback():
     )
 
     assert result.account is not None
-    assert result.account.account_id == "b"
-    repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
+    assert result.account.account_id == "a"
+    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
 
 
 # ---------------------------------------------------------------------------
@@ -1085,3 +1143,174 @@ async def test_burn_first_reallocation_only_when_burn_first_is_selectable():
     assert result.account.account_id == "a"
     repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+# ---------------------------------------------------------------------------
+# Same-owner refresh skip: hot (key, kind) rows must not be rewritten on every
+# request when the lookup already observed a fresh row.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_pinned_retention_skips_upsert():
+    """A healthy pinned owner within the refresh-skip window routes to the
+    pinned account without any sticky write."""
+    acc_a = _active("a", used_percent=10.0)
+    acc_b = _active("b", used_percent=50.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(),
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_not_called()
+    repo.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_false_pinned_retention_still_refreshes():
+    """Without the freshness observation the pinned retention keeps its
+    write-through updated_at refresh."""
+    acc_a = _active("a", used_percent=10.0)
+    acc_b = _active("b", used_percent=50.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=None,
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_never_suppresses_reallocation_write():
+    """Budget-pressure rebind to a different owner must persist immediately
+    even when the old row was observed fresh."""
+    acc_a = _active("a", used_percent=96.0)
+    acc_b = _active("b", used_percent=50.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(),
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "b"
+    repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_never_suppresses_departed_owner_rebind():
+    """A pinned owner that left the pool is still rebound with an immediate
+    write even when the old row was observed fresh."""
+    acc_b = _active("b", used_percent=50.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_b],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(),
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "b"
+    repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_grace_period_retention_skips_upsert():
+    """The grace-period pinned retention also honors the skip window."""
+    now = time.time()
+    pinned = _rate_limited("a", reset_at=now + 10)
+    acc_b = _active("b", used_percent=50.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [pinned, acc_b],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(),
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_skippable_reset_when_existing_owner_not_prefetched():
+    """The freshness observation belongs to the caller-provided lookup; an
+    internal owner lookup must fall back to write-through refresh."""
+    acc_a = _active("a", used_percent=10.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(),
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_refresh_skip_deadline_expired_at_persist_time_still_refreshes():
+    """The skip deadline is revalidated at write time: a deadline that lapsed
+    between lookup and persist must not suppress the refresh, keeping the
+    mapping's effective expiry within the documented skip-window bound."""
+    acc_a = _active("a", used_percent=10.0)
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a],
+        "key1",
+        repo,
+        sticky_refresh_skip_deadline=_future_deadline(-0.5),
+        sticky_existing_account_id="a",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+def test_refresh_write_skippable_guards_seed_and_delete_and_deadline():
+    """The persist-time gate never skips deletes, seed-initializing writes,
+    non-datetime deadlines (auto-vivified test doubles), or lapsed deadlines."""
+    from app.modules.proxy._load_balancer.sticky_selection import _StickyMutation
+
+    refresh = _StickyMutation(account_id="a", refresh_skip_deadline=_future_deadline())
+    assert _sticky_refresh_write_skippable(refresh, initialize_seed_key=None) is True
+    # Seed initialization piggybacks on this write and must never be skipped.
+    assert _sticky_refresh_write_skippable(refresh, initialize_seed_key="seed-key") is False
+    # Deletes are never skippable.
+    delete = _StickyMutation(account_id=None, refresh_skip_deadline=_future_deadline())
+    assert _sticky_refresh_write_skippable(delete, initialize_seed_key=None) is False
+    # A lapsed deadline fails revalidation.
+    expired = _StickyMutation(account_id="a", refresh_skip_deadline=_future_deadline(-0.5))
+    assert _sticky_refresh_write_skippable(expired, initialize_seed_key=None) is False
+    # Mutations without an observed deadline always write through.
+    plain = _StickyMutation(account_id="a")
+    assert _sticky_refresh_write_skippable(plain, initialize_seed_key=None) is False

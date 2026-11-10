@@ -1,5 +1,6 @@
 import { RESET_ERROR_LABEL } from "@/utils/constants";
 import { getTimeFormatPreference, type TimeFormatPreference } from "@/hooks/use-time-format";
+import { getDateDisplayFormat, type DateDisplayFormat } from "@/hooks/use-date-format";
 import i18n from "@/i18n";
 
 function t(key: string, options?: Record<string, unknown>): string {
@@ -84,6 +85,11 @@ export type FormattedDateTime = {
   date: string;
 };
 
+export type FormattedDateTimeLines = {
+  primary: string;
+  secondary: string;
+};
+
 function getTimeFormatter(): Intl.DateTimeFormat {
   const locale = getIntlLocale();
   const preference = getTimeFormatPreference();
@@ -163,17 +169,15 @@ export function formatPercent(value: unknown): string {
   return `${Math.round(numeric)}%`;
 }
 
-export function formatPercentNullable(value: unknown): string {
+export function formatPercentNullable(value: unknown, maximumFractionDigits = 0): string {
   const numeric = toNumber(value);
   if (numeric === null) {
     return "--";
   }
-  return `${Math.round(numeric)}%`;
-}
-
-export function formatPercentValue(value: unknown): number {
-  const numeric = toNumber(value);
-  return numeric === null ? 0 : Math.round(numeric);
+  if (maximumFractionDigits <= 0) {
+    return `${Math.round(numeric)}%`;
+  }
+  return `${numeric.toLocaleString("en-US", { maximumFractionDigits })}%`;
 }
 
 export function formatRate(value: unknown): string {
@@ -212,21 +216,6 @@ export function formatWindowLabel(
   return "--";
 }
 
-export function formatTokensWithCached(totalTokens: unknown, cachedInputTokens: unknown): string {
-  const total = toNumber(totalTokens);
-  if (total === null) {
-    return "--";
-  }
-  const cached = toNumber(cachedInputTokens);
-  if (cached === null || cached <= 0) {
-    return formatCompactNumber(total);
-  }
-  return t("formatters.cachedTokensInline", {
-    total: formatCompactNumber(total),
-    cached: formatCompactNumber(cached),
-  });
-}
-
 export function formatCachedTokensMeta(totalTokens: unknown, cachedInputTokens: unknown): string {
   const total = toNumber(totalTokens);
   const cached = toNumber(cachedInputTokens);
@@ -255,10 +244,19 @@ export function formatModelLabel(
   return suffix ? `${base} (${suffix})` : base;
 }
 
-export function formatTimeLong(iso: string | null | undefined): FormattedDateTime {
+export function formatTimeLong(
+  iso: string | null | undefined,
+  displayFormat: DateDisplayFormat = getDateDisplayFormat(),
+): FormattedDateTime {
   const date = parseDate(iso);
   if (!date) {
     return { time: "--", date: "--" };
+  }
+  if (displayFormat === "iso8601") {
+    return {
+      time: formatISOTime(date),
+      date: formatISODate(date),
+    };
   }
   return {
     time: getTimeFormatter().format(date),
@@ -302,21 +300,34 @@ export function formatConversationDuration(
   });
 }
 
-export function formatDateTimeInline(iso: string | null | undefined): string {
-  const formatted = formatTimeLong(iso);
-  return formatted.time === "--" ? "--" : `${formatted.time} ${formatted.date}`;
+export function formatDateTimeInline(
+  iso: string | null | undefined,
+  displayFormat: DateDisplayFormat = getDateDisplayFormat(),
+): string {
+  const formatted = formatDateTimeLines(iso, displayFormat);
+  return formatted.primary === "--" ? "--" : `${formatted.primary} ${formatted.secondary}`;
+}
+
+export function formatDateTimeLines(
+  iso: string | null | undefined,
+  displayFormat: DateDisplayFormat = getDateDisplayFormat(),
+): FormattedDateTimeLines {
+  const formatted = formatTimeLong(iso, displayFormat);
+  return displayFormat === "iso8601"
+    ? { primary: formatted.date, secondary: formatted.time }
+    : { primary: formatted.time, secondary: formatted.date };
+}
+
+function formatISODate(date: Date): string {
+  return `${date.getFullYear()}-${padTwo(date.getMonth() + 1)}-${padTwo(date.getDate())}`;
+}
+
+function formatISOTime(date: Date): string {
+  return `${padTwo(date.getHours())}:${padTwo(date.getMinutes())}:${padTwo(date.getSeconds())}`;
 }
 
 function padTwo(value: number): string {
   return String(value).padStart(2, "0");
-}
-
-export function formatLocalDateTimeSeconds(iso: string | null | undefined): string {
-  const date = parseDate(iso);
-  if (!date) {
-    return "--";
-  }
-  return `${date.getFullYear()}-${padTwo(date.getMonth() + 1)}-${padTwo(date.getDate())} ${padTwo(date.getHours())}:${padTwo(date.getMinutes())}:${padTwo(date.getSeconds())}`;
 }
 
 export function formatChartDateTime(iso: string | null | undefined): string {
@@ -345,6 +356,12 @@ export function formatRelative(ms: number): string {
   }
   const days = Math.ceil(hours / 24);
   return t("formatters.relative.days", { count: days });
+}
+
+/** Relative time until `iso`, or `null` once it has passed. */
+export function formatExpiresIn(iso: string): string | null {
+  const remaining = new Date(iso).getTime() - Date.now();
+  return remaining > 0 ? formatRelative(remaining) : null;
 }
 
 export function formatResetRelative(ms: number): string {
@@ -419,32 +436,6 @@ export function formatSingleUnitRemaining(expiresAtIso: string): SingleUnitRemai
           ? `${minutes}m`
           : t("formatters.now");
   return { label, expiringSoon: ms < EXPIRING_SOON_THRESHOLD_MS };
-}
-
-export function formatQuotaResetMeta(
-  resetAtSecondary: string | null | undefined,
-  windowMinutesSecondary: unknown,
-): string {
-  const labelSecondary = formatQuotaResetLabel(resetAtSecondary);
-  const windowSecondary = formatWindowLabel("secondary", windowMinutesSecondary);
-  if (labelSecondary === RESET_ERROR_LABEL) {
-    return t("formatters.quotaResetUnavailable");
-  }
-  return t("formatters.quotaResetMeta", { window: windowSecondary, label: labelSecondary });
-}
-
-export function truncateText(value: unknown, maxLen = 80): string {
-  if (value === null || value === undefined) {
-    return "";
-  }
-  const text = String(value);
-  if (text.length <= maxLen) {
-    return text;
-  }
-  if (maxLen <= 3) {
-    return text.slice(0, maxLen);
-  }
-  return `${text.slice(0, maxLen - 1)}\u2026`;
 }
 
 export function formatAccessTokenLabel(auth: AccountAuthStatus | null | undefined): string {

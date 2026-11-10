@@ -1,24 +1,34 @@
 from __future__ import annotations
 
 import json
+import re
+from copy import deepcopy
 from typing import Mapping, cast
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from pydantic import ValidationError
 
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.requests import (
     _ESTIMATED_CHARS_PER_TOKEN,
     _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS,
+    _UNSUPPORTED_UPSTREAM_FIELDS,
     ResponsesCompactRequest,
     ResponsesRequest,
+    _estimated_json_array_item_tokens,
     _estimated_json_tokens,
     _input_image_file_reference,
+    _sanitize_input_items,
+    _strip_unsupported_fields,
+    _trim_compact_input_for_upstream,
     extract_input_file_ids,
     extract_input_image_file_references,
 )
 from app.core.openai.v1_requests import V1ResponsesCompactRequest, V1ResponsesRequest
 from app.core.types import JsonValue
+from tests.unit.hypothesis_strategies import json_arrays, json_directive_types, json_objects, json_values
 
 
 def test_responses_requires_instructions():
@@ -115,117 +125,68 @@ def test_known_unsupported_upstream_fields_are_stripped():
     assert dumped["custom_field"] == "kept"
 
 
-def test_responses_to_payload_strips_replayed_tool_call_namespaces_only_on_wire():
-    replayed_calls = [
-        {
-            "type": "function_call",
-            "namespace": "collaboration",
-            "name": "spawn_agent",
-            "arguments": '{"message":"same task"}',
-            "call_id": "call_123",
-        },
-        {
-            "type": "custom_tool_call",
-            "namespace": "exec",
-            "name": "exec",
-            "input": "git status --short",
-            "call_id": "call_456",
-        },
-    ]
-    request = ResponsesRequest.model_validate(
-        {
-            "model": "gpt-5.6-sol",
-            "instructions": "continue",
-            "input": replayed_calls,
-        }
-    )
+@given(json_arrays)
+@settings(deadline=None)
+def test_sanitize_input_items_is_idempotent_for_json(input_items):
+    original = deepcopy(input_items)
+    try:
+        sanitized = _sanitize_input_items(input_items)
+    except ValueError:
+        # Tool items without a usable call ID are deliberately rejected.
+        return
 
-    assert request.input == replayed_calls
-    assert request.to_payload()["input"] == [
-        {
-            "type": "function_call",
-            "name": "spawn_agent",
-            "arguments": '{"message":"same task"}',
-            "call_id": "call_123",
-        },
-        {
-            "type": "custom_tool_call",
-            "name": "exec",
-            "input": "git status --short",
-            "call_id": "call_456",
-        },
-    ]
-    assert request.input == replayed_calls
+    assert input_items == original
+    assert _sanitize_input_items(deepcopy(sanitized)) == sanitized
 
 
-def test_compact_to_payload_strips_replayed_tool_call_namespaces_only_on_wire():
-    replayed_calls = [
-        {
-            "type": "function_call",
-            "namespace": "collaboration",
-            "name": "spawn_agent",
-            "arguments": '{"message":"same task"}',
-            "call_id": "call_123",
-        },
-        {
-            "type": "custom_tool_call",
-            "namespace": "exec",
-            "name": "exec",
-            "input": "git status --short",
-            "call_id": "call_456",
-        },
-    ]
-    request = ResponsesCompactRequest.model_validate(
-        {
-            "model": "gpt-5.6-sol",
-            "instructions": "continue",
-            "input": replayed_calls,
-        }
-    )
+@given(
+    role=st.sampled_from(["system", "developer"]),
+    item_type=json_directive_types,
+    extra=json_objects,
+)
+@settings(deadline=None)
+def test_sanitize_input_items_preserves_typed_directives(role, item_type, extra):
+    directive = dict(extra)
+    directive.update({"role": role, "type": item_type})
 
-    assert request.input == replayed_calls
-    assert request.to_payload()["input"] == [
-        {
-            "type": "function_call",
-            "name": "spawn_agent",
-            "arguments": '{"message":"same task"}',
-            "call_id": "call_123",
-        },
-        {
-            "type": "custom_tool_call",
-            "name": "exec",
-            "input": "git status --short",
-            "call_id": "call_456",
-        },
-    ]
-    assert request.input == replayed_calls
+    assert _sanitize_input_items([directive]) == [directive]
 
 
-@pytest.mark.parametrize("invalid_type", [[], {}])
-def test_responses_to_payload_ignores_unhashable_replayed_item_types(invalid_type: JsonValue):
-    malformed_item = {"type": invalid_type, "namespace": "client-metadata", "value": "kept"}
-    request = ResponsesRequest.model_validate(
-        {
-            "model": "gpt-5.6-sol",
-            "instructions": "continue",
-            "input": [malformed_item],
-        }
-    )
+@given(payload=json_objects.map(lambda value: {key: item for key, item in value.items() if key != "input"}))
+@settings(deadline=None)
+def test_strip_unsupported_fields_is_idempotent(payload):
+    payload = cast(dict[str, JsonValue], payload)
+    first = _strip_unsupported_fields(deepcopy(payload))
+    second = _strip_unsupported_fields(deepcopy(first))
 
-    assert request.to_payload()["input"] == [malformed_item]
+    assert second == first
+    assert _UNSUPPORTED_UPSTREAM_FIELDS.isdisjoint(first)
 
 
-def test_responses_preserves_service_tier():
+@given(namespace=json_values)
+@settings(deadline=None)
+def test_strip_unsupported_fields_namespace_flag_controls_replayed_calls(namespace):
+    payload = cast(dict[str, JsonValue], {"input": [{"type": "function_call", "namespace": namespace}]})
+
+    preserved = _strip_unsupported_fields(deepcopy(payload), strip_replayed_tool_call_namespaces=False)
+    stripped = _strip_unsupported_fields(deepcopy(payload))
+
+    assert preserved["input"] == payload["input"]
+    assert stripped["input"] == [{"type": "function_call"}]
+
+
+@pytest.mark.parametrize("service_tier", ["priority", "ultrafast"])
+def test_responses_preserves_service_tier(service_tier: str):
     payload = {
         "model": "gpt-5.1",
         "instructions": "hi",
         "input": [],
-        "service_tier": "priority",
+        "service_tier": service_tier,
     }
     request = ResponsesRequest.model_validate(payload)
 
     dumped = request.to_payload()
-    assert dumped["service_tier"] == "priority"
+    assert dumped["service_tier"] == service_tier
 
 
 def test_responses_normalizes_fast_service_tier_to_priority_for_upstream():
@@ -296,12 +257,15 @@ def test_openai_prompt_cache_aliases_are_normalized():
     assert "promptCacheRetention" not in dumped
 
 
-def test_settings_default_prompt_cache_affinity_ttl_is_1800():
-    from app.core.config.settings import Settings
+def test_dashboard_default_prompt_cache_affinity_ttl_is_1800():
+    # The affinity TTL is a dashboard runtime setting; the column default is
+    # what a freshly created settings row carries (no env seed).
+    from app.db.models import DashboardSettings
 
-    settings = Settings()
+    column = DashboardSettings.__table__.c.openai_cache_affinity_max_age_seconds
 
-    assert settings.openai_cache_affinity_max_age_seconds == 1800
+    assert column.default is not None
+    assert column.default.arg == 1800
 
 
 def test_responses_to_payload_preserves_tool_order_and_object_keys():
@@ -505,6 +469,41 @@ def test_openai_compatible_reasoning_aliases_are_normalized():
     assert "reasoningSummary" not in dumped
 
 
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+@pytest.mark.parametrize("alias", ["reasoningEffort", "reasoning_effort", "thinking"])
+def test_reasoning_aliases_are_preserved_until_wire_serialization(request_type, alias):
+    request = request_type.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "hi",
+            "input": [],
+            alias: "ultra",
+        }
+    )
+
+    assert request.reasoning is None
+    assert (request.model_extra or {})[alias] == "ultra"
+    dumped = request.to_payload()
+    assert dumped["reasoning"] == {"effort": "ultra"}
+    assert alias not in dumped
+
+
+def test_source_forwarding_preserves_provider_thinking_object():
+    thinking = {"type": "enabled", "budget": 4096, "budget_tokens": 2048, "vendor_hint": "keep"}
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "source-model",
+            "instructions": "hi",
+            "input": [],
+            "thinking": thinking,
+        }
+    )
+
+    forwarded = request.model_dump_for_forwarding()
+    assert forwarded["thinking"] == thinking
+    assert "reasoning" not in forwarded
+
+
 def test_provider_thinking_aliases_are_normalized():
     payload = {
         "model": "gpt-5.1",
@@ -525,7 +524,7 @@ def test_provider_thinking_string_alias_accepts_catalog_advertised_efforts():
     # GPT-5.6 catalog entries advertise ``max`` and ``ultra``
     # (codex-rs/models-manager/models.json at rust-v0.144.1); the string-form
     # thinking alias must accept every catalog-advertised effort.
-    for effort in ("low", "medium", "high", "xhigh", "max", "ultra"):
+    for effort in ("minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
         payload = {
             "model": "gpt-5.6-sol",
             "instructions": "hi",
@@ -584,16 +583,17 @@ def test_openai_compatible_top_level_verbosity_is_normalized():
     assert "verbosity" not in dumped
 
 
-def test_v1_responses_preserves_service_tier():
+@pytest.mark.parametrize("service_tier", ["priority", "ultrafast"])
+def test_v1_responses_preserves_service_tier(service_tier: str):
     payload = {
         "model": "gpt-5.1",
         "input": "hello",
-        "service_tier": "priority",
+        "service_tier": service_tier,
     }
     request = V1ResponsesRequest.model_validate(payload).to_responses_request()
 
     dumped = request.to_payload()
-    assert dumped["service_tier"] == "priority"
+    assert dumped["service_tier"] == service_tier
 
 
 def test_v1_responses_normalizes_fast_service_tier_to_priority_for_upstream():
@@ -1263,6 +1263,163 @@ def test_compact_many_small_items_include_array_wire_framing_in_budget():
     assert wire_bytes <= _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS * _ESTIMATED_CHARS_PER_TOKEN
 
 
+@given(input_items=json_arrays)
+@settings(max_examples=30, deadline=None)
+def test_compact_trim_leaves_budget_fitting_json_unchanged(input_items):
+    if _estimated_json_tokens(input_items) > _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS:
+        return
+
+    payload = cast(dict[str, JsonValue], {"input": deepcopy(input_items)})
+    original = deepcopy(payload["input"])
+
+    _trim_compact_input_for_upstream(payload)
+
+    assert payload["input"] == original
+
+
+@given(size=st.integers(min_value=400_000, max_value=500_000))
+@settings(max_examples=8, deadline=None)
+def test_compact_trim_keeps_budget_order_and_is_stable(size):
+    input_items = [
+        {"id": "head", "role": "user", "content": "head"},
+        {"id": "middle", "role": "assistant", "content": "x" * size},
+        {"id": "latest", "role": "user", "content": "latest"},
+    ]
+    payload = cast(dict[str, JsonValue], {"input": input_items})
+
+    _trim_compact_input_for_upstream(payload)
+    trimmed_input = cast(list[JsonValue], deepcopy(payload["input"]))
+
+    assert _estimated_json_tokens(trimmed_input) <= _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS
+    retained_ids = [item["id"] for item in trimmed_input if isinstance(item, dict) and isinstance(item.get("id"), str)]
+    assert retained_ids == ["head", "latest"]
+
+    _trim_compact_input_for_upstream(payload)
+    assert payload["input"] == trimmed_input
+
+
+@given(size=st.integers(min_value=400_000, max_value=500_000))
+@settings(max_examples=8, deadline=None)
+def test_compact_trim_marker_accounts_for_omitted_middle_item(size):
+    input_items = [
+        {"id": "head", "role": "user", "content": "head"},
+        {"id": "middle", "role": "assistant", "content": "x" * size},
+        {"id": "latest", "role": "user", "content": "latest"},
+    ]
+    payload = cast(dict[str, JsonValue], {"input": input_items})
+
+    _trim_compact_input_for_upstream(payload)
+    trimmed_input = cast(list[JsonValue], payload["input"])
+
+    marker = next(
+        item
+        for item in trimmed_input
+        if isinstance(item, dict) and "[compact trim] Omitted " in str(item.get("content"))
+    )
+    marker_text = str(marker["content"])
+    match = re.search(r"Omitted (\d+) input items \(~(\d+) estimated tokens\)", marker_text)
+
+    assert match is not None
+    assert match.groups() == ("1", str(_estimated_json_array_item_tokens(cast(JsonValue, input_items[1]))))
+
+
+@given(
+    pair=st.sampled_from(
+        [
+            ("function_call", "function_call_output"),
+            ("custom_tool_call", "custom_tool_call_output"),
+            ("apply_patch_call", "apply_patch_call_output"),
+        ]
+    ),
+    filler_size=st.integers(min_value=300_000, max_value=400_000),
+)
+@settings(max_examples=8, deadline=None)
+def test_compact_trim_keeps_generated_tool_pairs(pair, filler_size):
+    call_type, output_type = pair
+    call = {
+        "type": call_type,
+        "name": "exec_command",
+        "call_id": "call-generated",
+        "arguments" if call_type == "function_call" else "input": "{}",
+    }
+    if call_type == "apply_patch_call":
+        call = {
+            "type": call_type,
+            "call_id": "call-generated",
+            "operation": {"patch": "noop"},
+        }
+    output = {"type": output_type, "call_id": "call-generated", "output": "result"}
+    payload = cast(
+        dict[str, JsonValue],
+        {
+            "input": [
+                {"role": "assistant", "content": "x" * filler_size},
+                call,
+                output,
+            ]
+        },
+    )
+
+    _trim_compact_input_for_upstream(payload)
+    trimmed_input = cast(list[JsonValue], payload["input"])
+
+    assert call in trimmed_input
+    assert output in trimmed_input
+    assert _estimated_json_tokens(trimmed_input) <= _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS
+
+
+@given(anchor=st.sampled_from(["goal", "plan"]), filler_size=st.integers(350_000, 450_000))
+@settings(max_examples=8, deadline=None)
+def test_compact_trim_keeps_generated_state_anchor(anchor, filler_size):
+    anchor_text = (
+        '<codex_internal_context source="goal">continue the goal</codex_internal_context>'
+        if anchor == "goal"
+        else "<collaboration_mode># Plan Mode"
+    )
+    anchor_item = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": anchor_text}],
+    }
+    payload = cast(
+        dict[str, JsonValue],
+        {
+            "input": [
+                {"role": "user", "content": "head"},
+                {"role": "assistant", "content": "x" * filler_size},
+                anchor_item,
+                {"role": "user", "content": "latest"},
+            ]
+        },
+    )
+
+    _trim_compact_input_for_upstream(payload)
+    trimmed_input = cast(list[JsonValue], payload["input"])
+
+    assert anchor_item in trimmed_input
+    assert _estimated_json_tokens(trimmed_input) <= _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS
+
+
+@given(size=st.integers(min_value=400_000, max_value=500_000))
+@settings(max_examples=8, deadline=None)
+def test_compact_trim_rejects_generated_oversized_latest_item(size):
+    payload = cast(
+        dict[str, JsonValue],
+        {
+            "input": [
+                {"role": "assistant", "content": "head"},
+                {"role": "user", "content": "x" * size},
+            ]
+        },
+    )
+
+    with pytest.raises(ClientPayloadError) as raised:
+        _trim_compact_input_for_upstream(payload)
+
+    assert raised.value.param == "input"
+    assert raised.value.code == "responses_compact_input_too_large"
+
+
 def test_compact_trims_oversized_input_by_estimated_tokens_with_head_tail_and_marker():
     input_items = [
         {"role": "user", "content": "initial goal and instructions"},
@@ -1290,7 +1447,8 @@ def test_compact_trims_oversized_input_by_estimated_tokens_with_head_tail_and_ma
     marker_text = content[0]["text"]
     assert marker_text.startswith("[compact trim] Omitted 1 input items")
     assert "estimated tokens" in marker_text
-    assert "initial context, most recent context, and compact state anchors were preserved" in marker_text
+    assert "Required compact state anchors and retained input items remain in their original order" in marker_text
+    assert "most recent context" not in marker_text
     assert "codex-lb" not in marker_text
 
 
@@ -1797,14 +1955,14 @@ def test_compact_trimming_preserves_latest_unmatched_tool_call():
     assert latest_call in dumped_input
 
 
-def test_compact_trimming_rejects_latest_tool_output_when_matching_call_cannot_fit():
+def test_compact_trimming_omits_latest_non_state_tool_pair_when_it_cannot_fit():
     payload = {
         "model": "gpt-5.6-sol",
         "instructions": "",
         "input": [
             {
                 "type": "function_call",
-                "name": "exec",
+                "name": "read_file",
                 "call_id": "call-pair",
                 "arguments": "x" * 450_000,
             },
@@ -1817,13 +1975,372 @@ def test_compact_trimming_rejects_latest_tool_output_when_matching_call_cannot_f
         ],
     }
 
-    request = ResponsesCompactRequest.model_validate(payload)
+    dumped_input = ResponsesCompactRequest.model_validate(payload).to_payload()["input"]
+
+    assert isinstance(dumped_input, list)
+    assert payload["input"][0] not in dumped_input
+    assert payload["input"][2] not in dumped_input
+    assert any(
+        isinstance(item, dict) and item.get("type") == "message" and "[compact trim]" in str(item.get("content"))
+        for item in dumped_input
+    )
+    assert "most recent context" not in json.dumps(dumped_input)
+
+
+def test_compact_trimming_omits_latest_non_state_tool_pair_when_marker_would_overflow_budget():
+    call = {
+        "type": "function_call",
+        "name": "read_file",
+        "call_id": "call-marker-budget",
+        "arguments": "x" * 399_600,
+    }
+    output = {
+        "type": "function_call_output",
+        "call_id": "call-marker-budget",
+        "output": "ok",
+    }
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+            {"role": "assistant", "content": "old " + "y" * 500_000},
+            call,
+            output,
+        ],
+    }
+
+    dumped_input = ResponsesCompactRequest.model_validate(payload).to_payload()["input"]
+
+    assert isinstance(dumped_input, list)
+    assert call not in dumped_input
+    assert output not in dumped_input
+    assert any("[compact trim]" in str(item) for item in dumped_input)
+
+
+@pytest.mark.parametrize(
+    ("anchor_field", "anchor_value"),
+    [("previous_response_id", "resp_anchor"), ("conversation", "conv_anchor")],
+)
+def test_compact_trimming_preserves_latest_anchored_output_without_matching_call(
+    anchor_field: str,
+    anchor_value: str,
+):
+    output = {
+        "type": "function_call_output",
+        "call_id": "call-from-previous-response",
+        "output": "latest tool result",
+    }
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        anchor_field: anchor_value,
+        "input": [
+            {"role": "assistant", "content": "old " + "y" * 500_000},
+            output,
+        ],
+    }
+
+    dumped_input = ResponsesCompactRequest.model_validate(payload).to_payload()["input"]
+
+    assert isinstance(dumped_input, list)
+    assert output in dumped_input
+
+
+def _compact_call_item(item_type: str, call_id: str) -> dict[str, JsonValue]:
+    item: dict[str, JsonValue] = {
+        "type": item_type,
+        "name": "read_file",
+        "call_id": call_id,
+    }
+    if item_type == "function_call":
+        item["arguments"] = "{}"
+    elif item_type == "custom_tool_call":
+        item["input"] = "{}"
+    elif item_type == "apply_patch_call":
+        item["operation"] = {"patch": "noop"}
+    else:
+        raise AssertionError(f"unexpected compact call type: {item_type}")
+    return item
+
+
+@pytest.mark.parametrize(
+    ("supplied_call_type", "terminal_output_type"),
+    [
+        ("function_call", "custom_tool_call_output"),
+        ("function_call", "apply_patch_call_output"),
+        ("custom_tool_call", "function_call_output"),
+        ("custom_tool_call", "apply_patch_call_output"),
+        ("apply_patch_call", "function_call_output"),
+        ("apply_patch_call", "custom_tool_call_output"),
+    ],
+)
+def test_compact_anchored_output_ignores_reused_call_id_from_incompatible_tool_variant(
+    supplied_call_type: str,
+    terminal_output_type: str,
+):
+    supplied_call = _compact_call_item(supplied_call_type, "call-reused-across-variants")
+    terminal_output = {
+        "type": terminal_output_type,
+        "call_id": "call-reused-across-variants",
+        "output": "result from the call in the previous response",
+    }
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "previous_response_id": "resp_anchor",
+        "input": [
+            {"role": "assistant", "content": "old " + "x" * 500_000},
+            supplied_call,
+            {"role": "assistant", "content": "middle " + "y" * 500_000},
+            terminal_output,
+        ],
+    }
+
+    dumped_input = ResponsesCompactRequest.model_validate(payload).to_payload()["input"]
+
+    assert isinstance(dumped_input, list)
+    assert terminal_output in dumped_input
+    assert supplied_call not in dumped_input
+
+
+@pytest.mark.parametrize(
+    ("matching_call_type", "intervening_call_type", "terminal_output_type"),
+    [
+        ("function_call", "custom_tool_call", "function_call_output"),
+        ("custom_tool_call", "apply_patch_call", "custom_tool_call_output"),
+        ("apply_patch_call", "function_call", "apply_patch_call_output"),
+    ],
+)
+def test_compact_reused_call_id_selects_type_compatible_pair(
+    matching_call_type: str,
+    intervening_call_type: str,
+    terminal_output_type: str,
+):
+    matching_call = _compact_call_item(matching_call_type, "call-reused-across-variants")
+    intervening_call = _compact_call_item(intervening_call_type, "call-reused-across-variants")
+    terminal_output = {
+        "type": terminal_output_type,
+        "call_id": "call-reused-across-variants",
+        "output": "result from the matching supplied call",
+    }
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "previous_response_id": "resp_anchor",
+        "input": [
+            {"role": "assistant", "content": "old " + "x" * 500_000},
+            matching_call,
+            intervening_call,
+            {"role": "assistant", "content": "middle " + "y" * 500_000},
+            terminal_output,
+        ],
+    }
+
+    dumped_input = ResponsesCompactRequest.model_validate(payload).to_payload()["input"]
+
+    assert isinstance(dumped_input, list)
+    assert matching_call in dumped_input
+    assert terminal_output in dumped_input
+    assert intervening_call not in dumped_input
+
+
+@pytest.mark.parametrize(
+    ("supplied_call_type", "terminal_output_type"),
+    [
+        ("custom_tool_call", "function_call_output"),
+        ("function_call", "custom_tool_call_output"),
+    ],
+)
+def test_compact_rejects_oversized_anchored_output_with_only_incompatible_supplied_call(
+    supplied_call_type: str,
+    terminal_output_type: str,
+):
+    supplied_call = _compact_call_item(supplied_call_type, "call-reused-across-variants")
+    terminal_output = {
+        "type": terminal_output_type,
+        "call_id": "call-reused-across-variants",
+        "output": "x" * 450_000,
+    }
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "previous_response_id": "resp_anchor",
+        "input": [supplied_call, terminal_output],
+    }
 
     with pytest.raises(ClientPayloadError, match="cannot be trimmed without removing required state anchors") as raised:
-        request.to_payload()
+        ResponsesCompactRequest.model_validate(payload).to_payload()
 
     assert raised.value.param == "input"
     assert raised.value.code == "responses_compact_input_too_large"
+
+
+def test_compact_rejects_oversized_anchored_output_when_reused_call_id_is_already_consumed():
+    historical_call = _compact_call_item("function_call", "call-reused")
+    historical_output = {
+        "type": "function_call_output",
+        "call_id": "call-reused",
+        "output": "historical result",
+    }
+    terminal_output = {
+        "type": "function_call_output",
+        "call_id": "call-reused",
+        "output": "x" * 450_000,
+    }
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "previous_response_id": "resp_anchor",
+        "input": [historical_call, historical_output, {"role": "assistant", "content": "middle"}, terminal_output],
+    }
+
+    with pytest.raises(ClientPayloadError, match="cannot be trimmed without removing required state anchors") as raised:
+        ResponsesCompactRequest.model_validate(payload).to_payload()
+
+    assert raised.value.param == "input"
+    assert raised.value.code == "responses_compact_input_too_large"
+
+
+def test_compact_anchored_output_does_not_reattach_consumed_reused_call_pair():
+    historical_call = _compact_call_item("function_call", "call-reused")
+    historical_output = {
+        "type": "function_call_output",
+        "call_id": "call-reused",
+        "output": "historical " + "x" * 450_000,
+    }
+    terminal_output = {
+        "type": "function_call_output",
+        "call_id": "call-reused",
+        "output": "current result",
+    }
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "previous_response_id": "resp_anchor",
+        "input": [historical_call, historical_output, {"role": "assistant", "content": "middle"}, terminal_output],
+    }
+
+    dumped_input = ResponsesCompactRequest.model_validate(payload).to_payload()["input"]
+
+    assert isinstance(dumped_input, list)
+    assert terminal_output in dumped_input
+    assert historical_call not in dumped_input
+    assert historical_output not in dumped_input
+
+
+def test_compact_anchored_output_does_not_reattach_small_consumed_pair():
+    historical_call = _compact_call_item("function_call", "call-reused-small")
+    historical_output = {
+        "type": "function_call_output",
+        "call_id": "call-reused-small",
+        "output": "historical result",
+    }
+    terminal_output = {
+        "type": "function_call_output",
+        "call_id": "call-reused-small",
+        "output": "current result",
+    }
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "previous_response_id": "resp_anchor",
+        "input": [historical_call, historical_output, {"role": "assistant", "content": "x" * 500_000}, terminal_output],
+    }
+
+    dumped_input = ResponsesCompactRequest.model_validate(payload).to_payload()["input"]
+
+    assert isinstance(dumped_input, list)
+    assert terminal_output in dumped_input
+    assert historical_call not in dumped_input
+    assert historical_output not in dumped_input
+
+
+def test_compact_trimming_rejects_oversized_latest_apply_patch_pair():
+    call = {
+        "type": "apply_patch_call",
+        "call_id": "call-side-effect",
+        "operation": {"patch": "x" * 450_000},
+    }
+    output = {
+        "type": "apply_patch_call_output",
+        "call_id": "call-side-effect",
+        "output": "applied",
+    }
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+            {"role": "assistant", "content": "old " + "y" * 500_000},
+            call,
+            output,
+        ],
+    }
+
+    with pytest.raises(ClientPayloadError, match="cannot be trimmed without removing required state anchors") as raised:
+        ResponsesCompactRequest.model_validate(payload).to_payload()
+
+    assert raised.value.param == "input"
+    assert raised.value.code == "responses_compact_input_too_large"
+
+
+def test_compact_trimming_keeps_latest_non_state_tool_pair_when_it_fits():
+    call = {
+        "type": "function_call",
+        "name": "read_file",
+        "call_id": "call-pair",
+        "arguments": "{}",
+    }
+    output = {
+        "type": "function_call_output",
+        "call_id": "call-pair",
+        "output": "latest result",
+    }
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+            {"role": "assistant", "content": "x" * 500_000},
+            call,
+            output,
+        ],
+    }
+
+    dumped_input = ResponsesCompactRequest.model_validate(payload).to_payload()["input"]
+
+    assert isinstance(dumped_input, list)
+    assert call in dumped_input
+    assert output in dumped_input
+
+
+def test_compact_trimming_omits_oversized_latest_custom_tool_output():
+    call = {
+        "type": "custom_tool_call",
+        "name": "read_file",
+        "call_id": "call-large-output",
+        "input": "read a large generated file",
+    }
+    output = {
+        "type": "custom_tool_call_output",
+        "call_id": "call-large-output",
+        "output": "x" * 492_000,
+    }
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+            {"role": "user", "content": "continue the task"},
+            call,
+            output,
+        ],
+    }
+
+    dumped_input = ResponsesCompactRequest.model_validate(payload).to_payload()["input"]
+
+    assert isinstance(dumped_input, list)
+    assert call not in dumped_input
+    assert output not in dumped_input
+    assert dumped_input[0] == payload["input"][0]
+    assert any("[compact trim]" in str(item) for item in dumped_input)
 
 
 def test_compact_rejects_unicode_item_that_expands_past_wire_budget():

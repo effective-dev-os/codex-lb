@@ -3,22 +3,38 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 
 import { renderWithProviders } from "@/test/utils";
-import { createDashboardOverview, createDashboardProjections } from "@/test/mocks/factories";
+import {
+  ADMIN_PERMISSIONS,
+  OPERATOR_PERMISSIONS,
+  VIEWER_PERMISSIONS,
+  createDashboardOverview,
+  createDashboardProjections,
+} from "@/test/mocks/factories";
 import { useAccountMutations } from "@/features/accounts/hooks/use-accounts";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
 import { useDashboard, useDashboardProjections } from "@/features/dashboard/hooks/use-dashboard";
 import { useRequestLogs } from "@/features/dashboard/hooks/use-request-logs";
 import { useConversations } from "@/features/dashboard/hooks/use-conversations";
+import { REQUEST_LOG_TABLE_PREFERENCES_STORAGE_KEY } from "@/features/dashboard/hooks/use-request-log-table-preferences";
 import { buildDashboardView } from "@/features/dashboard/utils";
+import type { AccountListSort } from "@/features/dashboard/components/account-list";
+import type { RecentRequestsTableProps } from "@/features/dashboard/components/recent-requests-table";
 import { useDashboardPreferencesStore } from "@/hooks/use-dashboard-preferences";
 
 import { DashboardPage } from "./dashboard-page";
 
-const { accountCardsSpy, accountListSpy, accountSummaryLineSpy, conversationsViewSpy } = vi.hoisted(() => ({
+const {
+  accountCardsSpy,
+  accountListSpy,
+  accountSummaryLineSpy,
+  conversationsViewSpy,
+  recentRequestsTableSpy,
+} = vi.hoisted(() => ({
   accountCardsSpy: vi.fn(),
   accountListSpy: vi.fn(),
   accountSummaryLineSpy: vi.fn(),
   conversationsViewSpy: vi.fn(),
+  recentRequestsTableSpy: vi.fn(),
 }));
 
 vi.mock("@/features/accounts/hooks/use-accounts", () => ({
@@ -30,9 +46,13 @@ vi.mock("@/features/dashboard/hooks/use-dashboard", () => ({
   useDashboardProjections: vi.fn(),
 }));
 
-vi.mock("@/features/dashboard/hooks/use-request-logs", () => ({
-  useRequestLogs: vi.fn(),
-}));
+vi.mock("@/features/dashboard/hooks/use-request-logs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/features/dashboard/hooks/use-request-logs")>();
+  return {
+    ...actual,
+    useRequestLogs: vi.fn(),
+  };
+});
 
 vi.mock("@/features/dashboard/hooks/use-conversations", () => ({
   useConversations: vi.fn(),
@@ -56,15 +76,15 @@ vi.mock("@/features/dashboard/components/account-list", () => ({
     onSortChange,
   }: {
     accounts: Array<{ accountId: string }>;
-    sort: { key: string; direction: string } | null;
-    onSortChange: (sort: { key: string; direction: string }) => void;
+    sort: AccountListSort;
+    onSortChange: (sort: AccountListSort) => void;
   }) => {
     accountListSpy({ accounts, sort });
     return (
       <button
         type="button"
         data-testid="account-list"
-        onClick={() => onSortChange({ key: "credits", direction: "desc" })}
+        onClick={() => onSortChange({ key: "purchasedCredits", direction: "desc" })}
       >
         List for {accounts.length} accounts
       </button>
@@ -114,7 +134,10 @@ vi.mock("@/features/dashboard/components/filters/request-filters", async () => {
 });
 
 vi.mock("@/features/dashboard/components/recent-requests-table", () => ({
-  RecentRequestsTable: () => <div data-testid="recent-requests-table" />,
+  RecentRequestsTable: (props: RecentRequestsTableProps) => {
+    recentRequestsTableSpy(props);
+    return <div data-testid="recent-requests-table" />;
+  },
 }));
 
 vi.mock("@/features/dashboard/components/stats-grid", () => ({
@@ -153,7 +176,7 @@ describe("DashboardPage", () => {
   beforeEach(() => {
     useAuthStore.setState({
       role: "admin",
-      permissions: ["read", "write"],
+      permissions: ADMIN_PERMISSIONS,
       canWrite: true,
       initialized: true,
     });
@@ -161,12 +184,14 @@ describe("DashboardPage", () => {
     accountListSpy.mockReset();
     accountSummaryLineSpy.mockReset();
     conversationsViewSpy.mockReset();
+    recentRequestsTableSpy.mockReset();
     useAccountMutationsMock.mockReset();
     useDashboardMock.mockReset();
     useDashboardProjectionsMock.mockReset();
     useRequestLogsMock.mockReset();
     useConversationsMock.mockReset();
     buildDashboardViewMock.mockReset();
+    window.localStorage.removeItem(REQUEST_LOG_TABLE_PREFERENCES_STORAGE_KEY);
     useDashboardPreferencesStore.setState({
       accountBurnrateEnabled: true,
       accountViewMode: "cards",
@@ -446,11 +471,30 @@ describe("DashboardPage", () => {
     });
   });
 
+  it.each([
+    ["an operator", OPERATOR_PERMISSIONS, true],
+    ["a viewer", VIEWER_PERMISSIONS, false],
+  ])("hides Conversations from %s (no conversations:read) even though the wire role is admin", async (_label, permissions, canWrite) => {
+    const user = userEvent.setup();
+    useAuthStore.setState({ role: "admin", permissions, canWrite });
+    window.history.pushState({}, "", "/dashboard?view=conversations");
+    mockReadyDashboard();
+
+    renderWithProviders(<DashboardPage />);
+
+    expect(screen.getByRole("heading", { name: "Request Logs" })).toBeInTheDocument();
+    expect(screen.queryByTestId("conversations-view")).not.toBeInTheDocument();
+    expect(useConversationsMock.mock.calls.every(([options]) => options !== undefined && options.enabled === false)).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Request Logs" }));
+    expect(screen.queryByRole("menuitemradio", { name: "Conversations" })).not.toBeInTheDocument();
+    await waitFor(() => expect(window.location.search).not.toContain("view=conversations"));
+  });
+
   it("fails closed during auth hydration and preserves an admin bookmark until the guest is known", async () => {
     useAuthStore.setState({
       initialized: false,
       role: "admin",
-      permissions: ["read", "write"],
+      permissions: ADMIN_PERMISSIONS,
       canWrite: true,
     });
     window.history.pushState({}, "", "/dashboard?view=conversations");
@@ -478,6 +522,84 @@ describe("DashboardPage", () => {
       expect(window.location.search).not.toContain("view=conversations");
     });
     expect(useConversationsMock.mock.calls.every(([options]) => options !== undefined && options.enabled === false)).toBe(true);
+  });
+
+  it("fails closed during auth hydration from the least-privilege boot state", async () => {
+    // The store now boots as guest with no permissions; the gate normally
+    // holds rendering until initialized, but the page must still fail closed
+    // if it is mounted before the session resolves.
+    useAuthStore.setState({
+      initialized: false,
+      role: "guest",
+      permissions: [],
+      canWrite: false,
+    });
+    window.history.pushState({}, "", "/dashboard?view=conversations");
+    mockReadyDashboard();
+
+    renderWithProviders(<DashboardPage />);
+
+    expect(screen.getByRole("heading", { name: "Request Logs" })).toBeInTheDocument();
+    expect(screen.queryByTestId("conversations-view")).not.toBeInTheDocument();
+    expect(window.location.search).toContain("view=conversations");
+    expect(useConversationsMock.mock.calls.every(([options]) => options !== undefined && options.enabled === false)).toBe(true);
+
+    act(() => {
+      useAuthStore.setState({
+        initialized: true,
+        role: "admin",
+        permissions: ADMIN_PERMISSIONS,
+        canWrite: true,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("conversations-view")).toBeInTheDocument();
+    });
+    expect(window.location.search).toContain("view=conversations");
+  });
+
+  it("customizes and restores the request-log table without a global width control", async () => {
+    const user = userEvent.setup();
+    mockReadyDashboard();
+
+    renderWithProviders(<DashboardPage />);
+
+    expect(screen.getByRole("button", { name: "Columns (12)" })).toBeInTheDocument();
+    expect(screen.queryByRole("slider")).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Width$/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Columns (12)" }));
+    expect(screen.getByText("Visible columns")).toBeInTheDocument();
+    await user.click(screen.getByRole("menuitemcheckbox", { name: "Plan" }));
+
+    expect(screen.getByRole("menu", { name: "Columns (11)" })).toBeInTheDocument();
+    const selectedProps = recentRequestsTableSpy.mock.lastCall?.[0] as
+      | RecentRequestsTableProps
+      | undefined;
+    expect(selectedProps?.visibleColumns).not.toContain("plan");
+
+    act(() => {
+      selectedProps?.onColumnWidthChange?.("account", 240);
+    });
+    const resizedProps = recentRequestsTableSpy.mock.lastCall?.[0] as
+      | RecentRequestsTableProps
+      | undefined;
+    expect(resizedProps?.columnWidths?.account).toBe(240);
+
+    await user.keyboard("{Escape}");
+    await user.click(
+      screen.getByRole("button", { name: "Restore default column layout" }),
+    );
+
+    const restoredProps = recentRequestsTableSpy.mock.lastCall?.[0] as
+      | RecentRequestsTableProps
+      | undefined;
+    expect(restoredProps?.visibleColumns).toHaveLength(12);
+    expect(restoredProps?.columnWidths).toEqual({});
+    expect(
+      window.localStorage.getItem(REQUEST_LOG_TABLE_PREFERENCES_STORAGE_KEY),
+    ).toBeNull();
   });
 
   it("renders the account summary line in the Accounts header using overview accounts", () => {
@@ -539,7 +661,7 @@ describe("DashboardPage", () => {
 
     await user.click(screen.getByTestId("account-list"));
 
-    expect(useDashboardPreferencesStore.getState().accountListSort).toEqual({ key: "credits", direction: "desc" });
+    expect(useDashboardPreferencesStore.getState().accountListSort).toEqual({ key: "purchasedCredits", direction: "desc" });
   });
 
   it("renders conversation badge between Statuses and Reset in filters", () => {

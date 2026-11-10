@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RESET_ERROR_LABEL } from "@/utils/constants";
+import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
 import { useTimeFormatStore } from "@/hooks/use-time-format";
 import i18n from "@/i18n";
 import {
@@ -9,7 +10,6 @@ import {
   formatDateTimeInline,
   formatAccessTokenLabel,
   formatCachedTokensMeta,
-  formatLocalDateTimeSeconds,
   formatCompactNumber,
   formatElapsed,
   formatCountdown,
@@ -19,27 +19,24 @@ import {
   formatNumber,
   formatPercent,
   formatPercentNullable,
-  formatPercentValue,
   formatQuotaResetLabel,
-  formatQuotaResetMeta,
   formatRate,
   formatResetRelative,
   formatSingleUnitRemaining,
   formatRefreshTokenLabel,
   formatRelative,
   formatTimeLong,
-  formatTokensWithCached,
   formatWindowLabel,
   formatWindowMinutes,
   parseDate,
   toNumber,
-  truncateText,
 } from "@/utils/formatters";
 
 describe("formatters", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    useDateDisplayFormatStore.setState({ dateDisplayFormat: "default" });
     useTimeFormatStore.setState({ timeFormat: "12h" });
   });
 
@@ -86,9 +83,8 @@ describe("formatters", () => {
     expect(formatPercent(49.6)).toBe("50%");
     expect(formatPercent(null)).toBe("0%");
     expect(formatPercentNullable(49.6)).toBe("50%");
+    expect(formatPercentNullable(49.64, 1)).toBe("49.6%");
     expect(formatPercentNullable(null)).toBe("--");
-    expect(formatPercentValue(49.6)).toBe(50);
-    expect(formatPercentValue(null)).toBe(0);
     expect(formatRate(0.123)).toBe("12.3%");
     expect(formatRate(null)).toBe("--");
   });
@@ -103,8 +99,6 @@ describe("formatters", () => {
   });
 
   it("formats token meta strings", () => {
-    expect(formatTokensWithCached(1234, 200)).toContain("Cached");
-    expect(formatTokensWithCached(1234, 0)).not.toContain("Cached");
     expect(formatCachedTokensMeta(1000, 250)).toBe("Cached: 250 (25%)");
     expect(formatCachedTokensMeta(0, 250)).toBe("Cached: --");
   });
@@ -148,13 +142,16 @@ describe("formatters", () => {
     expect(formatChartDateTime(iso)).not.toMatch(/AM|PM/);
   });
 
-  it("formats local timestamps as yyyy-mm-dd hh:mm:ss", () => {
-    const iso = "2026-01-01T00:00:00.000Z";
+  it("keeps semantic date/time fields stable and orders ISO display date-first", () => {
+    const iso = "2026-08-09T14:30:45.000Z";
     const local = new Date(iso);
-    const expected = `${local.getFullYear()}-${String(local.getMonth() + 1).padStart(2, "0")}-${String(local.getDate()).padStart(2, "0")} ${String(local.getHours()).padStart(2, "0")}:${String(local.getMinutes()).padStart(2, "0")}:${String(local.getSeconds()).padStart(2, "0")}`;
+    const expectedDate = `${local.getFullYear()}-${String(local.getMonth() + 1).padStart(2, "0")}-${String(local.getDate()).padStart(2, "0")}`;
+    const expectedTime = `${String(local.getHours()).padStart(2, "0")}:${String(local.getMinutes()).padStart(2, "0")}:${String(local.getSeconds()).padStart(2, "0")}`;
 
-    expect(formatLocalDateTimeSeconds(iso)).toBe(expected);
-    expect(formatLocalDateTimeSeconds("bad-date")).toBe("--");
+    useDateDisplayFormatStore.setState({ dateDisplayFormat: "iso8601" });
+
+    expect(formatTimeLong(iso)).toEqual({ time: expectedTime, date: expectedDate });
+    expect(formatDateTimeInline(iso)).toBe(`${expectedDate} ${expectedTime}`);
   });
 
 it("formats elapsed latency values", () => {
@@ -211,13 +208,6 @@ it("formats elapsed latency values", () => {
     expect(formatQuotaResetLabel(inPast)).toBe("now");
     expect(formatQuotaResetLabel("1970-01-01T00:00:00.000Z")).toBe(RESET_ERROR_LABEL);
     expect(formatQuotaResetLabel("bad-date")).toBe(RESET_ERROR_LABEL);
-    expect(formatQuotaResetMeta(null, null)).toBe("Quota reset unavailable");
-  });
-
-  it("truncates long text safely", () => {
-    expect(truncateText("short", 10)).toBe("short");
-    expect(truncateText("1234567890", 5)).toBe("1234\u2026");
-    expect(truncateText(null, 5)).toBe("");
   });
 
   it("formats auth token status labels", () => {

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from aiohttp import ClientSession, web
 from fastapi.responses import JSONResponse
 
 import app.modules.oauth.service as oauth_module
@@ -41,6 +42,56 @@ def _oauth_flow_schema(db_setup):
     """
 
     del db_setup
+
+
+_injected_oauth_stores: list[oauth_module.OAuthStateStore] = []
+
+
+async def _drain_global_oauth_store() -> None:
+    """Reset the module-global OAuth store AND await its tasks to completion.
+
+    ``_OAUTH_STORE.reset()`` cancels poll tasks but does not await them, so a
+    cancelled (or still-pending) device poller can keep running into the next
+    test on the shared session loop -- exchanging the device code against
+    whatever ``exchange_device_token`` is monkeypatched to at that moment (or
+    the real network client) and committing slot/status writes to the next
+    test's freshly reset database (issue #1794, same family as #1755). Awaiting
+    every task here guarantees nothing owned by the store crosses a test
+    boundary, and retrieves cancelled tasks' exceptions so they cannot surface
+    as unrelated "Task exception was never retrieved" noise in a later test.
+    """
+
+    store = oauth_module._OAUTH_STORE
+    async with store.lock:
+        tasks = [
+            flow.poll_task for flow in store._flows.values() if flow.poll_task is not None and not flow.poll_task.done()
+        ]
+        stop_task = store._callback_server_stop_task
+        if stop_task is not None and not stop_task.done():
+            tasks.append(stop_task)
+    await store.reset()
+    for injected_store in _injected_oauth_stores:
+        await injected_store.reset()
+    _injected_oauth_stores.clear()
+    for task in tasks:
+        task.cancel()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await task
+
+
+@pytest.fixture(autouse=True)
+async def _isolate_global_oauth_store():
+    """Fence ``oauth_module._OAUTH_STORE`` at BOTH edges of every test.
+
+    The per-test ``_OAUTH_STORE.reset()`` calls this fixture replaces only ran
+    at each test's start, so whichever test happened to run next inherited the
+    previous test's live poll tasks for its whole fixture setup -- the
+    order-dependent "different victim per run" flake of issue #1794.
+    """
+
+    await _drain_global_oauth_store()
+    yield
+    await _drain_global_oauth_store()
 
 
 def _encode_jwt(payload: dict) -> str:
@@ -104,7 +155,6 @@ async def test_manual_callback_api_preserves_oauth_error():
 
 @pytest.mark.asyncio
 async def test_manual_callback_service_sanitizes_unexpected_exception(monkeypatch, caplog):
-    await oauth_module._OAUTH_STORE.reset()
     caplog.set_level(logging.ERROR, logger=oauth_module.logger.name)
     # Persist the flow durably (real flows are written to the shared DB at start)
     # so the reconciliation gate keeps it rather than dropping it as stale.
@@ -162,8 +212,6 @@ def test_oauth_error_html_escapes_message():
 
 @pytest.mark.asyncio
 async def test_device_oauth_flow_creates_account(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
-
     email = "device@example.com"
     raw_account_id = "acc_device"
 
@@ -220,7 +268,6 @@ async def test_device_oauth_flow_creates_account(async_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_starting_new_device_flow_cancels_previous_pending_poll(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
     issued = 0
     first_poll_started = asyncio.Event()
     first_poll_cancelled = asyncio.Event()
@@ -276,8 +323,6 @@ async def test_starting_new_device_flow_cancels_previous_pending_poll(async_clie
     await asyncio.wait_for(first_poll_cancelled.wait(), timeout=1)
     assert first_task.cancelled()
 
-    await oauth_module._OAUTH_STORE.reset()
-
 
 @pytest.mark.asyncio
 async def test_device_oauth_reauth_reuses_existing_row_for_same_chatgpt_identity(
@@ -298,8 +343,6 @@ async def test_device_oauth_reauth_reuses_existing_row_for_same_chatgpt_identity
     ChatGPT identity, so a refresh-token-revoked account picks up the
     new tokens onto its historical row instead of forking a duplicate.
     """
-
-    await oauth_module._OAUTH_STORE.reset()
 
     settings = await async_client.put(
         "/api/settings",
@@ -352,6 +395,7 @@ async def test_device_oauth_reauth_reuses_existing_row_for_same_chatgpt_identity
         start = await async_client.post("/api/oauth/start", json={"forceMethod": "device"})
         assert start.status_code == 200
         assert start.json()["method"] == "device"
+        flow_id = start.json()["flowId"]
 
         complete = await async_client.post("/api/oauth/complete", json={})
         assert complete.status_code == 200
@@ -359,9 +403,13 @@ async def test_device_oauth_reauth_reuses_existing_row_for_same_chatgpt_identity
 
         await asyncio.sleep(0)
 
+        # Poll THIS flow's status (like the dashboard does): the flowId-less
+        # endpoint reads the store's "latest flow" pointer, which a finishing
+        # neighbor poller's cleanup can re-latch to its own already-successful
+        # flow -- reporting success before this flow's poller persisted.
         payload = None
         for _ in range(20):
-            status = await async_client.get("/api/oauth/status")
+            status = await async_client.get("/api/oauth/status", params={"flowId": flow_id})
             assert status.status_code == 200
             payload = status.json()
             if payload["status"] == "success":
@@ -388,8 +436,6 @@ async def test_device_oauth_flow_heals_deactivated_account_when_import_without_o
     async_client,
     monkeypatch,
 ):
-    await oauth_module._OAUTH_STORE.reset()
-
     settings = await async_client.put(
         "/api/settings",
         json={
@@ -834,8 +880,6 @@ async def test_device_oauth_flow_keeps_same_email_distinct_upstream_identities_i
     async_client,
     monkeypatch,
 ):
-    await oauth_module._OAUTH_STORE.reset()
-
     enable_separate = await async_client.put(
         "/api/settings",
         json={
@@ -901,6 +945,7 @@ async def test_device_oauth_flow_keeps_same_email_distinct_upstream_identities_i
         start = await async_client.post("/api/oauth/start", json={"forceMethod": "device"})
         assert start.status_code == 200
         assert start.json()["method"] == "device"
+        flow_id = start.json()["flowId"]
 
         complete = await async_client.post("/api/oauth/complete", json={})
         assert complete.status_code == 200
@@ -908,9 +953,11 @@ async def test_device_oauth_flow_keeps_same_email_distinct_upstream_identities_i
 
         await asyncio.sleep(0)
 
+        # Poll THIS flow's status; see the reauth test above for why the
+        # flowId-less "latest flow" endpoint is racy across sequential flows.
         payload: dict[str, str | None] | None = None
         for _ in range(20):
-            status = await async_client.get("/api/oauth/status")
+            status = await async_client.get("/api/oauth/status", params={"flowId": flow_id})
             assert status.status_code == 200
             payload = status.json()
             if payload["status"] in {"success", "error"}:
@@ -949,8 +996,6 @@ async def test_device_oauth_flow_keeps_same_email_distinct_upstream_identities_i
 
 @pytest.mark.asyncio
 async def test_oauth_start_with_existing_account_marks_success(async_client):
-    await oauth_module._OAUTH_STORE.reset()
-
     encryptor = TokenEncryptor()
     account = Account(
         id="acc_existing",
@@ -978,8 +1023,6 @@ async def test_oauth_start_with_existing_account_marks_success(async_client):
 
 @pytest.mark.asyncio
 async def test_oauth_start_with_existing_account_clears_stale_flows(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
-
     async def fake_callback_server_start(self) -> None:
         return None
 
@@ -1025,8 +1068,6 @@ async def test_oauth_start_with_existing_account_clears_stale_flows(async_client
 
 @pytest.mark.asyncio
 async def test_terminal_oauth_flows_are_bounded_outside_full_reset():
-    await oauth_module._OAUTH_STORE.reset()
-
     retained_limit = oauth_module._MAX_RETAINED_TERMINAL_OAUTH_FLOWS
 
     async with oauth_module._OAUTH_STORE.lock:
@@ -1056,8 +1097,6 @@ async def test_terminal_oauth_flows_are_bounded_outside_full_reset():
 
 @pytest.mark.asyncio
 async def test_expired_pending_browser_oauth_flows_are_pruned():
-    await oauth_module._OAUTH_STORE.reset()
-
     now = time.time()
     async with oauth_module._OAUTH_STORE.lock:
         expired = oauth_module.OAuthState(
@@ -1087,8 +1126,6 @@ async def test_expired_pending_browser_oauth_flows_are_pruned():
 
 @pytest.mark.asyncio
 async def test_only_expired_pending_browser_flow_no_longer_keeps_callback_server_alive():
-    await oauth_module._OAUTH_STORE.reset()
-
     async with oauth_module._OAUTH_STORE.lock:
         flow = oauth_module.OAuthState(
             flow_id="expired-flow",
@@ -1105,9 +1142,132 @@ async def test_only_expired_pending_browser_flow_no_longer_keeps_callback_server
         assert oauth_module._OAUTH_STORE.state.status == "idle"
 
 
+async def _wait_for_browser_flow_removal(store: oauth_module.OAuthStateStore, flow_id: str) -> None:
+    async with asyncio.timeout(5):
+        while flow_id in store._flows:
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_abandoned_browser_flow_expiry_releases_callback_port_without_followup_request(
+    monkeypatch, unused_tcp_port, async_client
+):
+    monkeypatch.setattr(oauth_module, "OAUTH_CALLBACK_PORT", unused_tcp_port)
+    monkeypatch.setattr(oauth_module, "_PENDING_BROWSER_OAUTH_FLOW_TTL_SECONDS", 0.25)
+    # Keep the flow pending until the listener is observed, even on a slow runner.
+    now = time.time()
+    monkeypatch.setattr(oauth_module, "time", SimpleNamespace(time=lambda: now))
+    stopped = asyncio.Event()
+    original_stop = oauth_module.OAuthCallbackServer.stop
+
+    async def observe_stop(server):
+        await original_stop(server)
+        stopped.set()
+
+    monkeypatch.setattr(oauth_module.OAuthCallbackServer, "stop", observe_stop)
+    response = await async_client.post("/api/oauth/start", json={"forceMethod": "browser"})
+    assert response.status_code == 200
+    flow_id = response.json()["flowId"]
+    _, writer = await asyncio.open_connection("127.0.0.1", unused_tcp_port)
+    writer.close()
+    await writer.wait_closed()
+
+    now += oauth_module._PENDING_BROWSER_OAUTH_FLOW_TTL_SECONDS
+    # Only the deadline can trigger cleanup: no status, callback, or new start.
+    await asyncio.wait_for(stopped.wait(), timeout=5)
+    store = oauth_module._OAUTH_STORE
+    assert flow_id not in store._flows
+    assert store._state_token_index == {}
+    with pytest.raises(OSError):
+        await asyncio.open_connection("127.0.0.1", unused_tcp_port)
+
+    # A fresh listener can immediately acquire the released port.
+    async def handler(_request):
+        return web.Response(text="ok")
+
+    replacement = oauth_module.OAuthCallbackServer(handler, port=unused_tcp_port)
+    try:
+        await replacement.start()
+    finally:
+        await replacement.stop()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_browser_flows_keep_listener_until_final_expiry(monkeypatch, unused_tcp_port, async_client):
+    monkeypatch.setattr(oauth_module, "OAUTH_CALLBACK_PORT", unused_tcp_port)
+    monkeypatch.setattr(oauth_module, "_PENDING_BROWSER_OAUTH_FLOW_TTL_SECONDS", 0.25)
+    first = await async_client.post("/api/oauth/start", json={"forceMethod": "browser"})
+    assert first.status_code == 200
+    monkeypatch.setattr(oauth_module, "_PENDING_BROWSER_OAUTH_FLOW_TTL_SECONDS", 1)
+    second = await async_client.post("/api/oauth/start", json={"forceMethod": "browser"})
+    assert second.status_code == 200
+    store = oauth_module._OAUTH_STORE
+    await _wait_for_browser_flow_removal(store, first.json()["flowId"])
+    assert second.json()["flowId"] in store._flows
+    _, writer = await asyncio.open_connection("127.0.0.1", unused_tcp_port)
+    writer.close()
+    await writer.wait_closed()
+
+    await _wait_for_browser_flow_removal(store, second.json()["flowId"])
+    async with asyncio.timeout(5):
+        while store._callback_server is not None:
+            await asyncio.sleep(0.01)
+    with pytest.raises(OSError):
+        await asyncio.open_connection("127.0.0.1", unused_tcp_port)
+
+
+@pytest.mark.asyncio
+async def test_hydrated_browser_flow_rearms_earlier_deadline_and_reset_drains_task(monkeypatch):
+    monkeypatch.setattr(oauth_module.OAuthCallbackServer, "start", AsyncMock())
+    source = _make_replica_service(oauth_module.OAuthStateStore())
+    replica = _make_replica_service(oauth_module.OAuthStateStore())
+    later = await replica._start_browser_flow()
+    monkeypatch.setattr(oauth_module, "_PENDING_BROWSER_OAUTH_FLOW_TTL_SECONDS", 0.25)
+    earlier = await source._start_browser_flow()
+    assert earlier.flow_id is not None
+    assert (await replica.oauth_status(earlier.flow_id)).status == "pending"
+
+    await _wait_for_browser_flow_removal(replica._store, earlier.flow_id)
+    assert later.flow_id in replica._store._flows
+    task = replica._store._browser_flow_expiry_task
+    assert task is not None and not task.done()
+    await replica._store.reset()
+    assert task.done()
+    assert replica._store._browser_flow_expiry_task is None
+
+
+@pytest.mark.asyncio
+async def test_callback_access_log_omits_code_and_state(caplog, unused_tcp_port):
+    code_secret = "CALLBACK_CODE_SECRET"
+    state_secret = "CALLBACK_STATE_SECRET"
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        assert request.query["code"] == code_secret
+        assert request.query["state"] == state_secret
+        return web.Response(text="callback accepted")
+
+    caplog.set_level(logging.INFO, logger="aiohttp.access")
+    server = oauth_module.OAuthCallbackServer(handler, port=unused_tcp_port)
+    await server.start()
+    try:
+        async with ClientSession() as client:
+            async with client.get(
+                f"http://127.0.0.1:{unused_tcp_port}/auth/callback",
+                params={"code": code_secret, "state": state_secret},
+            ) as response:
+                status = response.status
+                body = await response.text()
+    finally:
+        await server.stop()
+
+    assert status == 200
+    assert body == "callback accepted"
+    assert code_secret not in caplog.text
+    assert state_secret not in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_callback_server_remains_reserved_until_stop_completes():
-    await oauth_module._OAUTH_STORE.reset()
     stop_started = asyncio.Event()
     release_stop = asyncio.Event()
 
@@ -1133,8 +1293,6 @@ async def test_callback_server_remains_reserved_until_stop_completes():
 
 @pytest.mark.asyncio
 async def test_oauth_start_falls_back_to_device_on_os_error(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
-
     async def fake_browser_flow(self):
         raise OSError("no port")
 
@@ -1147,8 +1305,15 @@ async def test_oauth_start_falls_back_to_device_on_os_error(async_client, monkey
             expires_in_seconds=30,
         )
 
+    # Park the spawned device poller instead of letting it hit the REAL token
+    # exchange client (this test only asserts the browser->device fallback);
+    # the autouse store fence cancels and awaits it at teardown.
+    async def fake_exchange_device_token(**_):
+        await asyncio.Event().wait()
+
     monkeypatch.setattr(oauth_module.OauthService, "_start_browser_flow", fake_browser_flow)
     monkeypatch.setattr(oauth_module, "request_device_code", fake_device_code)
+    monkeypatch.setattr(oauth_module, "exchange_device_token", fake_exchange_device_token)
 
     start = await async_client.post("/api/oauth/start", json={})
     assert start.status_code == 200
@@ -1159,8 +1324,6 @@ async def test_oauth_start_falls_back_to_device_on_os_error(async_client, monkey
 
 @pytest.mark.asyncio
 async def test_device_oauth_flow_reports_proxy_route_errors(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
-
     async def fake_oauth_route(*_args, **_kwargs):
         raise UpstreamProxyRouteError("default_pool_unconfigured", account_id=None)
 
@@ -1174,8 +1337,6 @@ async def test_device_oauth_flow_reports_proxy_route_errors(async_client, monkey
 
 @pytest.mark.asyncio
 async def test_manual_callback_returns_success_and_creates_account(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
-
     async def fake_callback_server_start(self) -> None:
         return None
 
@@ -1227,8 +1388,6 @@ async def test_manual_callback_returns_success_and_creates_account(async_client,
 
 @pytest.mark.asyncio
 async def test_manual_callback_returns_error_message_for_invalid_state(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
-
     async def fake_callback_server_start(self) -> None:
         return None
 
@@ -1262,8 +1421,6 @@ async def test_manual_callback_returns_error_message_for_invalid_state(async_cli
 
 @pytest.mark.asyncio
 async def test_oauth_status_binds_camel_case_flow_id(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
-
     async def fake_callback_server_start(self) -> None:
         return None
 
@@ -1309,8 +1466,6 @@ async def test_oauth_status_binds_camel_case_flow_id(async_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_manual_callback_error_resolves_state_before_marking_flow_failed(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
-
     async def fake_callback_server_start(self) -> None:
         return None
 
@@ -1377,7 +1532,6 @@ async def test_manual_callback_error_resolves_state_before_marking_flow_failed(a
 
 @pytest.mark.asyncio
 async def test_unknown_flow_error_does_not_mutate_latest_oauth_status():
-    await oauth_module._OAUTH_STORE.reset()
     async with SessionLocal() as session:
         service = oauth_module.OauthService(AccountsRepository(session))
 
@@ -1407,7 +1561,6 @@ async def test_unknown_flow_error_does_not_mutate_latest_oauth_status():
 
 @pytest.mark.asyncio
 async def test_missing_flow_error_does_not_mutate_latest_oauth_status():
-    await oauth_module._OAUTH_STORE.reset()
     async with SessionLocal() as session:
         service = oauth_module.OauthService(AccountsRepository(session))
 
@@ -1437,8 +1590,6 @@ async def test_missing_flow_error_does_not_mutate_latest_oauth_status():
 
 @pytest.mark.asyncio
 async def test_manual_callback_unknown_state_does_not_mutate_latest_flow(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
-
     async def fake_callback_server_start(self) -> None:
         return None
 
@@ -1467,8 +1618,6 @@ async def test_manual_callback_unknown_state_does_not_mutate_latest_flow(async_c
 
 @pytest.mark.asyncio
 async def test_concurrent_browser_oauth_flows_keep_callbacks_isolated(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
-
     async def fake_callback_server_start(self) -> None:
         return None
 
@@ -1547,7 +1696,6 @@ async def test_concurrent_browser_oauth_flows_keep_callbacks_isolated(async_clie
 
 @pytest.mark.asyncio
 async def test_callback_server_idle_stop_releases_store_lock_before_cleanup():
-    await oauth_module._OAUTH_STORE.reset()
     async with SessionLocal() as session:
         service = oauth_module.OauthService(AccountsRepository(session))
 
@@ -1575,8 +1723,6 @@ async def test_callback_server_idle_stop_releases_store_lock_before_cleanup():
 
 @pytest.mark.asyncio
 async def test_existing_account_cleanup_releases_store_lock_before_callback_server_stop():
-    await oauth_module._OAUTH_STORE.reset()
-
     class ExistingAccountRepo:
         async def list_accounts(self):
             return [object()]
@@ -1607,7 +1753,6 @@ async def test_existing_account_cleanup_releases_store_lock_before_callback_serv
 
 @pytest.mark.asyncio
 async def test_new_browser_flow_waits_for_stopping_callback_server_before_reusing_slot(monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
     stop_started = asyncio.Event()
     release_stop = asyncio.Event()
     started_servers: list[object] = []
@@ -1653,8 +1798,6 @@ async def test_new_browser_flow_waits_for_stopping_callback_server_before_reusin
 
 @pytest.mark.asyncio
 async def test_manual_callback_idempotent_success_requires_requested_flow(async_client, monkeypatch):
-    await oauth_module._OAUTH_STORE.reset()
-
     async def fake_callback_server_start(self) -> None:
         return None
 
@@ -1728,6 +1871,8 @@ def _make_replica_service(store: "oauth_module.OAuthStateStore") -> oauth_module
     for one replica behind a load balancer. All replicas share the one test DB."""
 
     from contextlib import asynccontextmanager
+
+    _injected_oauth_stores.append(store)
 
     @asynccontextmanager
     async def _repo_factory():
@@ -2059,7 +2204,6 @@ async def test_device_complete_ack_stays_pending_when_own_poller_already_succeed
     and must NOT spawn a second poll of the consumed device code.
     """
 
-    await oauth_module._OAUTH_STORE.reset()
     async with SessionLocal() as session:
         service = oauth_module.OauthService(AccountsRepository(session))
 

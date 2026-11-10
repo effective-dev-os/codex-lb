@@ -40,6 +40,7 @@ class RequestLogApiKeyOption:
 @dataclass(frozen=True, slots=True)
 class RequestLogStatusFilter:
     include_success: bool
+    include_cancelled: bool
     include_error_other: bool
     error_codes_in: list[str] | None
     error_codes_excluding: list[str] | None
@@ -98,7 +99,11 @@ class RequestLogsService:
         reasoning_efforts: list[str] | None = None,
         status: list[str] | None = None,
         *,
+        cache_mode: str = "since",
+        timeframe: str | None = None,
         include_sensitive_metadata: bool,
+        include_account_identity: bool = True,
+        include_api_key_identity: bool = True,
     ) -> RequestLogsPage:
         status_filter = _map_status_filter(status)
         normalized_model_options = (
@@ -117,10 +122,15 @@ class RequestLogsService:
             models=models,
             reasoning_efforts=reasoning_efforts,
             include_success=status_filter.include_success,
+            include_cancelled=status_filter.include_cancelled,
             include_error_other=status_filter.include_error_other,
             error_codes_in=status_filter.error_codes_in,
             error_codes_excluding=status_filter.error_codes_excluding,
+            cache_mode=cache_mode,
+            timeframe=timeframe,
             include_sensitive_metadata=include_sensitive_metadata,
+            include_account_identity=include_account_identity,
+            include_api_key_identity=include_api_key_identity,
         )
         logs = result.logs
         total = result.total
@@ -131,13 +141,14 @@ class RequestLogsService:
                 request_count=total,
                 aggregated_cost_usd=result.aggregated_cost_usd,
             )
-        api_key_ids = [log.api_key_id for log in logs if log.api_key_id]
-        api_key_name_by_id = await self._repo.get_api_key_names_by_ids(api_key_ids)
+        api_key_ids = [log.api_key_id for log in logs if log.api_key_id] if include_api_key_identity else []
+        api_key_name_by_id = await self._repo.get_api_key_names_by_ids(api_key_ids) if api_key_ids else {}
         requests = [
             to_request_log_entry(
                 log,
                 api_key_name=api_key_name_by_id.get(log.api_key_id or ""),
                 include_sensitive_metadata=include_sensitive_metadata,
+                include_api_key_identity=include_api_key_identity,
             )
             for log in logs
         ]
@@ -230,6 +241,7 @@ def _map_status_filter(status: list[str] | None) -> RequestLogStatusFilter:
     if not status:
         return RequestLogStatusFilter(
             include_success=True,
+            include_cancelled=True,
             include_error_other=True,
             error_codes_in=None,
             error_codes_excluding=None,
@@ -238,12 +250,14 @@ def _map_status_filter(status: list[str] | None) -> RequestLogStatusFilter:
     if not normalized or "all" in normalized:
         return RequestLogStatusFilter(
             include_success=True,
+            include_cancelled=True,
             include_error_other=True,
             error_codes_in=None,
             error_codes_excluding=None,
         )
 
     include_success = "ok" in normalized
+    include_cancelled = "cancelled" in normalized
     include_rate_limit = "rate_limit" in normalized
     include_quota = "quota" in normalized
     include_error_other = "error" in normalized
@@ -256,6 +270,7 @@ def _map_status_filter(status: list[str] | None) -> RequestLogStatusFilter:
 
     return RequestLogStatusFilter(
         include_success=include_success,
+        include_cancelled=include_cancelled,
         include_error_other=include_error_other,
         error_codes_in=sorted(error_codes_in) if error_codes_in else None,
         error_codes_excluding=sorted(RATE_LIMIT_CODES | QUOTA_CODES) if include_error_other else None,
@@ -264,7 +279,7 @@ def _map_status_filter(status: list[str] | None) -> RequestLogStatusFilter:
 
 def _normalize_status_values(values: list[tuple[str, str | None]]) -> list[str]:
     normalized = {normalize_log_status(status, error_code) for status, error_code in values}
-    ordered = ["ok", "rate_limit", "quota", "error"]
+    ordered = ["ok", "cancelled", "rate_limit", "quota", "error"]
     return [status for status in ordered if status in normalized]
 
 

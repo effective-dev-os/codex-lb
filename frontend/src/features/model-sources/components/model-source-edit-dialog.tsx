@@ -17,6 +17,7 @@ import { ModelSourceFormFields } from "@/features/model-sources/components/model
 import {
   createModelSourceFormSchema,
   draftFromSource,
+  mergeReasoningMetadata,
   modelIdsToInput,
   modelSourceDraftReducer,
   type ModelSourceDraft,
@@ -41,8 +42,6 @@ type ModelDraftChangeFlags = {
   supportsVision: boolean;
   supportsReasoning: boolean;
 };
-
-const SUPPORTS_REASONING_KEY = "supports_reasoning";
 
 function parsePositiveInt(value: string): number | null {
   const trimmed = value.trim();
@@ -84,35 +83,15 @@ function getModelDraftChangeFlags(
     supportsStreaming: draft.supportsStreaming !== initialDraft.supportsStreaming,
     supportsTools: draft.supportsTools !== initialDraft.supportsTools,
     supportsVision: draft.supportsVision !== initialDraft.supportsVision,
-    supportsReasoning: draft.supportsReasoning !== initialDraft.supportsReasoning,
+    supportsReasoning:
+      draft.supportsReasoning !== initialDraft.supportsReasoning ||
+      JSON.stringify(draft.reasoningEfforts) !== JSON.stringify(initialDraft.reasoningEfforts) ||
+      draft.defaultReasoningEffort !== initialDraft.defaultReasoningEffort,
   };
 }
 
 function hasAnyModelDraftChange(flags: ModelDraftChangeFlags): boolean {
   return Object.values(flags).some(Boolean);
-}
-
-function mergeReasoningMetadata(
-  existingMetadata: string | null | undefined,
-  supportsReasoning: boolean,
-): string | null {
-  let metadata: Record<string, unknown> = {};
-  if (existingMetadata) {
-    try {
-      const parsed: unknown = JSON.parse(existingMetadata);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        metadata = parsed as Record<string, unknown>;
-      }
-    } catch {
-      metadata = {};
-    }
-  }
-  if (supportsReasoning) {
-    metadata[SUPPORTS_REASONING_KEY] = true;
-  } else {
-    delete metadata[SUPPORTS_REASONING_KEY];
-  }
-  return Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null;
 }
 
 function buildModelInputs(
@@ -155,7 +134,12 @@ function buildModelInputs(
         ? parseNonNegativeFloat(draft.audioPerMinute)
         : existingModel?.audioPerMinute ?? null,
       rawMetadataJson: draftChangeFlags.supportsReasoning
-        ? mergeReasoningMetadata(existingModel?.rawMetadataJson, draft.supportsReasoning)
+        ? mergeReasoningMetadata(
+            existingModel?.rawMetadataJson,
+            draft.supportsReasoning,
+            draft.reasoningEfforts,
+            draft.defaultReasoningEffort,
+          )
         : existingModel?.rawMetadataJson ?? null,
       isEnabled: existingModel?.isEnabled ?? true,
     };
@@ -203,6 +187,7 @@ function ModelSourceEditForm({ source, busy, onSubmit, onClose }: ModelSourceEdi
       supportsChatCompletions: draft.supportsChatCompletions,
       supportsResponses: draft.supportsResponses,
       supportsAudioTranscriptions: draft.supportsAudioTranscriptions,
+      supportsEmbeddings: draft.supportsEmbeddings,
     };
 
     if (modelIdsChanged || hasAnyModelDraftChange(draftChangeFlags)) {
@@ -231,15 +216,20 @@ function ModelSourceEditForm({ source, busy, onSubmit, onClose }: ModelSourceEdi
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-4">
-        <ModelSourceFormFields
-          control={form.control}
-          draft={draft}
-          updateDraft={updateDraft}
-	          apiKeyLabel={t("modelSources.fields.upstreamApiKey")}
-	          apiKeyPlaceholder={t("modelSources.editDialog.keepCurrentKey")}
-        />
-        <DialogFooter>
+      <form onSubmit={form.handleSubmit(handleSubmit)} className="flex min-h-0 flex-1 flex-col">
+        <div
+          className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-6 pb-4"
+          data-testid="model-source-edit-scroll-region"
+        >
+          <ModelSourceFormFields
+            control={form.control}
+            draft={draft}
+            updateDraft={updateDraft}
+            apiKeyLabel={t("modelSources.fields.upstreamApiKey")}
+            apiKeyPlaceholder={t("modelSources.editDialog.keepCurrentKey")}
+          />
+        </div>
+        <DialogFooter className="shrink-0 border-t px-6 py-4">
           <Button type="submit" disabled={busy || form.formState.isSubmitting}>
 	            {t("common.actions.save")}
           </Button>
@@ -259,8 +249,8 @@ export function ModelSourceEditDialog({
   const { t } = useTranslation();
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col gap-0 overflow-clip p-0 sm:max-w-2xl">
+        <DialogHeader className="shrink-0 px-6 pt-6 pr-12 pb-2">
 	          <DialogTitle>{t("modelSources.editDialog.title")}</DialogTitle>
 	          <DialogDescription>{t("modelSources.editDialog.description")}</DialogDescription>
         </DialogHeader>
@@ -274,7 +264,7 @@ export function ModelSourceEditDialog({
             onClose={() => onOpenChange(false)}
           />
         ) : (
-	          <p className="text-sm text-muted-foreground">{t("modelSources.editDialog.selectSource")}</p>
+          <p className="px-6 pb-6 text-sm text-muted-foreground">{t("modelSources.editDialog.selectSource")}</p>
         )}
       </DialogContent>
     </Dialog>

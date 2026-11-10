@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import secrets
 import time
@@ -11,10 +10,14 @@ from hashlib import sha256
 from math import ceil
 from typing import Protocol
 
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.core.auth.api_key_cache import get_api_key_cache
 from app.core.cache.invalidation import NAMESPACE_API_KEY, get_cache_invalidation_poller
+from app.core.clients.thread_cache_identity import (
+    THREAD_CACHE_IDENTITY_MODES,
+    normalize_thread_cache_identity_mode,
+)
 from app.core.usage.pricing import (
     UsageTokens,
     calculate_cost_from_usage,
@@ -24,6 +27,7 @@ from app.core.usage.types import UsageWindowRow
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import Account, AccountStatus, ApiKey, ApiKeyLimit, LimitType, LimitWindow, ModelSource, UsageHistory
 from app.db.session import sqlite_writer_section
+from app.db.sqlite_lock_retry import should_retry_after_sqlite_lock
 from app.modules.api_keys.last_used_coalescer import ApiKeyLastUsedCoalescer, get_api_key_last_used_coalescer
 from app.modules.api_keys.limit_windows import advance_limit_reset, limit_window_delta, next_limit_reset
 from app.modules.api_keys.repository import (
@@ -51,12 +55,15 @@ TRAFFIC_CLASS_FOREGROUND = "foreground"
 TRAFFIC_CLASS_OPPORTUNISTIC = "opportunistic"
 _SUPPORTED_TRAFFIC_CLASSES = frozenset({TRAFFIC_CLASS_FOREGROUND, TRAFFIC_CLASS_OPPORTUNISTIC})
 _SUPPORTED_TRANSPORT_POLICY_OVERRIDES = frozenset({"smart", "always_http", "always_websocket"})
+_REASONING_POLICY_EXCLUSIVE_CONSTRAINT = "ck_api_keys_reasoning_policy_exclusive"
 
 
 class ApiKeysRepositoryProtocol(Protocol):
     async def create(self, row: ApiKey, *, commit: bool = True) -> ApiKey: ...
 
     async def get_by_id(self, key_id: str) -> ApiKey | None: ...
+
+    async def get_for_limit_enforcement(self, key_id: str) -> ApiKey | None: ...
 
     async def get_by_hash(self, key_hash: str) -> ApiKey | None: ...
 
@@ -85,9 +92,11 @@ class ApiKeysRepositoryProtocol(Protocol):
         apply_to_codex_model: bool | _Unset = ...,
         enforced_model: str | None | _Unset = ...,
         enforced_reasoning_effort: str | None | _Unset = ...,
+        allowed_reasoning_efforts: str | None | _Unset = ...,
         enforced_service_tier: str | None | _Unset = ...,
         traffic_class: str | _Unset = ...,
         transport_policy_override: str | None | _Unset = ...,
+        thread_cache_identity_override: str | None | _Unset = ...,
         usage_sections: str | _Unset = ...,
         account_assignment_scope_enabled: bool | _Unset = ...,
         source_assignment_scope_enabled: bool | _Unset = ...,
@@ -109,7 +118,12 @@ class ApiKeysRepositoryProtocol(Protocol):
     async def replace_limits(self, key_id: str, limits: list[ApiKeyLimit]) -> list[ApiKeyLimit]: ...
 
     async def upsert_limits(
-        self, key_id: str, limits: list[ApiKeyLimit], *, commit: bool = True
+        self,
+        key_id: str,
+        limits: list[ApiKeyLimit],
+        *,
+        commit: bool = True,
+        preserve_matched_usage: bool = False,
     ) -> list[ApiKeyLimit]: ...
     async def replace_account_assignments(
         self, key_id: str, account_ids: list[str], *, commit: bool = True
@@ -270,9 +284,11 @@ class ApiKeyCreateData:
     apply_to_codex_model: bool = False
     enforced_model: str | None = None
     enforced_reasoning_effort: str | None = None
+    allowed_reasoning_efforts: list[str] | None = None
     enforced_service_tier: str | None = None
     traffic_class: str = TRAFFIC_CLASS_FOREGROUND
     transport_policy_override: str | None = None
+    thread_cache_identity_override: str | None = None
     usage_sections: str = "upstream_limits,account_pool_usage"
     expires_at: datetime | None = None
     assigned_account_ids: list[str] | None = None
@@ -292,12 +308,16 @@ class ApiKeyUpdateData:
     enforced_model_set: bool = False
     enforced_reasoning_effort: str | None = None
     enforced_reasoning_effort_set: bool = False
+    allowed_reasoning_efforts: list[str] | None = None
+    allowed_reasoning_efforts_set: bool = False
     enforced_service_tier: str | None = None
     enforced_service_tier_set: bool = False
     traffic_class: str | None = None
     traffic_class_set: bool = False
     transport_policy_override: str | None = None
     transport_policy_override_set: bool = False
+    thread_cache_identity_override: str | None = None
+    thread_cache_identity_override_set: bool = False
     usage_sections: str | None = None
     usage_sections_set: bool = False
     expires_at: datetime | None = None
@@ -326,9 +346,11 @@ class ApiKeyData:
     is_active: bool
     created_at: datetime
     last_used_at: datetime | None
+    allowed_reasoning_efforts: list[str] | None = None
     apply_to_codex_model: bool = False
     traffic_class: str = TRAFFIC_CLASS_FOREGROUND
     transport_policy_override: str | None = None
+    thread_cache_identity_override: str | None = None
     usage_sections: str = "upstream_limits,account_pool_usage"
     limits: list[LimitRuleData] = field(default_factory=list)
     usage_summary: "ApiKeyUsageSummaryData | None" = None
@@ -381,8 +403,7 @@ def _compute_pooled_credits(
     account_map = {
         a.id: a
         for a in all_accounts
-        if a.id in requested_account_ids
-        and a.status not in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED, AccountStatus.PAUSED)
+        if a.id in requested_account_ids and a.status not in (AccountStatus.DEACTIVATED, AccountStatus.PAUSED)
     }
     account_ids = set(account_map)
 
@@ -468,11 +489,19 @@ class ApiKeysService:
         assigned_source_ids = await self._resolve_assigned_source_ids(payload.assigned_source_ids)
         enforced_model = _normalize_model_slug(payload.enforced_model)
         enforced_reasoning_effort = _normalize_reasoning_effort(payload.enforced_reasoning_effort)
+        allowed_reasoning_efforts = _normalize_allowed_reasoning_efforts(payload.allowed_reasoning_efforts)
         enforced_service_tier = _normalize_service_tier(payload.enforced_service_tier)
         traffic_class = _normalize_traffic_class(payload.traffic_class)
         transport_policy_override = _normalize_transport_policy_override(payload.transport_policy_override)
+        thread_cache_identity_override = _normalize_thread_cache_identity_override(
+            payload.thread_cache_identity_override
+        )
         usage_sections = _normalize_usage_sections(payload.usage_sections)
         _validate_model_enforcement(enforced_model=enforced_model, allowed_models=normalized_allowed_models)
+        _validate_reasoning_effort_policy(
+            enforced_reasoning_effort=enforced_reasoning_effort,
+            allowed_reasoning_efforts=allowed_reasoning_efforts,
+        )
         row = ApiKey(
             id=str(__import__("uuid").uuid4()),
             name=_normalize_name(payload.name),
@@ -482,11 +511,13 @@ class ApiKeysService:
             apply_to_codex_model=bool(payload.apply_to_codex_model),
             enforced_model=enforced_model,
             enforced_reasoning_effort=enforced_reasoning_effort,
+            allowed_reasoning_efforts=_serialize_allowed_reasoning_efforts(allowed_reasoning_efforts),
             enforced_service_tier=enforced_service_tier,
             account_assignment_scope_enabled=bool(assigned_account_ids),
             source_assignment_scope_enabled=bool(assigned_source_ids),
             traffic_class=traffic_class,
             transport_policy_override=transport_policy_override,
+            thread_cache_identity_override=thread_cache_identity_override,
             usage_sections=usage_sections,
             expires_at=expires_at,
             is_active=True,
@@ -506,8 +537,12 @@ class ApiKeysService:
                 await self._repository.upsert_limits(created.id, limit_rows, commit=False)
 
             await self._repository.commit()
-        except Exception:
+        except Exception as exc:
             await self._repository.rollback()
+            if isinstance(exc, IntegrityError) and _is_reasoning_policy_constraint_error(exc):
+                raise ApiKeyValidationError(
+                    "enforced_reasoning_effort and allowed_reasoning_efforts cannot be configured together"
+                ) from exc
             raise
 
         created = await self._repository.get_by_id(created.id)
@@ -565,7 +600,13 @@ class ApiKeysService:
             for row in rows
         ]
 
-    async def update_key(self, key_id: str, payload: ApiKeyUpdateData) -> ApiKeyData:
+    async def update_key(
+        self,
+        key_id: str,
+        payload: ApiKeyUpdateData,
+        *,
+        _retry_attempt: int = 0,
+    ) -> ApiKeyData:
         expires_at = _normalize_expires_at(payload.expires_at) if payload.expires_at_set else None
         existing = await self._repository.get_by_id(key_id)
         if existing is None:
@@ -607,6 +648,11 @@ class ApiKeysService:
         else:
             enforced_reasoning_effort = None
 
+        if payload.allowed_reasoning_efforts_set:
+            allowed_reasoning_efforts = _normalize_allowed_reasoning_efforts(payload.allowed_reasoning_efforts)
+        else:
+            allowed_reasoning_efforts = None
+
         if payload.enforced_service_tier_set:
             enforced_service_tier = _normalize_service_tier(payload.enforced_service_tier)
         else:
@@ -618,6 +664,11 @@ class ApiKeysService:
         transport_policy_override_update: str | None | _Unset = _UNSET
         if payload.transport_policy_override_set:
             transport_policy_override_update = _normalize_transport_policy_override(payload.transport_policy_override)
+        thread_cache_identity_override_update: str | None | _Unset = _UNSET
+        if payload.thread_cache_identity_override_set:
+            thread_cache_identity_override_update = _normalize_thread_cache_identity_override(
+                payload.thread_cache_identity_override
+            )
         usage_sections: str | _Unset = _UNSET
         if payload.usage_sections_set:
             usage_sections = _normalize_usage_sections(payload.usage_sections)
@@ -632,6 +683,22 @@ class ApiKeysService:
             _validate_model_enforcement(
                 enforced_model=effective_enforced_model,
                 allowed_models=effective_allowed_models,
+            )
+
+        if payload.enforced_reasoning_effort_set or payload.allowed_reasoning_efforts_set:
+            effective_enforced_reasoning_effort = (
+                enforced_reasoning_effort
+                if payload.enforced_reasoning_effort_set
+                else _normalize_reasoning_effort_lenient(existing.enforced_reasoning_effort)
+            )
+            effective_allowed_reasoning_efforts = (
+                allowed_reasoning_efforts
+                if payload.allowed_reasoning_efforts_set
+                else _deserialize_allowed_reasoning_efforts(existing.allowed_reasoning_efforts)
+            )
+            _validate_reasoning_effort_policy(
+                enforced_reasoning_effort=effective_enforced_reasoning_effort,
+                allowed_reasoning_efforts=effective_allowed_reasoning_efforts,
             )
 
         limit_rows: list[ApiKeyLimit] | None = None
@@ -662,9 +729,15 @@ class ApiKeysService:
                 enforced_reasoning_effort=(
                     enforced_reasoning_effort if payload.enforced_reasoning_effort_set else _UNSET
                 ),
+                allowed_reasoning_efforts=(
+                    _serialize_allowed_reasoning_efforts(allowed_reasoning_efforts)
+                    if payload.allowed_reasoning_efforts_set
+                    else _UNSET
+                ),
                 enforced_service_tier=(enforced_service_tier if payload.enforced_service_tier_set else _UNSET),
                 traffic_class=traffic_class_update,
                 transport_policy_override=transport_policy_override_update,
+                thread_cache_identity_override=thread_cache_identity_override_update,
                 usage_sections=usage_sections,
                 account_assignment_scope_enabled=account_assignment_scope_enabled,
                 source_assignment_scope_enabled=source_assignment_scope_enabled,
@@ -683,11 +756,28 @@ class ApiKeysService:
                 await self._repository.replace_source_assignments(key_id, assigned_source_ids, commit=False)
 
             if limit_rows is not None:
-                await self._repository.upsert_limits(key_id, limit_rows, commit=False)
+                await self._repository.upsert_limits(
+                    key_id,
+                    limit_rows,
+                    commit=False,
+                    preserve_matched_usage=not payload.reset_usage,
+                )
 
             await self._repository.commit()
-        except Exception:
+        except Exception as exc:
             await self._repository.rollback()
+            if await should_retry_after_sqlite_lock(
+                exc,
+                what="update_key",
+                attempt=_retry_attempt,
+                max_attempts=_SQLITE_BUSY_RETRY_ATTEMPTS,
+                base_delay_seconds=_SQLITE_BUSY_RETRY_BASE_SECONDS,
+            ):
+                return await self.update_key(key_id, payload, _retry_attempt=_retry_attempt + 1)
+            if isinstance(exc, IntegrityError) and _is_reasoning_policy_constraint_error(exc):
+                raise ApiKeyValidationError(
+                    "enforced_reasoning_effort and allowed_reasoning_efforts cannot be configured together"
+                ) from exc
             raise
 
         if (
@@ -699,9 +789,11 @@ class ApiKeysService:
             or payload.apply_to_codex_model_set
             or payload.enforced_model_set
             or payload.enforced_reasoning_effort_set
+            or payload.allowed_reasoning_efforts_set
             or payload.enforced_service_tier_set
             or payload.traffic_class_set
             or payload.transport_policy_override_set
+            or payload.thread_cache_identity_override_set
             or payload.usage_sections_set
             or payload.expires_at_set
             or payload.is_active_set
@@ -800,7 +892,7 @@ class ApiKeysService:
         request_model: str | None,
         request_service_tier: str | None = None,
         request_usage_budget: ApiKeyRequestUsageBudget | None = None,
-    ) -> ApiKeyUsageReservationData:
+    ) -> ApiKeyUsageReservationData | None:
         for attempt in range(_SQLITE_BUSY_RETRY_ATTEMPTS):
             try:
                 return await self._enforce_limits_for_request_once(
@@ -811,9 +903,14 @@ class ApiKeysService:
                 )
             except OperationalError as exc:
                 await self._repository.rollback()
-                if not _is_sqlite_database_locked(exc) or attempt == _SQLITE_BUSY_RETRY_ATTEMPTS - 1:
+                if not await should_retry_after_sqlite_lock(
+                    exc,
+                    what="enforce_limits_for_request",
+                    attempt=attempt,
+                    max_attempts=_SQLITE_BUSY_RETRY_ATTEMPTS,
+                    base_delay_seconds=_SQLITE_BUSY_RETRY_BASE_SECONDS,
+                ):
                     raise
-                await asyncio.sleep(_SQLITE_BUSY_RETRY_BASE_SECONDS * (2**attempt))
 
         raise RuntimeError("unreachable")
 
@@ -824,18 +921,23 @@ class ApiKeysService:
         request_model: str | None,
         request_service_tier: str | None,
         request_usage_budget: ApiKeyRequestUsageBudget | None,
-    ) -> ApiKeyUsageReservationData:
+    ) -> ApiKeyUsageReservationData | None:
         now = utcnow()
         async with sqlite_writer_section():
-            row = _ensure_valid_api_key_row(await self._repository.get_by_id(key_id))
+            row = _ensure_valid_api_key_row(await self._repository.get_for_limit_enforcement(key_id))
             if row.expires_at is not None and row.expires_at < now:
                 raise ApiKeyInvalidError("API key has expired")
             limits_reset = await _lazy_reset_expired_limits(self._repository, row.limits, now=now)
-            refreshed = _ensure_valid_api_key_row(await self._repository.get_by_id(key_id)) if limits_reset else row
+            refreshed = (
+                _ensure_valid_api_key_row(await self._repository.get_for_limit_enforcement(key_id))
+                if limits_reset
+                else row
+            )
             if refreshed.expires_at is not None and refreshed.expires_at < now:
                 raise ApiKeyInvalidError("API key has expired")
 
             reservation_items: list[UsageReservationItemData] = []
+            reservation_id: str | None = None
             normalized_usage_budget = _normalize_request_usage_budget(request_usage_budget)
             try:
                 for limit in refreshed.limits:
@@ -866,17 +968,54 @@ class ApiKeysService:
                         )
                     )
 
-                reservation_id = _next_usage_reservation_id()
-                await self._repository.create_usage_reservation(
-                    reservation_id,
-                    key_id=key_id,
-                    model=request_model or "",
-                    items=reservation_items,
-                )
-                await self._repository.commit()
+                if not reservation_items:
+                    # No configured limit applies to this request, so there is
+                    # nothing to reserve and nothing to settle. Skip the empty
+                    # reservation INSERT and its full-durability commit (the
+                    # lazy expired-limit reset above commits inside
+                    # ``reset_limit`` itself, so no write is pending here).
+                    # Every downstream consumer treats a missing reservation
+                    # as "nothing to settle". Commit to close the implicit
+                    # transaction opened by the admission SELECTs: on sessions
+                    # that outlive this call (e.g. the quota-planner warmup
+                    # service) an open transaction would otherwise idle across
+                    # the upstream round-trip until the next commit. This must
+                    # be ``commit()`` rather than ``rollback()``:
+                    # ``AsyncSession.rollback()`` expires every tracked ORM
+                    # object regardless of ``expire_on_commit``, and the warmup
+                    # service shares this session with already-loaded
+                    # ``account``/``decision`` rows whose attribute access
+                    # after expiry raises ``MissingGreenlet``. ``commit()``
+                    # with ``expire_on_commit=False`` (app/db/session.py)
+                    # leaves tracked state loaded, and is semantically
+                    # equivalent here because the transaction holds only the
+                    # admission SELECTs — no reservation write ran, and every
+                    # production caller either dedicates a session to
+                    # admission (proxy paths) or commits each prior write
+                    # inside its repository methods (quota-planner), so no
+                    # unrelated dirty state can be flushed by this commit.
+                    await self._repository.commit()
+                else:
+                    reservation_id = _next_usage_reservation_id()
+                    await self._repository.create_usage_reservation(
+                        reservation_id,
+                        key_id=key_id,
+                        model=request_model or "",
+                        items=reservation_items,
+                    )
+                    await self._repository.commit()
             except Exception:
                 await self._repository.rollback()
                 raise
+
+        if reservation_id is None:
+            # Settlement is the only other production writer of
+            # ``last_used_at``; without a reservation it never runs, so record
+            # the last-used touch at admission instead. Recorded outside
+            # sqlite_writer_section() for the same reason as settlement: the
+            # shutdown write-through flush takes the writer section itself.
+            await self._last_used_coalescer.record(key_id, utcnow())
+            return None
 
         return ApiKeyUsageReservationData(
             reservation_id=reservation_id,
@@ -911,9 +1050,14 @@ class ApiKeysService:
                 return
             except OperationalError as exc:
                 await self._repository.rollback()
-                if not _is_sqlite_database_locked(exc) or attempt == _SQLITE_BUSY_RETRY_ATTEMPTS - 1:
+                if not await should_retry_after_sqlite_lock(
+                    exc,
+                    what="finalize_usage_reservation",
+                    attempt=attempt,
+                    max_attempts=_SQLITE_BUSY_RETRY_ATTEMPTS,
+                    base_delay_seconds=_SQLITE_BUSY_RETRY_BASE_SECONDS,
+                ):
                     raise
-                await asyncio.sleep(_SQLITE_BUSY_RETRY_BASE_SECONDS * (2**attempt))
 
         raise RuntimeError("unreachable")
 
@@ -941,9 +1085,14 @@ class ApiKeysService:
                 return
             except OperationalError as exc:
                 await self._repository.rollback()
-                if not _is_sqlite_database_locked(exc) or attempt == _SQLITE_BUSY_RETRY_ATTEMPTS - 1:
+                if not await should_retry_after_sqlite_lock(
+                    exc,
+                    what="fail_usage_reservation",
+                    attempt=attempt,
+                    max_attempts=_SQLITE_BUSY_RETRY_ATTEMPTS,
+                    base_delay_seconds=_SQLITE_BUSY_RETRY_BASE_SECONDS,
+                ):
                     raise
-                await asyncio.sleep(_SQLITE_BUSY_RETRY_BASE_SECONDS * (2**attempt))
 
         raise RuntimeError("unreachable")
 
@@ -1037,9 +1186,14 @@ class ApiKeysService:
                     return touched
             except OperationalError as exc:
                 await self._repository.rollback()
-                if not _is_sqlite_database_locked(exc) or attempt == _SQLITE_BUSY_RETRY_ATTEMPTS - 1:
+                if not await should_retry_after_sqlite_lock(
+                    exc,
+                    what="touch_usage_reservation",
+                    attempt=attempt,
+                    max_attempts=_SQLITE_BUSY_RETRY_ATTEMPTS,
+                    base_delay_seconds=_SQLITE_BUSY_RETRY_BASE_SECONDS,
+                ):
                     raise
-                await asyncio.sleep(_SQLITE_BUSY_RETRY_BASE_SECONDS * (2**attempt))
 
         raise RuntimeError("unreachable")
 
@@ -1050,9 +1204,14 @@ class ApiKeysService:
                 return
             except OperationalError as exc:
                 await self._repository.rollback()
-                if not _is_sqlite_database_locked(exc) or attempt == _SQLITE_BUSY_RETRY_ATTEMPTS - 1:
+                if not await should_retry_after_sqlite_lock(
+                    exc,
+                    what="release_usage_reservation",
+                    attempt=attempt,
+                    max_attempts=_SQLITE_BUSY_RETRY_ATTEMPTS,
+                    base_delay_seconds=_SQLITE_BUSY_RETRY_BASE_SECONDS,
+                ):
                     raise
-                await asyncio.sleep(_SQLITE_BUSY_RETRY_BASE_SECONDS * (2**attempt))
 
         raise RuntimeError("unreachable")
 
@@ -1279,7 +1438,7 @@ def _get_usage_sections_with_default(row: ApiKey) -> str:
 
 
 def _generate_plain_key() -> str:
-    return f"sk-clb-{secrets.token_urlsafe(32)}"
+    return f"sk-clb-{secrets.token_hex(24)}"
 
 
 def _hash_key(plain_key: str) -> str:
@@ -1292,6 +1451,12 @@ def _serialize_allowed_models(allowed_models: list[str] | None) -> str | None:
     return json.dumps(allowed_models)
 
 
+def _serialize_allowed_reasoning_efforts(allowed_reasoning_efforts: list[str] | None) -> str | None:
+    if allowed_reasoning_efforts is None:
+        return None
+    return json.dumps(allowed_reasoning_efforts)
+
+
 def _deserialize_allowed_models(payload: str | None) -> list[str] | None:
     if payload is None:
         return None
@@ -1300,6 +1465,22 @@ def _deserialize_allowed_models(payload: str | None) -> list[str] | None:
         return None
     models = [value.strip() for value in parsed if isinstance(value, str) and value.strip()]
     return models
+
+
+def _deserialize_allowed_reasoning_efforts(payload: str | None) -> list[str] | None:
+    if payload is None:
+        return None
+    try:
+        parsed = json.loads(payload)
+        if not isinstance(parsed, list):
+            return []
+        return _normalize_allowed_reasoning_efforts(parsed)
+    except (ApiKeyValidationError, TypeError, json.JSONDecodeError):
+        return []
+
+
+def _is_reasoning_policy_constraint_error(exc: IntegrityError) -> bool:
+    return _REASONING_POLICY_EXCLUSIVE_CONSTRAINT in str(exc).lower()
 
 
 def _normalize_allowed_models(allowed_models: list[str] | None) -> list[str] | None:
@@ -1345,8 +1526,10 @@ def _normalize_model_slug(value: str | None) -> str | None:
     return normalized
 
 
-_SUPPORTED_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
-_SUPPORTED_SERVICE_TIERS = frozenset({"auto", "default", "priority", "flex"})
+_REASONING_EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+_SUPPORTED_REASONING_EFFORTS = frozenset({"none", *_REASONING_EFFORT_ORDER})
+_SUPPORTED_SELECTABLE_REASONING_EFFORTS = frozenset(_REASONING_EFFORT_ORDER)
+_SUPPORTED_SERVICE_TIERS = frozenset({"auto", "default", "priority", "flex", "ultrafast"})
 
 
 def _normalize_expires_at(value: datetime | None) -> datetime | None:
@@ -1376,6 +1559,25 @@ def _normalize_reasoning_effort_lenient(value: str | None) -> str | None:
     if normalized in _SUPPORTED_REASONING_EFFORTS:
         return normalized
     return None
+
+
+def _normalize_allowed_reasoning_efforts(values: list[str] | None) -> list[str] | None:
+    if values is None:
+        return None
+
+    normalized: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ApiKeyValidationError("Allowed reasoning efforts must be strings")
+        effort = value.strip().lower()
+        if effort not in _SUPPORTED_SELECTABLE_REASONING_EFFORTS:
+            options = ", ".join(_REASONING_EFFORT_ORDER)
+            raise ApiKeyValidationError(f"Unsupported allowed reasoning effort '{effort}'. Expected one of: {options}")
+        normalized.add(effort)
+
+    if not normalized:
+        raise ApiKeyValidationError("Allowed reasoning efforts must not be empty")
+    return [effort for effort in _REASONING_EFFORT_ORDER if effort in normalized]
 
 
 def _normalize_service_tier(value: str | None) -> str | None:
@@ -1420,6 +1622,24 @@ def _normalize_traffic_class_lenient(value: str | None) -> str:
     return TRAFFIC_CLASS_FOREGROUND
 
 
+def _normalize_thread_cache_identity_override(value: str | None) -> str | None:
+    """Strict (write path): an unknown value is a 400, not a silent fallback."""
+    if value is None:
+        return None
+    normalized = normalize_thread_cache_identity_mode(value)
+    if normalized is not None:
+        return normalized
+    options = ", ".join(sorted(THREAD_CACHE_IDENTITY_MODES))
+    raise ApiKeyValidationError(
+        f"Unsupported thread cache identity override '{value.strip().lower()}'. Expected one of: {options}"
+    )
+
+
+def _normalize_thread_cache_identity_override_lenient(value: str | None) -> str | None:
+    """Read path: a stale or hand-edited value reads as "no override" rather than a 500."""
+    return normalize_thread_cache_identity_mode(value)
+
+
 def _normalize_transport_policy_override(value: str | None) -> str | None:
     if value is None:
         return None
@@ -1445,6 +1665,17 @@ def _validate_model_enforcement(*, enforced_model: str | None, allowed_models: l
     if enforced_model not in allowed_models:
         raise ApiKeyValidationError(
             "enforced_model must be present in allowed_models when allowed_models is configured"
+        )
+
+
+def _validate_reasoning_effort_policy(
+    *,
+    enforced_reasoning_effort: str | None,
+    allowed_reasoning_efforts: list[str] | None,
+) -> None:
+    if enforced_reasoning_effort is not None and allowed_reasoning_efforts is not None:
+        raise ApiKeyValidationError(
+            "enforced_reasoning_effort and allowed_reasoning_efforts cannot be configured together"
         )
 
 
@@ -1639,9 +1870,11 @@ def _to_created_data(data: ApiKeyData, key: str) -> ApiKeyCreatedData:
         apply_to_codex_model=data.apply_to_codex_model,
         enforced_model=data.enforced_model,
         enforced_reasoning_effort=data.enforced_reasoning_effort,
+        allowed_reasoning_efforts=data.allowed_reasoning_efforts,
         enforced_service_tier=data.enforced_service_tier,
         traffic_class=data.traffic_class,
         transport_policy_override=data.transport_policy_override,
+        thread_cache_identity_override=data.thread_cache_identity_override,
         usage_sections=data.usage_sections,
         expires_at=data.expires_at,
         is_active=data.is_active,
@@ -1674,10 +1907,16 @@ def _to_api_key_data(
         apply_to_codex_model=getattr(row, "apply_to_codex_model", False),
         enforced_model=_normalize_model_slug(row.enforced_model),
         enforced_reasoning_effort=_normalize_reasoning_effort_lenient(row.enforced_reasoning_effort),
+        allowed_reasoning_efforts=_deserialize_allowed_reasoning_efforts(
+            getattr(row, "allowed_reasoning_efforts", None)
+        ),
         enforced_service_tier=_normalize_service_tier_lenient(row.enforced_service_tier),
         traffic_class=_normalize_traffic_class_lenient(getattr(row, "traffic_class", TRAFFIC_CLASS_FOREGROUND)),
         transport_policy_override=_normalize_transport_policy_override_lenient(
             getattr(row, "transport_policy_override", None)
+        ),
+        thread_cache_identity_override=_normalize_thread_cache_identity_override_lenient(
+            getattr(row, "thread_cache_identity_override", None)
         ),
         usage_sections=_get_usage_sections_with_default(row),
         expires_at=row.expires_at,
@@ -1848,15 +2087,6 @@ def _calculate_cost_microdollars(
     if cost_usd is None:
         return 0
     return int(cost_usd * 1_000_000)
-
-
-def _is_sqlite_database_locked(exc: OperationalError) -> bool:
-    message = str(exc).lower()
-    return (
-        "database is locked" in message
-        or "database table is locked" in message
-        or "database schema is locked" in message
-    )
 
 
 def _build_api_key_trends(

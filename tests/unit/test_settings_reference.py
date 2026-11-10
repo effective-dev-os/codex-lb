@@ -12,6 +12,7 @@ Guards three contracts:
 from __future__ import annotations
 
 import os
+import tomllib
 from pathlib import Path
 from typing import Any, cast
 from unittest import mock
@@ -41,22 +42,14 @@ pytestmark = pytest.mark.unit
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
 
-# Ratchet on the settings surface (issue #1340, PRINCIPLES.md P2). Lower this
-# number when fields are removed; never raise it without a simplicity-budget
+# Ratchet on the settings surface (issue #1340, PRINCIPLES.md P2). The number
+# lives in .github/simplicity-budgets.toml [settings_fields] (single source,
+# also enforced by scripts/check_settings_tiers.py under `make lint`); lower it
+# when fields are removed, never raise it without a simplicity-budget
 # discussion — every new CODEX_LB_* setting needs a why-not-a-default
 # justification per CONTRIBUTING.md's simplicity gates.
-# 115 -> 116: http_responses_session_bridge_clean_close_retry_jitter_max_seconds
-# (http-bridge clean-close recovery, #1394).
-# 116 -> 117: proxy_api_key_fair_share_congestion_threshold_pct (fair-share
-# gate, issue #1535). Not a hardcoded default because the right congestion
-# threshold depends on pool size and workload mix, and 0-means-off is the P1
-# default-off switch; the companion min-guarantee constant stayed hardcoded.
-# 117 -> 126: durable HTTP bridge continuity controls (operation ledger,
-# ambiguous-continuation recovery, and best-effort transcript spool, #1657).
-# These remain operator-selectable because deployments differ in recovery
-# safety policy and available persistence/latency budgets; their conservative
-# defaults preserve fail-closed behavior and bound background write work.
-MAX_SETTINGS_FIELDS = 126
+BUDGETS_PATH = REPO_ROOT / ".github" / "simplicity-budgets.toml"
+MAX_SETTINGS_FIELDS = int(tomllib.loads(BUDGETS_PATH.read_text(encoding="utf-8"))["settings_fields"]["max"])
 
 
 def test_generated_settings_reference_matches_code() -> None:
@@ -77,7 +70,7 @@ def test_settings_surface_ratchet() -> None:
     assert len(Settings.model_fields) <= MAX_SETTINGS_FIELDS, (
         f"Settings grew to {len(Settings.model_fields)} fields (ratchet: {MAX_SETTINGS_FIELDS}). "
         "New settings need a simplicity-budget discussion (PRINCIPLES.md P2, issue #1340); "
-        "lower MAX_SETTINGS_FIELDS when fields are removed."
+        "lower [settings_fields].max in .github/simplicity-budgets.toml when fields are removed."
     )
 
 

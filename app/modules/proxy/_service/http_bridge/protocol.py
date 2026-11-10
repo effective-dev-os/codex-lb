@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from typing import Any, Protocol
 
 from app.core.clients.proxy import ProxyResponseError
+from app.core.clock import Clock, Scheduler
 from app.core.openai.requests import ResponsesRequest
 from app.db.models import Account
-from app.modules.proxy._service.support import _HTTPBridgeSession, _HTTPBridgeSessionKey
+from app.modules.proxy._service.support import _HTTPBridgeSession, _HTTPBridgeSessionKey, _WebSocketRequestState
 from app.modules.proxy.durable_bridge_repository import DurableBridgeAliasRegistrationReceipt
 from app.modules.proxy.load_balancer import AccountSelection
 
@@ -14,6 +16,9 @@ from app.modules.proxy.load_balancer import AccountSelection
 class _HTTPBridgeServiceProtocol(Protocol):
     _repo_factory: Any
     _encryptor: Any
+    _clock: Clock
+    _scheduler: Scheduler
+    _remaining_budget_seconds: Any
     _load_balancer: Any
     _http_client: Any
     _ring_membership: Any
@@ -21,6 +26,9 @@ class _HTTPBridgeServiceProtocol(Protocol):
     _durable_bridge_coordinator: Any
     _http_bridge_owner_client: Any
     _http_bridge_sessions: Any
+    _http_bridge_detached_sessions: Any
+    _http_bridge_denied_anchor_fences: Any
+    _http_bridge_denied_anchor_fence_generation: int
     _http_bridge_inflight_sessions: Any
     _http_bridge_turn_state_index: Any
     _http_bridge_previous_response_index: Any
@@ -29,6 +37,7 @@ class _HTTPBridgeServiceProtocol(Protocol):
     _pending_lock: Any
     _inflight_session_creates: Any
     _background_cleanup_tasks: Any
+    _http_bridge_background_cleanup_failed: bool
     _http_bridge_draining: bool
     _http_bridge_lock: Any
     _work_admission: Any
@@ -43,12 +52,48 @@ class _HTTPBridgeServiceProtocol(Protocol):
     async def _resolve_file_account_for_responses(
         self, payload: ResponsesRequest, headers: Mapping[str, str]
     ) -> str | None: ...
+    async def _resolve_forwarded_file_account_for_responses(
+        self,
+        payload: ResponsesRequest,
+        headers: Mapping[str, str],
+        *,
+        forwarded_file_owner_account_id: str | None,
+        require_forwarded_file_owner: bool = False,
+    ) -> str | None: ...
     async def _fail_pending_websocket_requests(self, *args: Any, **kwargs: Any) -> bool: ...
     async def _finalize_websocket_request_state(self, *args: Any, **kwargs: Any) -> None: ...
     async def _next_websocket_receive_timeout(self, *args: Any, **kwargs: Any) -> Any: ...
+    async def close_all_http_bridge_sessions(self) -> bool: ...
     async def _close_http_bridge_session_bounded(self, session: _HTTPBridgeSession, *, reason: str) -> None: ...
+    async def _close_http_bridge_session(self, session: _HTTPBridgeSession) -> None: ...
+    async def _drain_http_bridge_background_cleanup_tasks(self, *, reason: str) -> bool: ...
+    async def _fail_http_bridge_inflight_session_creation(
+        self,
+        key: _HTTPBridgeSessionKey,
+        inflight_future: asyncio.Future[_HTTPBridgeSession] | None,
+        exc: BaseException,
+    ) -> bool: ...
+    async def _retire_http_bridge_after_drain_if_ready(
+        self,
+        session: _HTTPBridgeSession,
+        *,
+        lock_wait_timeout_seconds: float | None = None,
+    ) -> bool: ...
+    async def _release_http_bridge_admission_preregistration(
+        self,
+        session: _HTTPBridgeSession,
+        *,
+        request_state: _WebSocketRequestState,
+    ) -> bool: ...
+    async def _retire_idle_http_bridge_session_on_cooldown_suppression(
+        self,
+        session: _HTTPBridgeSession,
+        *,
+        owned_unanchored_handoff: bool,
+    ) -> bool: ...
     async def _refresh_durable_http_bridge_session(self, session: _HTTPBridgeSession) -> None: ...
     def _http_bridge_pending_count_nowait(self, session: _HTTPBridgeSession, *, context: str) -> int | None: ...
+    async def abandon_stale_http_bridge_operations(self) -> int: ...
     def _detach_http_bridge_session_locked(
         self,
         key: _HTTPBridgeSessionKey,
@@ -56,8 +101,16 @@ class _HTTPBridgeServiceProtocol(Protocol):
         expected_session: _HTTPBridgeSession | None = None,
         mark_closed: bool = True,
     ) -> _HTTPBridgeSession | None: ...
+    def _take_all_http_bridge_sessions_locked(
+        self,
+    ) -> tuple[list[_HTTPBridgeSession], list[asyncio.Future[_HTTPBridgeSession]]]: ...
     def _unregister_http_bridge_turn_states_locked(self, session: _HTTPBridgeSession) -> None: ...
     def _unregister_http_bridge_previous_response_ids_locked(self, session: _HTTPBridgeSession) -> None: ...
+    def _unregister_http_bridge_previous_response_id_locked(
+        self,
+        session: _HTTPBridgeSession,
+        response_id: str,
+    ) -> None: ...
     async def _register_http_bridge_turn_state_impl(
         self,
         session: _HTTPBridgeSession,
@@ -78,6 +131,14 @@ class _HTTPBridgeServiceProtocol(Protocol):
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
+    ) -> bool: ...
+    async def _unregister_http_bridge_previous_response_id(
+        self,
+        session: _HTTPBridgeSession,
+        response_id: str,
+        *,
+        expected_durable_session_id: str | None = None,
+        expected_durable_owner_epoch: int | None = None,
     ) -> bool: ...
     def _schedule_http_bridge_session_closes(
         self,

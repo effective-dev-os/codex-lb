@@ -6,7 +6,16 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    SerializeAsAny,
+    SkipValidation,
+    field_validator,
+    model_validator,
+)
 
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.tool_call_safety import is_downstream_side_effect_tool_call_item
@@ -14,6 +23,26 @@ from app.core.types import JsonObject, JsonValue
 from app.core.utils.json_guards import is_json_list, is_json_mapping
 
 type MutableJsonObject = dict[str, JsonValue]
+
+# Passthrough request fields (``input``, ``tools``, ``messages``, ``schema``)
+# arrive from ``json.loads`` and are forwarded upstream as-is, so validating
+# every node against the recursive ``JsonValue`` union only burns CPU (a
+# Python-level ``Mapping`` ABC ``isinstance`` per dict node) and copies the
+# tree. ``SkipValidation`` keeps the client's objects; ``SerializeAsAny``
+# (inner) serializes them by runtime type instead of through a wrap
+# serializer, which keeps ``model_dump(mode="json")`` byte-identical and
+# faster. Field validators still run, so shape checks live there. The
+# subscript form expands to ``Annotated[T, SerializeAsAny(), SkipValidation()]``
+# (``SerializeAsAny`` inner, ``SkipValidation`` outermost) and type-checks as ``T``.
+type PassthroughJsonValue = SkipValidation[SerializeAsAny[JsonValue]]
+type PassthroughJsonList = SkipValidation[SerializeAsAny[list[JsonValue]]]
+
+# pydantic-core's serializer refuses container nesting deeper than ~250 levels
+# (a 500 from ``model_dump`` long after validation); deep validation used to
+# reject such bodies first (``recursion_loop`` -> 400), so the passthrough
+# validators keep that contract with an explicit, cheaper depth check.
+PASSTHROUGH_MAX_DEPTH = 200
+_JSON_CONTAINER_TYPES = (dict, list)
 
 _RESPONSES_INCLUDE_ALLOWLIST = {
     "code_interpreter_call.outputs",
@@ -42,13 +71,21 @@ _INTERLEAVED_REASONING_PART_TYPES = frozenset({"reasoning", "reasoning_content",
 _ASSISTANT_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _TOOL_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text", "refusal"})
 _COMPACT_STATE_TOOL_NAMES = frozenset({"create_goal", "get_goal", "update_goal", "update_plan"})
-_TOOL_CALL_ITEM_TYPES = frozenset({"function_call", "custom_tool_call", "apply_patch_call"})
-_COMPACT_TOOL_CALL_OUTPUT_ITEM_TYPES = frozenset(
-    {"function_call_output", "custom_tool_call_output", "apply_patch_call_output"}
-)
-_EXPLICIT_PROMPT_CACHE_CONTENT_TYPES = frozenset({"input_text", "input_image", "input_file"})
+# A call_id can be reused by different item protocols. Compact pairing must
+# therefore keep each protocol's occurrence stream separate.
+_COMPACT_TOOL_CALL_TYPE_BY_OUTPUT_TYPE: dict[str, str] = {
+    "function_call_output": "function_call",
+    "custom_tool_call_output": "custom_tool_call",
+    "apply_patch_call_output": "apply_patch_call",
+}
+_COMPACT_TOOL_CALL_ITEM_TYPES = frozenset(_COMPACT_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.values())
+_COMPACT_TOOL_CALL_OUTPUT_ITEM_TYPES = frozenset(_COMPACT_TOOL_CALL_TYPE_BY_OUTPUT_TYPE)
+_COMPACT_SIDE_EFFECT_TOOL_ITEM_TYPES = frozenset({"apply_patch_call", "apply_patch_call_output"})
+_TOOL_CALL_ITEM_TYPES = frozenset(_COMPACT_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.values())
+_COMPACT_INLINE_IMAGE_DATA_URL_RE = re.compile(r"""data:image/[^,\s]+,[^\s"'<>]+""")
 _GOAL_CONTINUATION_CONTEXT_PREFIX = '<codex_internal_context source="goal">'
 _PLAN_MODE_CONTEXT_PREFIX = "<collaboration_mode># Plan Mode"
+_EXPLICIT_PROMPT_CACHE_CONTENT_TYPES = frozenset({"input_text", "input_image", "input_file"})
 
 
 def _json_mapping_or_none(value: JsonValue) -> Mapping[str, JsonValue] | None:
@@ -81,7 +118,29 @@ def normalize_tool_choice(choice: JsonValue | None) -> JsonValue | None:
     return choice
 
 
+def validate_passthrough_depth(value: object, *, limit: int = PASSTHROUGH_MAX_DEPTH) -> None:
+    """Reject JSON nested deeper than ``limit`` container levels (iterative walk over
+    ``dict``/``list`` nodes; ``isinstance`` because the WebSocket parser yields ``dict`` subclasses)."""
+    if not isinstance(value, _JSON_CONTAINER_TYPES):
+        return
+    frontier: list[object] = [value]
+    depth = 0
+    while frontier:
+        depth += 1
+        if depth > limit:
+            raise ValueError(f"nesting exceeds {limit} levels")
+        next_frontier: list[object] = []
+        for node in frontier:
+            children: Iterable[object] = node.values() if isinstance(node, dict) else cast(list[object], node)
+            next_frontier.extend([child for child in children if isinstance(child, _JSON_CONTAINER_TYPES)])
+        frontier = next_frontier
+
+
 def validate_tool_types(tools: list[JsonValue], *, allow_builtin_tools: bool = False) -> list[JsonValue]:
+    # ``tools`` skips pydantic's ``list`` validation, so the array check that
+    # used to yield ``list_type`` lives here (same ``param``: ``tools``).
+    if not isinstance(tools, list):
+        raise ValueError("tools must be an array")
     normalized_tools: list[JsonValue] = []
     for tool in tools:
         if not is_json_mapping(tool):
@@ -99,28 +158,6 @@ def validate_tool_types(tools: list[JsonValue], *, allow_builtin_tools: bool = F
                 raise ValueError(f"Unsupported tool type: {tool_type}")
         normalized_tools.append(tool)
     return normalized_tools
-
-
-def _has_input_file_id(input_items: list[JsonValue]) -> bool:
-    for item in input_items:
-        if not is_json_mapping(item):
-            continue
-        item_mapping = item
-        if _is_input_file_with_id(item_mapping):
-            return True
-        content = item_mapping.get("content")
-        if is_json_list(content):
-            parts = content
-        elif is_json_mapping(content):
-            parts = [content]
-        else:
-            parts = []
-        for part in parts:
-            if not is_json_mapping(part):
-                continue
-            if _is_input_file_with_id(part):
-                return True
-    return False
 
 
 def _is_input_file_with_id(item: Mapping[str, JsonValue]) -> bool:
@@ -404,11 +441,6 @@ def _split_responses_instruction_item_content(item: Mapping[str, JsonValue]) -> 
     return "", content
 
 
-def _responses_instruction_item_text(item: Mapping[str, JsonValue]) -> str:
-    instruction_text, _ = _split_responses_instruction_item_content(item)
-    return instruction_text
-
-
 def _responses_instruction_content_text(content: JsonValue) -> str | None:
     if isinstance(content, str):
         return content
@@ -591,8 +623,14 @@ class ResponsesTextFormat(BaseModel):
 
     type: str | None = None
     strict: bool | None = None
-    schema_: JsonValue | None = Field(default=None, alias="schema")
+    schema_: PassthroughJsonValue = Field(default=None, alias="schema")
     name: str | None = None
+
+    @field_validator("schema_")
+    @classmethod
+    def _validate_schema_depth(cls, value: JsonValue) -> JsonValue:
+        validate_passthrough_depth(value)
+        return value
 
 
 class ResponsesTextControls(BaseModel):
@@ -604,6 +642,8 @@ class ResponsesTextControls(BaseModel):
 
 class ResponsesRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
+    _codex_lb_client_reasoning_effort: str | None = PrivateAttr(default=None)
+    _codex_lb_provider_reasoning_effort_materialized: bool = PrivateAttr(default=False)
 
     @model_validator(mode="before")
     @classmethod
@@ -612,8 +652,8 @@ class ResponsesRequest(BaseModel):
 
     model: str = Field(min_length=1)
     instructions: str
-    input: JsonValue
-    tools: list[JsonValue] = Field(default_factory=list)
+    input: PassthroughJsonValue
+    tools: PassthroughJsonList = Field(default_factory=list)
     tool_choice: str | JsonObject | None = None
     parallel_tool_calls: bool | None = None
     reasoning: ResponsesReasoning | None = None
@@ -639,8 +679,8 @@ class ResponsesRequest(BaseModel):
             normalized = _normalize_input_text(value)
             return _sanitize_input_items(normalized)
         if is_json_list(value):
-            input_items = value
-            return _sanitize_input_items(input_items)
+            validate_passthrough_depth(value)
+            return _sanitize_input_items(value)
         raise ValueError("input must be a string or array")
 
     @field_validator("include")
@@ -676,7 +716,9 @@ class ResponsesRequest(BaseModel):
     @field_validator("tools")
     @classmethod
     def _validate_tools(cls, value: list[JsonValue]) -> list[JsonValue]:
-        return validate_tool_types(value, allow_builtin_tools=True)
+        validated = validate_tool_types(value, allow_builtin_tools=True)
+        validate_passthrough_depth(validated)
+        return validated
 
     @field_validator("tool_choice")
     @classmethod
@@ -723,17 +765,17 @@ class ResponsesRequest(BaseModel):
         return payload
 
     def to_payload(self) -> JsonObject:
-        return _strip_unsupported_fields(self.model_dump_for_forwarding())
+        payload = _strip_unsupported_fields(self.model_dump_for_forwarding())
+        _normalize_compaction_trigger_singleton(payload)
+        return payload
 
     def to_replay_safety_payload(self) -> JsonObject:
-        return _strip_unsupported_fields(
-            self.model_dump_for_forwarding(),
-            strip_replayed_tool_call_namespaces=False,
-        )
+        return _strip_unsupported_fields(self.model_dump_for_forwarding(), strip_replayed_tool_call_namespaces=False)
 
 
 class ResponsesCompactRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
+    _codex_lb_client_reasoning_effort: str | None = PrivateAttr(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -742,7 +784,7 @@ class ResponsesCompactRequest(BaseModel):
 
     model: str = Field(min_length=1)
     instructions: str
-    input: JsonValue
+    input: PassthroughJsonValue
     reasoning: ResponsesReasoning | None = None
     store: bool = False
     service_tier: str | None = None
@@ -757,8 +799,8 @@ class ResponsesCompactRequest(BaseModel):
             normalized = _normalize_input_text(value)
             return _sanitize_input_items(normalized)
         if is_json_list(value):
-            input_items = value
-            return _sanitize_input_items(input_items)
+            validate_passthrough_depth(value)
+            return _sanitize_input_items(value)
         raise ValueError("input must be a string or array")
 
     @model_validator(mode="before")
@@ -794,41 +836,8 @@ _UNSUPPORTED_UPSTREAM_FIELDS = {
     "user",
 }
 
-_POISONED_LOCAL_COMPACT_FALLBACK_TEXT = "Local compact fallback preserved the latest encrypted reasoning state."
-_MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS = 100_000
-_COMPACT_UPSTREAM_HEAD_ESTIMATED_TOKENS = 12_000
-_ESTIMATED_CHARS_PER_TOKEN = 4
-_COMPACT_OMITTED_INLINE_IMAGE_TEXT = (
-    "[compact trim] Omitted inline image bytes that were already observed before compaction"
-)
-_COMPACT_INLINE_IMAGE_DATA_URL_RE = re.compile(r"""data:image/[^,\s]+,[^\s"'<>]+""")
-
-
-def _strip_unsupported_fields(
-    payload: MutableJsonObject,
-    *,
-    strip_replayed_tool_call_namespaces: bool = True,
-) -> MutableJsonObject:
-    _normalize_openai_compatible_aliases(payload)
-    _normalize_service_tier_aliases(payload)
-    _strip_subscription_prompt_cache_controls(payload)
-    _sanitize_interleaved_reasoning_input(payload)
-    _strip_poisoned_local_compact_fallback_items(payload)
-    if strip_replayed_tool_call_namespaces:
-        strip_replayed_tool_call_namespaces_from_payload(payload)
-    # ``tools`` is deliberately NOT canonicalized here: the wire payload must
-    # forward client tool entries byte-preserved (array order, key order, and
-    # unknown keys untouched) so reserved model tools survive upstream
-    # byte/structural-equality checks. Order-insensitive canonicalization is
-    # cache-affinity/observability-only; see ``canonicalized_tools``.
-    for key in _UNSUPPORTED_UPSTREAM_FIELDS:
-        payload.pop(key, None)
-    return payload
-
 
 def responses_request_has_explicit_prompt_cache_controls(payload: ResponsesRequest) -> bool:
-    """Whether a request asks for public-API explicit prompt caching."""
-
     extra = payload.model_extra
     if isinstance(extra, dict) and "prompt_cache_options" in extra:
         return True
@@ -851,12 +860,6 @@ def _contains_explicit_prompt_cache_breakpoint(value: JsonValue) -> bool:
 
 
 def _strip_subscription_prompt_cache_controls(payload: MutableJsonObject) -> None:
-    """Remove controls rejected by the Codex subscription upstream.
-
-    OpenAI-compatible model sources use ``model_dump_for_forwarding`` and do
-    not pass through this subscription-only serializer.
-    """
-
     payload.pop("prompt_cache_options", None)
     _strip_subscription_prompt_cache_breakpoints(payload.get("input"))
 
@@ -879,25 +882,53 @@ def strip_replayed_tool_call_namespaces_from_payload(payload: MutableJsonObject)
     input_value = payload.get("input")
     if not is_json_list(input_value):
         return
-
     normalized_items: list[JsonValue] = []
     changed = False
     for item in input_value:
         if not is_json_mapping(item):
             normalized_items.append(item)
             continue
-        item_mapping = item
-        item_type = item_mapping.get("type")
-        if isinstance(item_type, str) and item_type in _TOOL_CALL_ITEM_TYPES and "namespace" in item_mapping:
-            normalized_item = dict(item_mapping)
+        item_type = item.get("type")
+        if isinstance(item_type, str) and item_type in _TOOL_CALL_ITEM_TYPES and "namespace" in item:
+            normalized_item = dict(item)
             normalized_item.pop("namespace")
             normalized_items.append(normalized_item)
             changed = True
-            continue
-        normalized_items.append(item)
-
+        else:
+            normalized_items.append(item)
     if changed:
         payload["input"] = normalized_items
+
+
+_POISONED_LOCAL_COMPACT_FALLBACK_TEXT = "Local compact fallback preserved the latest encrypted reasoning state."
+_MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS = 100_000
+_COMPACT_UPSTREAM_HEAD_ESTIMATED_TOKENS = 12_000
+_ESTIMATED_CHARS_PER_TOKEN = 4
+_COMPACT_OMITTED_INLINE_IMAGE_TEXT = (
+    "[compact trim] Omitted inline image bytes that were already observed before compaction"
+)
+
+
+def _strip_unsupported_fields(
+    payload: MutableJsonObject,
+    *,
+    strip_replayed_tool_call_namespaces: bool = True,
+) -> MutableJsonObject:
+    _normalize_openai_compatible_aliases(payload)
+    _normalize_service_tier_aliases(payload)
+    _strip_subscription_prompt_cache_controls(payload)
+    _sanitize_interleaved_reasoning_input(payload)
+    _strip_poisoned_local_compact_fallback_items(payload)
+    if strip_replayed_tool_call_namespaces:
+        strip_replayed_tool_call_namespaces_from_payload(payload)
+    # ``tools`` is deliberately NOT canonicalized here: the wire payload must
+    # forward client tool entries byte-preserved (array order, key order, and
+    # unknown keys untouched) so reserved model tools survive upstream
+    # byte/structural-equality checks. Order-insensitive canonicalization is
+    # cache-affinity/observability-only; see ``canonicalized_tools``.
+    for key in _UNSUPPORTED_UPSTREAM_FIELDS:
+        payload.pop(key, None)
+    return payload
 
 
 def _strip_poisoned_local_compact_fallback_items(payload: MutableJsonObject) -> None:
@@ -989,6 +1020,7 @@ def _strip_compact_unsupported_fields(payload: MutableJsonObject) -> MutableJson
     if is_json_mapping(normalized_payload):
         payload = dict(normalized_payload)
     _trim_compact_input_for_upstream(payload)
+    _normalize_compaction_trigger_singleton(payload)
     payload.pop("store", None)
     payload.pop("text", None)
     payload.pop("tools", None)
@@ -996,6 +1028,21 @@ def _strip_compact_unsupported_fields(payload: MutableJsonObject) -> MutableJson
     payload.pop("client_metadata", None)
     payload["parallel_tool_calls"] = False
     return payload
+
+
+def _normalize_compaction_trigger_singleton(payload: MutableJsonObject) -> None:
+    input_value = payload.get("input")
+    if not is_json_list(input_value) or not input_value:
+        return
+
+    trigger_items = [item for item in input_value if is_json_mapping(item) and item.get("type") == "compaction_trigger"]
+    if not trigger_items:
+        return
+
+    payload["input"] = [
+        item for item in input_value if not (is_json_mapping(item) and item.get("type") == "compaction_trigger")
+    ]
+    cast(list[JsonValue], payload["input"]).append({"type": "compaction_trigger"})
 
 
 def _trim_compact_input_for_upstream(payload: MutableJsonObject) -> None:
@@ -1006,13 +1053,25 @@ def _trim_compact_input_for_upstream(payload: MutableJsonObject) -> None:
     if total_tokens <= _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS:
         return
 
-    losslessly_trimmed_input = _compact_losslessly_trim_input(input_value)
+    has_continuity_anchor = _compact_has_continuity_anchor(payload)
+    losslessly_trimmed_input = _compact_losslessly_trim_input(
+        input_value,
+        has_continuity_anchor=has_continuity_anchor,
+    )
     if losslessly_trimmed_input is not None:
         payload["input"] = losslessly_trimmed_input
         return
 
     token_counts = [_estimated_json_array_item_tokens(item) for item in input_value]
-    required_indices = _compact_required_indices(input_value, token_counts)
+    required_indices = _compact_required_indices(
+        input_value,
+        token_counts,
+        has_continuity_anchor=has_continuity_anchor,
+    )
+    required_input = _compact_trimmed_input_with_markers(input_value, token_counts, required_indices)
+    if _estimated_json_tokens(required_input) <= _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS:
+        payload["input"] = required_input
+        return
     rewritten_input, images_elided = _compact_elide_required_tool_output_images(
         input_value,
         required_indices=required_indices,
@@ -1022,7 +1081,10 @@ def _trim_compact_input_for_upstream(payload: MutableJsonObject) -> None:
         payload["input"] = input_value
         if _estimated_json_tokens(input_value) <= _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS:
             return
-        losslessly_trimmed_input = _compact_losslessly_trim_input(input_value)
+        losslessly_trimmed_input = _compact_losslessly_trim_input(
+            input_value,
+            has_continuity_anchor=has_continuity_anchor,
+        )
         if losslessly_trimmed_input is not None:
             payload["input"] = losslessly_trimmed_input
             return
@@ -1033,7 +1095,11 @@ def _trim_compact_input_for_upstream(payload: MutableJsonObject) -> None:
     )
 
 
-def _compact_losslessly_trim_input(input_value: list[JsonValue]) -> list[JsonValue] | None:
+def _compact_losslessly_trim_input(
+    input_value: list[JsonValue],
+    *,
+    has_continuity_anchor: bool = False,
+) -> list[JsonValue] | None:
     """Return a budget-fitting context selection without changing any retained bytes."""
 
     token_counts = [_estimated_json_array_item_tokens(item) for item in input_value]
@@ -1054,7 +1120,12 @@ def _compact_losslessly_trim_input(input_value: list[JsonValue]) -> list[JsonVal
         token_counts=token_counts,
         token_budget=sum(token_counts),
     )
-    required_indices = _compact_required_indices(input_value, token_counts, preserved_indices=state_anchor_indices)
+    required_indices = _compact_required_indices(
+        input_value,
+        token_counts,
+        preserved_indices=state_anchor_indices,
+        has_continuity_anchor=has_continuity_anchor,
+    )
     if required_indices & unusable_side_effect_indices:
         raise ClientPayloadError(
             "Compact input cannot retain a required side-effect call without a usable call_id.",
@@ -1086,6 +1157,12 @@ def _compact_losslessly_trim_input(input_value: list[JsonValue]) -> list[JsonVal
         )
     )
     selected_indices.update(required_indices)
+    if has_continuity_anchor:
+        _compact_discard_consumed_continuity_output_pairs(
+            input_value,
+            selected_indices=selected_indices,
+            required_indices=required_indices,
+        )
     selected_indices.difference_update(unusable_side_effect_indices)
     selected_indices = _compact_reconciled_tool_call_indices(
         input_value,
@@ -1117,18 +1194,213 @@ def _compact_required_indices(
     token_counts: list[int],
     *,
     preserved_indices: set[int] | None = None,
+    has_continuity_anchor: bool = False,
 ) -> set[int]:
     if preserved_indices is None:
         preserved_indices = _compact_state_anchor_indices(input_value)
-    required_indices = set(preserved_indices)
-    if input_value:
-        required_indices.add(len(input_value) - 1)
-    return _compact_reconciled_tool_call_indices(
+    required_indices = _compact_reconciled_tool_call_indices(
         input_value,
-        required_indices,
+        preserved_indices,
         token_counts=token_counts,
         token_budget=sum(token_counts),
-        required_indices=required_indices,
+        required_indices=preserved_indices,
+    )
+    terminal_indices, terminal_is_required, reconcile_terminal_pairs = _compact_terminal_required_indices(
+        input_value,
+        token_counts=token_counts,
+        has_continuity_anchor=has_continuity_anchor,
+    )
+    if terminal_indices:
+        prospective_required_indices = required_indices | terminal_indices
+        if reconcile_terminal_pairs:
+            prospective_required_indices = _compact_reconciled_tool_call_indices(
+                input_value,
+                prospective_required_indices,
+                token_counts=token_counts,
+                token_budget=sum(token_counts),
+                required_indices=prospective_required_indices,
+            )
+        prospective_required_input = _compact_trimmed_input_with_markers(
+            input_value,
+            token_counts,
+            prospective_required_indices,
+        )
+        if terminal_is_required or (
+            _estimated_json_tokens(prospective_required_input) <= _MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS
+        ):
+            required_indices = prospective_required_indices
+    return required_indices
+
+
+def _compact_has_continuity_anchor(payload: Mapping[str, JsonValue]) -> bool:
+    return any(
+        isinstance(payload.get(field), str) and bool(cast(str, payload[field]).strip())
+        for field in ("previous_response_id", "conversation")
+    )
+
+
+def _compact_discard_consumed_continuity_output_pairs(
+    input_value: list[JsonValue],
+    *,
+    selected_indices: set[int],
+    required_indices: set[int],
+) -> None:
+    if not input_value:
+        return
+    latest_index = len(input_value) - 1
+    latest_mapping = _json_mapping_or_none(input_value[latest_index])
+    latest_type = latest_mapping.get("type") if latest_mapping is not None else None
+    if latest_type == "compaction_trigger":
+        if latest_index == 0:
+            return
+        latest_index -= 1
+        latest_mapping = _json_mapping_or_none(input_value[latest_index])
+        latest_type = latest_mapping.get("type") if latest_mapping is not None else None
+    if (
+        latest_mapping is None
+        or not isinstance(latest_type, str)
+        or latest_type not in _COMPACT_TOOL_CALL_OUTPUT_ITEM_TYPES
+        or _compact_matching_tool_call_index(input_value, latest_index) is not None
+    ):
+        return
+    latest_call_id = latest_mapping.get("call_id")
+    matching_call_type = _COMPACT_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.get(latest_type)
+    selected_indices.difference_update(
+        index
+        for index, item in enumerate(input_value[:latest_index])
+        if is_json_mapping(item)
+        and item.get("call_id") == latest_call_id
+        and item.get("type") in {latest_type, matching_call_type}
+        and index not in required_indices
+    )
+
+
+def _compact_terminal_required_indices(
+    input_value: list[JsonValue],
+    *,
+    token_counts: list[int],
+    has_continuity_anchor: bool,
+) -> tuple[set[int], bool, bool]:
+    """Return terminal context and whether it must remain even when oversized."""
+
+    if not input_value:
+        return set(), False, False
+
+    latest_index = len(input_value) - 1
+    latest_mapping = _json_mapping_or_none(input_value[latest_index])
+    latest_type = latest_mapping.get("type") if latest_mapping is not None else None
+    terminal_trigger_indices: set[int] = set()
+    if latest_type == "compaction_trigger":
+        terminal_trigger_indices.add(latest_index)
+        if latest_index == 0:
+            return terminal_trigger_indices, True, False
+        latest_index -= 1
+        latest_mapping = _json_mapping_or_none(input_value[latest_index])
+        latest_type = latest_mapping.get("type") if latest_mapping is not None else None
+
+    def with_terminal_trigger(indices: set[int]) -> set[int]:
+        return indices | terminal_trigger_indices
+
+    if latest_type not in _COMPACT_TOOL_CALL_ITEM_TYPES | _COMPACT_TOOL_CALL_OUTPUT_ITEM_TYPES:
+        return with_terminal_trigger({latest_index}), True, False
+    if latest_mapping is not None and _compact_item_is_state_anchor(latest_mapping):
+        terminal_indices = _compact_required_terminal_indices(input_value, latest_index, token_counts)
+        return with_terminal_trigger(terminal_indices), True, True
+    if latest_mapping is not None and _compact_item_has_elidable_inline_image(latest_mapping):
+        terminal_indices = _compact_required_terminal_indices(input_value, latest_index, token_counts)
+        return with_terminal_trigger(terminal_indices), True, True
+    matching_call_index = _compact_matching_tool_call_index(input_value, latest_index)
+    if latest_mapping is not None and _compact_terminal_item_is_side_effect(
+        input_value,
+        latest_index,
+        matching_call_index=matching_call_index,
+    ):
+        terminal_indices = _compact_required_terminal_indices(input_value, latest_index, token_counts)
+        return with_terminal_trigger(terminal_indices), True, True
+    if latest_type in _COMPACT_TOOL_CALL_OUTPUT_ITEM_TYPES and has_continuity_anchor and matching_call_index is None:
+        return with_terminal_trigger({latest_index}), True, False
+    if latest_type in _COMPACT_TOOL_CALL_ITEM_TYPES:
+        terminal_indices = _compact_required_terminal_indices(input_value, latest_index, token_counts)
+        return with_terminal_trigger(terminal_indices), True, True
+
+    if terminal_trigger_indices:
+        # The trigger is the only mandatory suffix sentinel. An ordinary
+        # matched tool pair immediately before it remains best-effort context
+        # and may be dropped when other anchors consume the wire budget.
+        return terminal_trigger_indices, True, False
+
+    paired_tail = _compact_reconciled_tool_call_indices(
+        input_value,
+        with_terminal_trigger({latest_index}),
+        token_counts=token_counts,
+        token_budget=_MAX_COMPACT_UPSTREAM_ESTIMATED_TOKENS,
+    )
+    if latest_index in paired_tail:
+        return paired_tail, False, False
+    return terminal_trigger_indices, bool(terminal_trigger_indices), False
+
+
+def _compact_item_has_elidable_inline_image(item: JsonValue) -> bool:
+    _, changed = _compact_elide_inline_images(item)
+    return changed
+
+
+def _compact_matching_tool_call_index(input_value: list[JsonValue], output_index: int) -> int | None:
+    output = _json_mapping_or_none(input_value[output_index])
+    if output is None:
+        return None
+    call_id = output.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    output_type = output.get("type")
+    expected_call_type = (
+        _COMPACT_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.get(output_type) if isinstance(output_type, str) else None
+    )
+    if expected_call_type is None:
+        return None
+    unmatched_call_indices: list[int] = []
+    for index in range(output_index):
+        item = _json_mapping_or_none(input_value[index])
+        if item is None or item.get("call_id") != call_id:
+            continue
+        if item.get("type") == expected_call_type:
+            unmatched_call_indices.append(index)
+        elif item.get("type") == output_type and unmatched_call_indices:
+            unmatched_call_indices.pop()
+    return unmatched_call_indices[-1] if unmatched_call_indices else None
+
+
+def _compact_terminal_item_is_side_effect(
+    input_value: list[JsonValue],
+    index: int,
+    *,
+    matching_call_index: int | None,
+) -> bool:
+    item = _json_mapping_or_none(input_value[index])
+    if item is None:
+        return False
+    if item.get("type") in _COMPACT_SIDE_EFFECT_TOOL_ITEM_TYPES or _compact_item_is_side_effect_anchor(item):
+        return True
+    if matching_call_index is None:
+        return False
+    matching_call = _json_mapping_or_none(input_value[matching_call_index])
+    return matching_call is not None and (
+        matching_call.get("type") in _COMPACT_SIDE_EFFECT_TOOL_ITEM_TYPES
+        or _compact_item_is_side_effect_anchor(matching_call)
+    )
+
+
+def _compact_required_terminal_indices(
+    input_value: list[JsonValue],
+    latest_index: int,
+    token_counts: list[int],
+) -> set[int]:
+    return _compact_reconciled_tool_call_indices(
+        input_value,
+        {latest_index},
+        token_counts=token_counts,
+        token_budget=sum(token_counts),
+        required_indices={latest_index},
     )
 
 
@@ -1154,13 +1426,7 @@ def _compact_elide_required_tool_output_images(
 
 
 def _compact_elide_inline_images(value: JsonValue) -> tuple[JsonValue, bool]:
-    """Replace inline image bytes with an explicit compact-only text marker.
-
-    The model has already observed these images during the live turn. Re-sending
-    their data URLs to the compact endpoint can make an otherwise recoverable
-    thread permanently uncompactable, especially when the latest required tool
-    output contains a screenshot. File-backed image references remain intact.
-    """
+    """Replace inline image bytes with an explicit compact-only text marker."""
 
     if is_json_mapping(value):
         if value.get("type") == "input_image":
@@ -1318,8 +1584,8 @@ def _compact_reconciled_tool_call_indices(
     required_indices: set[int] | None = None,
     allow_pair_additions: bool = True,
 ) -> set[int]:
-    call_indices_by_id: dict[str, list[int]] = {}
-    output_indices_by_id: dict[str, list[int]] = {}
+    call_indices_by_key: dict[tuple[str, str], list[int]] = {}
+    output_indices_by_key: dict[tuple[str, str], list[int]] = {}
     for index, item in enumerate(input_value):
         if not is_json_mapping(item):
             continue
@@ -1327,10 +1593,12 @@ def _compact_reconciled_tool_call_indices(
         if not isinstance(call_id, str) or not call_id:
             continue
         item_type = item.get("type")
-        if item_type in _TOOL_CALL_ITEM_TYPES:
-            call_indices_by_id.setdefault(call_id, []).append(index)
-        elif item_type in _COMPACT_TOOL_CALL_OUTPUT_ITEM_TYPES:
-            output_indices_by_id.setdefault(call_id, []).append(index)
+        if isinstance(item_type, str) and item_type in _COMPACT_TOOL_CALL_ITEM_TYPES:
+            call_indices_by_key.setdefault((call_id, item_type), []).append(index)
+        elif isinstance(item_type, str):
+            matching_call_type = _COMPACT_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.get(item_type)
+            if matching_call_type is not None:
+                output_indices_by_key.setdefault((call_id, matching_call_type), []).append(index)
 
     reconciled = set(selected_indices)
     protected_indices = required_indices or set()
@@ -1353,13 +1621,16 @@ def _compact_reconciled_tool_call_indices(
                 reconciled.remove(index)
                 selected_tokens -= token_counts[index]
 
-    def matching_call_index(call_indices: list[int], output_index: int) -> int | None:
-        if not call_indices:
-            return None
-        preceding_call_indices = [call_index for call_index in call_indices if call_index < output_index]
-        if preceding_call_indices:
-            return preceding_call_indices[-1]
-        return call_indices[0]
+    def matching_call_index(call_indices: list[int], output_indices: list[int], output_index: int) -> int | None:
+        unmatched_calls: list[int] = []
+        call_index_set = set(call_indices)
+        output_index_set = set(output_indices)
+        for index in range(output_index):
+            if index in call_index_set:
+                unmatched_calls.append(index)
+            elif index in output_index_set and unmatched_calls:
+                unmatched_calls.pop()
+        return unmatched_calls[-1] if unmatched_calls else None
 
     def matching_output_indices(call_indices: list[int], call_index: int, output_indices: list[int]) -> list[int]:
         next_call_indices = [next_call_index for next_call_index in call_indices if next_call_index > call_index]
@@ -1368,23 +1639,23 @@ def _compact_reconciled_tool_call_indices(
             output_index
             for output_index in output_indices
             if output_index > call_index and (next_call_index is None or output_index < next_call_index)
-        ]
+        ][:1]
 
-    for call_id, output_indices in output_indices_by_id.items():
+    for pair_key, output_indices in output_indices_by_key.items():
         selected_outputs = [index for index in output_indices if index in reconciled]
         if not selected_outputs:
             continue
-        call_indices = call_indices_by_id.get(call_id, [])
+        call_indices = call_indices_by_key.get(pair_key, [])
         for output_index in selected_outputs:
-            call_index = matching_call_index(call_indices, output_index)
+            call_index = matching_call_index(call_indices, output_indices, output_index)
             if call_index is None:
                 remove_indices([output_index])
             elif not allow_pair_additions and call_index not in reconciled:
                 remove_indices([output_index])
             elif not add_indices([call_index]):
                 remove_indices([output_index])
-    for call_id, call_indices in call_indices_by_id.items():
-        output_indices = output_indices_by_id.get(call_id, [])
+    for pair_key, call_indices in call_indices_by_key.items():
+        output_indices = output_indices_by_key.get(pair_key, [])
         for call_index in call_indices:
             if call_index not in reconciled:
                 continue
@@ -1452,6 +1723,36 @@ def _compact_item_texts(item: Mapping[str, JsonValue]) -> list[str]:
     return texts
 
 
+def responses_input_contains_goal_continuation_context(input_value: JsonValue) -> bool:
+    """Return whether Responses input carries Codex's goal-continuation marker."""
+
+    if not is_json_list(input_value):
+        return False
+    for item in input_value:
+        if not is_json_mapping(item):
+            continue
+        for text in _compact_item_texts(item):
+            if text.lstrip().startswith(_GOAL_CONTINUATION_CONTEXT_PREFIX):
+                return True
+    return False
+
+
+def responses_request_contains_goal_continuation_context(payload: ResponsesRequest) -> bool:
+    """Return whether a normalized request carries Codex's goal restart marker."""
+
+    # ResponsesRequest normalization lifts developer/system input messages into
+    # ``instructions``. The marker can therefore disappear from ``input`` and
+    # follow pre-existing instruction text by the time affinity is classified.
+    # Keep both locations in this check or a harmless parser refactor can
+    # silently break restart recovery while marker-preservation tests still pass.
+    instructions = payload.instructions
+    if isinstance(instructions, str) and any(
+        line.lstrip().startswith(_GOAL_CONTINUATION_CONTEXT_PREFIX) for line in instructions.splitlines()
+    ):
+        return True
+    return responses_input_contains_goal_continuation_context(payload.input)
+
+
 def _compact_trimmed_input_with_markers(
     input_value: list[JsonValue], token_counts: list[int], selected_indices: set[int]
 ) -> list[JsonValue]:
@@ -1513,8 +1814,9 @@ def _compact_trim_marker(*, omitted_items: int, omitted_tokens: int) -> JsonObje
                 "text": (
                     "[compact trim] Omitted "
                     f"{omitted_items} input items (~{omitted_tokens} estimated tokens) "
-                    "before forwarding this oversized compact request upstream. The initial "
-                    "context, most recent context, and compact state anchors were preserved."
+                    "before forwarding this oversized compact request upstream. Required compact "
+                    "state anchors and retained input items remain in their original order; "
+                    "omitted items may include terminal context."
                 ),
             }
         ],
@@ -1548,6 +1850,7 @@ def _sanitize_interleaved_reasoning_input(payload: MutableJsonObject) -> None:
 
 def normalize_reasoning_aliases(payload: MutableJsonObject) -> None:
     reasoning_effort = payload.pop("reasoningEffort", None)
+    snake_case_reasoning_effort = payload.pop("reasoning_effort", None)
     reasoning_summary = payload.pop("reasoningSummary", None)
     provider_thinking = payload.pop("thinking", None)
     provider_enable_thinking = payload.pop("enable_thinking", None)
@@ -1558,8 +1861,20 @@ def normalize_reasoning_aliases(payload: MutableJsonObject) -> None:
     else:
         reasoning_map = {}
 
-    if isinstance(reasoning_effort, str) and "effort" not in reasoning_map:
-        reasoning_map["effort"] = reasoning_effort
+    existing_effort = reasoning_map.get("effort")
+    if isinstance(existing_effort, str) and not existing_effort.strip():
+        reasoning_map.pop("effort")
+
+    alias_effort = next(
+        (
+            candidate.strip()
+            for candidate in (reasoning_effort, snake_case_reasoning_effort)
+            if isinstance(candidate, str) and candidate.strip()
+        ),
+        None,
+    )
+    if alias_effort is not None and "effort" not in reasoning_map:
+        reasoning_map["effort"] = alias_effort
     if isinstance(reasoning_summary, str) and "summary" not in reasoning_map:
         reasoning_map["summary"] = reasoning_summary
 
@@ -1583,15 +1898,14 @@ def _normalize_thinking_alias(
     enable_thinking: JsonValue,
 ) -> MutableJsonObject | None:
     if isinstance(thinking, bool):
-        return {"effort": "medium"} if thinking else None
+        if thinking:
+            return {"effort": "medium"}
     if isinstance(thinking, str):
         normalized = thinking.strip().lower()
-        if normalized in {"low", "medium", "high", "xhigh", "max", "ultra"}:
+        if normalized in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
             return {"effort": normalized}
         if normalized in {"enabled", "true", "on"}:
             return {"effort": "medium"}
-        if normalized in {"disabled", "false", "off"}:
-            return None
     thinking_mapping = _json_mapping_or_none(thinking)
     if thinking_mapping is not None:
         normalized: MutableJsonObject = {}
@@ -1601,19 +1915,19 @@ def _normalize_thinking_alias(
             normalized["effort"] = effort.strip().lower()
         if isinstance(summary, str) and summary.strip():
             normalized["summary"] = summary.strip()
+        thinking_type = thinking_mapping.get("type")
+        if "effort" not in normalized and isinstance(thinking_type, str) and thinking_type.strip().lower() == "enabled":
+            normalized["effort"] = "medium"
+        enabled = thinking_mapping.get("enabled")
+        if "effort" not in normalized and enabled is True:
+            normalized["effort"] = "medium"
+        if "effort" not in normalized and enable_thinking is True:
+            normalized["effort"] = "medium"
         if normalized:
             return normalized
-        thinking_type = thinking_mapping.get("type")
-        if isinstance(thinking_type, str):
-            normalized_type = thinking_type.strip().lower()
-            if normalized_type == "enabled":
-                return {"effort": "medium"}
-            if normalized_type == "disabled":
-                return None
-        enabled = thinking_mapping.get("enabled")
-        if isinstance(enabled, bool):
-            return {"effort": "medium"} if enabled else None
 
+    # Disabled `thinking` spellings are inactive, not authoritative: a
+    # separate enabled alias must still participate in policy evaluation.
     if isinstance(enable_thinking, bool):
         return {"effort": "medium"} if enable_thinking else None
     return None

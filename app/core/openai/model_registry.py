@@ -142,7 +142,7 @@ _BOOTSTRAP_CORE_AVAILABLE_IN_PLANS = frozenset(
 )
 
 # GPT-5.6 ships to four additional plan tiers upstream
-# (codex-rs/models-manager/models.json at rust-v0.144.1).
+# (codex-rs/models-manager/models.json at rust-v0.145.0).
 _BOOTSTRAP_GPT56_AVAILABLE_IN_PLANS = frozenset(
     {
         *_BOOTSTRAP_AVAILABLE_IN_PLANS,
@@ -219,8 +219,10 @@ def _gpt56_raw(
     availability_nux: dict[str, JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
     """Raw catalog fields for the GPT-5.6 family, mirroring the upstream
-    bundled catalog (codex-rs/models-manager/models.json at rust-v0.144.1)
-    field-for-field. The ~16.5 KB ``base_instructions`` string and the
+    bundled catalog (codex-rs/models-manager/models.json at rust-v0.145.0)
+    field-for-field, with one tracked exception: ``max_context_window``, which
+    upstream later raised from 272,000 to 872,000 (see the field comment
+    below). The ~16.5 KB ``base_instructions`` string and the
     personality-templated ``model_messages`` object are deliberately not
     bundled; the live upstream registry supplies them on the first refresh.
     """
@@ -237,6 +239,16 @@ def _gpt56_raw(
         "use_responses_lite": True,
         "include_skills_usage_instructions": False,
         "auto_review_model_override": None,
+        # Upstream raised only the ceiling: ``max_context_window`` 272000 ->
+        # 872000 with ``context_window`` unchanged at 272000. ``_bootstrap_model``
+        # synthesizes ``max_context_window == context_window``, so the family
+        # ceiling has to override it here, the same decoupling ``gpt-5.4`` uses.
+        # Pinned evidence: openai/codex commit
+        # 2eee483e49f88b868f67364134a658b3298e6c14 -- "Raise the GPT-5.6 maximum
+        # context window" (openai/codex#39102). Not yet in a ``rust-v*`` release
+        # tag; ``rust-v0.148.0-alpha.21`` still ships 272000. Re-pin to the tag
+        # once one carries it.
+        "max_context_window": 872_000,
         "auto_compact_token_limit": None,
         "comp_hash": "3000",
         "reasoning_summary_format": "experimental",
@@ -270,7 +282,7 @@ _BOOTSTRAP_STATIC_MODELS: tuple[UpstreamModel, ...] = (
         prefer_websockets=True,
         minimal_client_version="0.144.0",
         reasoning_levels=_REASONING_LEVELS_ULTRA,
-        context_window=372_000,
+        context_window=272_000,
         default_reasoning_level="low",
         priority=1,
         available_in_plans=_BOOTSTRAP_GPT56_AVAILABLE_IN_PLANS,
@@ -283,7 +295,7 @@ _BOOTSTRAP_STATIC_MODELS: tuple[UpstreamModel, ...] = (
         prefer_websockets=True,
         minimal_client_version="0.144.0",
         reasoning_levels=_REASONING_LEVELS_ULTRA,
-        context_window=372_000,
+        context_window=272_000,
         default_reasoning_level="medium",
         priority=2,
         available_in_plans=_BOOTSTRAP_GPT56_AVAILABLE_IN_PLANS,
@@ -296,7 +308,7 @@ _BOOTSTRAP_STATIC_MODELS: tuple[UpstreamModel, ...] = (
         prefer_websockets=True,
         minimal_client_version="0.144.0",
         reasoning_levels=_REASONING_LEVELS_MAX,
-        context_window=372_000,
+        context_window=272_000,
         default_reasoning_level="medium",
         priority=3,
         available_in_plans=_BOOTSTRAP_GPT56_AVAILABLE_IN_PLANS,

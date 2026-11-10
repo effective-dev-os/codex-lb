@@ -1,5 +1,5 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import {
@@ -21,6 +21,18 @@ const DEFAULT_FILTER_STATE: FilterState = {
   limit: 25,
   offset: 0,
 };
+
+export function requestLogFiltersApplied(filters: FilterState): boolean {
+  return (
+    filters.search.trim() !== "" ||
+    filters.timeframe !== DEFAULT_FILTER_STATE.timeframe ||
+    filters.accountIds.length > 0 ||
+    filters.apiKeyIds.length > 0 ||
+    filters.modelOptions.length > 0 ||
+    filters.statuses.length > 0 ||
+    Boolean(filters.conversationId)
+  );
+}
 
 const REQUEST_LOG_PARAM_KEYS = [
   "search",
@@ -92,29 +104,38 @@ function writeFilterState(state: FilterState, base?: URLSearchParams): URLSearch
   return params;
 }
 
-function timeframeToSinceIso(timeframe: FilterState["timeframe"]): string | undefined {
-  if (timeframe === "all") {
-    return undefined;
-  }
-  const now = Date.now();
-  const lookup: Record<Exclude<FilterState["timeframe"], "all">, number> = {
-    "1h": 60 * 60 * 1000,
-    "24h": 24 * 60 * 60 * 1000,
-    "7d": 7 * 24 * 60 * 60 * 1000,
-  };
-  return new Date(now - lookup[timeframe]).toISOString();
-}
-
 export type UseRequestLogsOptions = {
   enabled?: boolean;
+  /**
+   * Set false for read-only sessions: the API-key filter control is hidden for
+   * them, so any `apiKeyId` carried by the URL (bookmark, or an admin's
+   * selection retained across logout) is ignored and removed instead of being
+   * sent as an invisible restriction.
+   */
+  allowApiKeyFilters?: boolean;
 };
 
 export function useRequestLogs(options: UseRequestLogsOptions = {}) {
   const enabled = options.enabled ?? true;
+  const allowApiKeyFilters = options.allowApiKeyFilters ?? true;
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const filters = useMemo(() => parseFilterState(searchParams), [searchParams]);
-  const since = useMemo(() => timeframeToSinceIso(filters.timeframe), [filters.timeframe]);
+  const filters = useMemo(() => {
+    const parsed = parseFilterState(searchParams);
+    if (allowApiKeyFilters || parsed.apiKeyIds.length === 0) {
+      return parsed;
+    }
+    return { ...parsed, apiKeyIds: [] };
+  }, [allowApiKeyFilters, searchParams]);
+  const hasHiddenApiKeyParams = !allowApiKeyFilters && searchParams.has("apiKeyId");
+  useEffect(() => {
+    if (!hasHiddenApiKeyParams) {
+      return;
+    }
+    setSearchParams(writeFilterState(filters, searchParams), { replace: true });
+  }, [filters, hasHiddenApiKeyParams, searchParams, setSearchParams]);
+  const filtersApplied = requestLogFiltersApplied(filters);
+  const timeframe = filters.timeframe === "all" ? undefined : filters.timeframe;
   const listFilters = useMemo<RequestLogsListFilters>(
     () => ({
       search: filters.search || undefined,
@@ -124,44 +145,52 @@ export function useRequestLogs(options: UseRequestLogsOptions = {}) {
       apiKeyIds: filters.apiKeyIds,
       statuses: filters.statuses,
       modelOptions: filters.modelOptions,
-      since,
+      timeframe,
       conversationId: filters.conversationId ?? undefined,
     }),
-    [filters, since],
+    [filters, timeframe],
   );
   const facetFilters = useMemo<RequestLogFacetFilters>(
     () => ({
-      since,
+      timeframe,
       accountIds: filters.accountIds,
       apiKeyIds: filters.apiKeyIds,
       modelOptions: filters.modelOptions,
     }),
-    [filters.accountIds, filters.apiKeyIds, filters.modelOptions, since],
+    [filters.accountIds, filters.apiKeyIds, filters.modelOptions, timeframe],
   );
 
   const {
-    data: logsData,
+    data: logsResult,
     error: logsError,
     isFetching: logsIsFetching,
     isLoading: logsIsLoading,
     isPending: logsIsPending,
+    isPlaceholderData: logsIsPlaceholderData,
     isSuccess: logsIsSuccess,
     refetch: refetchLogs,
   } = useQuery({
     queryKey: ["dashboard", "request-logs", listFilters],
-    queryFn: () => getRequestLogs(listFilters),
+    queryFn: async () => ({
+      page: await getRequestLogs(listFilters),
+      filtersApplied,
+    }),
     enabled,
     refetchInterval: 30_000,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
     placeholderData: keepPreviousData,
   });
+  const logsData = logsResult?.page;
+  const emptyStateFiltersApplied =
+    filtersApplied || (logsIsPlaceholderData && Boolean(logsResult?.filtersApplied));
   const logsQuery = {
     data: logsData,
     error: logsError,
     isFetching: logsIsFetching,
     isLoading: logsIsLoading,
     isPending: logsIsPending,
+    isPlaceholderData: logsIsPlaceholderData,
     isSuccess: logsIsSuccess,
     refetch: refetchLogs,
   };
@@ -204,6 +233,7 @@ export function useRequestLogs(options: UseRequestLogsOptions = {}) {
     filters,
     listFilters,
     facetFilters,
+    emptyStateFiltersApplied,
     logsQuery,
     optionsQuery,
     updateFilters,

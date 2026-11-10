@@ -5,7 +5,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 from unittest.mock import AsyncMock
@@ -29,15 +29,136 @@ from app.core.balancer.logic import (
 from app.core.crypto import TokenEncryptor
 from app.db.models import Account, AccountStatus, StickySessionKind, UsageHistory
 from app.modules.api_keys.repository import ApiKeysRepository
-from app.modules.proxy.affinity import _codex_session_selection_key
+from app.modules.proxy.affinity import (
+    _AffinityPolicy,
+    _codex_backend_identity,
+    _codex_session_selection_key,
+)
 from app.modules.proxy.cap_partitioning import CapPartition
 from app.modules.proxy.load_balancer import LoadBalancer, RuntimeState, effective_account_concurrency_caps
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.sticky_repository import StickyOwnerLookup
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.repository import AdditionalUsageRepository
+from tests.simulation.virtual_time import VirtualClock
 
 pytestmark = pytest.mark.unit
+
+
+def test_selected_probe_timestamps_use_injected_clock() -> None:
+    clock = VirtualClock(epoch_value=1_700_000_123.0)
+    balancer = LoadBalancer(cast(Any, None), clock=clock)
+    account = _make_account("acc-virtual-clock")
+    balancer._runtime[account.id] = RuntimeState(last_selected_at=10.0)
+    reservation = load_balancer_module.ProbeReservation(
+        account_id=account.id,
+        previous_last_selected_at=None,
+        reserved_at=10.0,
+        expected_runtime_version=0,
+    )
+
+    assert balancer._commit_due_probe_reservation_locked(reservation)
+    assert balancer._runtime[account.id].last_selected_at == clock.time()
+
+    state = balancer._state_for(account)
+    clock.advance(1.0)
+    assert balancer._sync_runtime_state(
+        account,
+        state,
+        selected=True,
+        expected_version=balancer._runtime[account.id].version,
+    )
+    assert balancer._runtime[account.id].last_selected_at == clock.time()
+
+
+def test_probe_selection_uses_injected_clock() -> None:
+    clock = VirtualClock(epoch_value=1_700_000_123.0)
+    balancer = LoadBalancer(cast(Any, None), clock=clock)
+    healthy = _make_account("acc-virtual-clock-healthy")
+    probing = _make_account("acc-virtual-clock-probing")
+    recent_selection = clock.time() - 1.0
+    balancer._runtime[probing.id] = RuntimeState(
+        health_tier=HEALTH_TIER_PROBING,
+        last_selected_at=recent_selection,
+    )
+
+    reservation = balancer._reserve_due_probe_locked(
+        [
+            AccountState(
+                account_id=healthy.id,
+                status=AccountStatus.ACTIVE,
+                health_tier=HEALTH_TIER_HEALTHY,
+            ),
+            AccountState(
+                account_id=probing.id,
+                status=AccountStatus.ACTIVE,
+                last_selected_at=recent_selection,
+                health_tier=HEALTH_TIER_PROBING,
+            ),
+        ],
+        prefer_earlier_reset=False,
+        prefer_earlier_reset_window="secondary",
+        routing_strategy="usage_weighted",
+        relative_availability_power=2.0,
+        relative_availability_top_k=5,
+        traffic_class=load_balancer_module.TRAFFIC_CLASS_FOREGROUND,
+        routing_costs_by_account_id=None,
+    )
+
+    assert reservation is None
+
+
+@pytest.mark.asyncio
+async def test_record_errors_uses_injected_clock() -> None:
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    account = _make_account("acc-virtual-clock-error")
+    balancer = LoadBalancer(
+        lambda: _repo_factory(_StubAccountsRepository([account]), _StubUsageRepository({}, {})),
+        clock=clock,
+    )
+
+    await balancer.record_errors(account, 2)
+
+    runtime = balancer._runtime[account.id]
+    assert runtime.error_count == 2
+    assert runtime.last_error_at == clock.time()
+
+
+@pytest.mark.asyncio
+async def test_record_errors_uses_real_clock_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_epoch = 2_000_000_001.0
+    monkeypatch.setattr("app.core.clock.time.time", lambda: real_epoch)
+    account = _make_account("acc-real-clock-error")
+    balancer = LoadBalancer(lambda: _repo_factory(_StubAccountsRepository([account]), _StubUsageRepository({}, {})))
+
+    await balancer.record_error(account)
+
+    assert balancer._runtime[account.id].last_error_at == real_epoch
+
+
+@pytest.mark.asyncio
+async def test_virtual_clock_controls_state_and_probe_health_transitions() -> None:
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    account = _make_account("acc-virtual-clock-state")
+    primary = _usage_row_with_percent(
+        900,
+        account.id,
+        used_percent=DRAIN_PRIMARY_THRESHOLD_PCT,
+        reset_at=int(clock.time() + 300),
+    )
+    usage_repo = _StubUsageRepository({account.id: primary}, {})
+    balancer = LoadBalancer(lambda: _repo_factory(_StubAccountsRepository([account]), usage_repo), clock=clock)
+    balancer._runtime[account.id] = RuntimeState(health_tier=HEALTH_TIER_PROBING, probe_success_streak=2)
+
+    await balancer.select_account()
+    runtime = balancer._runtime[account.id]
+    assert runtime.health_tier == HEALTH_TIER_DRAINING
+    assert runtime.drain_entered_at == clock.time()
+
+    await balancer.record_probe_result(account_id=account.id, http_status=200)
+
+    assert runtime.health_tier == HEALTH_TIER_DRAINING
+    assert runtime.drain_entered_at == clock.time()
 
 
 @pytest.fixture(autouse=True)
@@ -222,32 +343,90 @@ class _StubStickySessionsRepository:
         # abandoned so run_sticky_selection_path can bypass the
         # ambiguous-owner check for them.
         self.abandoned_keys: set[str] = set()
+        self.scoped_abandoned_account_ids_by_key: dict[str, str] = {}
+        # Refresh-skip deadlines reported alongside the owner lookup, keyed by
+        # sticky key (see StickyOwnerLookup.refresh_skip_deadline).
+        self.refresh_skip_deadlines_by_key: dict[str, datetime] = {}
         self.deleted: list[tuple[str, StickySessionKind | None]] = []
         self.upserts: list[tuple[str, str, StickySessionKind | None]] = []
+        self.insert_if_absent_calls: list[tuple[str, str, StickySessionKind]] = []
+        self.seeded_upserts: list[tuple[str, str, StickySessionKind, str, StickySessionKind]] = []
 
     async def get_account_id(self, *args: Any, **kwargs: Any) -> str | None:
         lookup = await self.get_account_id_and_abandonment(*args, **kwargs)
         return lookup.account_id
 
+    async def release_read_snapshot(self) -> None:
+        # The shared owner-lookup session releases its read snapshot between
+        # ownership sources; the stub has no transaction to end.
+        return None
+
     async def get_account_id_and_abandonment(self, *args: Any, **kwargs: Any) -> StickyOwnerLookup:
         key = cast(str, args[0])
+        scoped_abandoned_account_id = self.scoped_abandoned_account_ids_by_key.get(key)
+        if scoped_abandoned_account_id is not None:
+            return StickyOwnerLookup(
+                account_id=None,
+                continuity_abandoned=True,
+                abandoned_account_id=scoped_abandoned_account_id,
+            )
         if key in self.abandoned_keys:
             return StickyOwnerLookup(account_id=None, continuity_abandoned=True)
         if self.account_ids_by_key is not None:
-            return StickyOwnerLookup(account_id=self.account_ids_by_key.get(key), continuity_abandoned=False)
+            return StickyOwnerLookup(
+                account_id=self.account_ids_by_key.get(key),
+                continuity_abandoned=False,
+                refresh_skip_deadline=self.refresh_skip_deadlines_by_key.get(key),
+            )
         del kwargs
-        return StickyOwnerLookup(account_id=self.account_id, continuity_abandoned=False)
+        return StickyOwnerLookup(
+            account_id=self.account_id,
+            continuity_abandoned=False,
+            refresh_skip_deadline=self.refresh_skip_deadlines_by_key.get(key),
+        )
 
     async def upsert(self, *args: Any, **kwargs: Any) -> Any:
         sticky_key = cast(str, args[0])
         account_id = cast(str, args[1])
         self.account_id = account_id
+        if self.account_ids_by_key is not None:
+            self.account_ids_by_key[sticky_key] = account_id
         self.upserts.append((sticky_key, account_id, kwargs.get("kind")))
         return None
+
+    async def insert_if_absent(
+        self,
+        key: str,
+        account_id: str,
+        kind: StickySessionKind,
+    ) -> str:
+        self.insert_if_absent_calls.append((key, account_id, kind))
+        if self.account_ids_by_key is None:
+            self.account_ids_by_key = {}
+        return self.account_ids_by_key.setdefault(key, account_id)
+
+    async def upsert_with_seed_if_absent(
+        self,
+        key: str,
+        account_id: str,
+        *,
+        kind: StickySessionKind,
+        seed_key: str,
+        seed_kind: StickySessionKind,
+    ) -> None:
+        self.seeded_upserts.append((key, account_id, kind, seed_key, seed_kind))
+        if self.account_ids_by_key is None:
+            self.account_ids_by_key = {}
+        self.account_ids_by_key.setdefault(seed_key, account_id)
+        self.account_ids_by_key[key] = account_id
+        self.account_id = account_id
+        self.upserts.append((key, account_id, kind))
 
     async def delete(self, *args: Any, **kwargs: Any) -> bool:
         sticky_key = cast(str, args[0])
         self.deleted.append((sticky_key, kwargs.get("kind")))
+        if self.account_ids_by_key is not None:
+            self.account_ids_by_key.pop(sticky_key, None)
         self.account_id = None
         return True
 
@@ -259,13 +438,20 @@ class _StubStickySessionsRepository:
         expected_account_id: str | None,
         restore_account_id: str | None,
     ) -> bool:
-        if self.account_id != expected_account_id:
+        current_account_id = (
+            self.account_ids_by_key.get(key) if self.account_ids_by_key is not None else self.account_id
+        )
+        if current_account_id != expected_account_id:
             return False
         if restore_account_id is None:
             self.deleted.append((key, kind))
+            if self.account_ids_by_key is not None:
+                self.account_ids_by_key.pop(key, None)
             self.account_id = None
             return True
         self.upserts.append((key, restore_account_id, kind))
+        if self.account_ids_by_key is not None:
+            self.account_ids_by_key[key] = restore_account_id
         self.account_id = restore_account_id
         return True
 
@@ -308,6 +494,56 @@ class _FailingUpsertStickySessionsRepository(_StubStickySessionsRepository):
     async def upsert(self, *args: Any, **kwargs: Any) -> Any:
         del args, kwargs
         raise RuntimeError("sticky persistence unavailable")
+
+
+class _RetiringStaleOwnerStickySessionsRepository(_StubStickySessionsRepository):
+    def __init__(self, *, raw_key: str, owner_account_id: str) -> None:
+        super().__init__()
+        self.account_ids_by_key = {raw_key: owner_account_id}
+        self.tombstones: list[tuple[str, str]] = []
+
+    async def abandon_legacy_session_header_owner_if_unavailable(
+        self,
+        key: str,
+        *,
+        kind: StickySessionKind,
+        expected_account_id: str,
+    ) -> bool:
+        assert kind == StickySessionKind.CODEX_SESSION
+        assert self.account_ids_by_key is not None
+        if self.account_ids_by_key.get(key) != expected_account_id:
+            return False
+        # The account objects supplied to selection intentionally remain stale
+        # and ACTIVE after this authoritative repository decision.
+        self.scoped_abandoned_account_ids_by_key[key] = expected_account_id
+        self.tombstones.append((key, expected_account_id))
+        return True
+
+    async def upsert(self, *args: Any, **kwargs: Any) -> None:
+        sticky_key = cast(str, args[0])
+        account_id = cast(str, args[1])
+        assert self.account_ids_by_key is not None
+        self.account_ids_by_key[sticky_key] = account_id
+        self.upserts.append((sticky_key, account_id, kwargs.get("kind")))
+
+
+class _LosingRetirementRaceStickySessionsRepository(_RetiringStaleOwnerStickySessionsRepository):
+    async def abandon_legacy_session_header_owner_if_unavailable(
+        self,
+        key: str,
+        *,
+        kind: StickySessionKind,
+        expected_account_id: str,
+    ) -> bool:
+        assert kind == StickySessionKind.CODEX_SESSION
+        assert self.account_ids_by_key is not None
+        assert self.account_ids_by_key.get(key) == expected_account_id
+        # Another selector wins the source-scoped retirement CAS. The losing
+        # selector's authoritative reread must carry this retained owner into
+        # its stale-snapshot exclusion set.
+        self.scoped_abandoned_account_ids_by_key[key] = expected_account_id
+        self.tombstones.append((key, expected_account_id))
+        return False
 
 
 @asynccontextmanager
@@ -444,8 +680,10 @@ async def test_record_error_backoff_enters_floor_without_adding_full_threshold()
 
 
 @pytest.mark.asyncio
-async def test_successful_force_probes_promote_probing_account_to_healthy() -> None:
+@pytest.mark.parametrize("status", [AccountStatus.ACTIVE, AccountStatus.REAUTH_REQUIRED])
+async def test_successful_force_probes_promote_routable_account_to_healthy(status: AccountStatus) -> None:
     account = _make_account("acc-force-probe-success")
+    account.status = status
     balancer = LoadBalancer(lambda: _repo_factory(_StubAccountsRepository([account]), _StubUsageRepository({}, {})))
     balancer._runtime[account.id] = RuntimeState(
         health_tier=HEALTH_TIER_PROBING,
@@ -1294,6 +1532,7 @@ def test_bypass_routing_strategies_do_not_require_probe_reservations(routing_str
         states[1],
         routing_strategy=routing_strategy,
         traffic_class=load_balancer_module.TRAFFIC_CLASS_FOREGROUND,
+        now=0.0,
     )
 
 
@@ -1320,6 +1559,7 @@ def test_blocked_healthy_tier_peer_does_not_suppress_recovery_probe() -> None:
         load_balancer_module._filter_recovery_probe_candidates(
             states,
             traffic_class=load_balancer_module.TRAFFIC_CLASS_FOREGROUND,
+            now=float(now_epoch),
         )
         == states
     )
@@ -1328,7 +1568,31 @@ def test_blocked_healthy_tier_peer_does_not_suppress_recovery_probe() -> None:
         due_probe,
         routing_strategy="usage_weighted",
         traffic_class=load_balancer_module.TRAFFIC_CLASS_FOREGROUND,
+        now=float(now_epoch),
     )
+
+
+def test_recovery_probe_filter_uses_injected_selection_time() -> None:
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    recovered_healthy = AccountState(
+        "recovered-healthy",
+        AccountStatus.RATE_LIMITED,
+        used_percent=100.0,
+        reset_at=clock.time() - 1.0,
+        health_tier=HEALTH_TIER_HEALTHY,
+    )
+    due_probe = AccountState(
+        "due-probe",
+        AccountStatus.ACTIVE,
+        used_percent=10.0,
+        health_tier=HEALTH_TIER_PROBING,
+    )
+
+    assert load_balancer_module._filter_recovery_probe_candidates(
+        [recovered_healthy, due_probe],
+        traffic_class=load_balancer_module.TRAFFIC_CLASS_FOREGROUND,
+        now=clock.time(),
+    ) == [recovered_healthy]
 
 
 @pytest.mark.asyncio
@@ -2112,6 +2376,74 @@ async def test_sticky_probe_reservation_restores_affinity_after_repeated_commit_
 
 
 @pytest.mark.asyncio
+async def test_provisional_recovery_probe_does_not_publish_process_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+    healthy = _make_account("acc-probe-seed-healthy")
+    probing = _make_account("acc-probe-seed-probing")
+    accounts_repo = _StubAccountsRepository([healthy, probing])
+    usage_repo = _StubUsageRepository(
+        primary={
+            healthy.id: _usage_row_with_percent(
+                211,
+                healthy.id,
+                used_percent=30.0,
+                reset_at=now_epoch + 300,
+            ),
+            probing.id: _usage_row_with_percent(
+                212,
+                probing.id,
+                used_percent=10.0,
+                reset_at=now_epoch + 300,
+            ),
+        },
+        secondary={},
+    )
+    sticky_repo = _StubStickySessionsRepository()
+    sticky_repo.account_ids_by_key = {}
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+    balancer._runtime[probing.id] = RuntimeState(
+        health_tier=HEALTH_TIER_PROBING,
+        last_selected_at=0.0,
+        version=37,
+        health_version=13,
+    )
+    monkeypatch.setattr(balancer, "_commit_due_probe_reservation_locked", lambda *args, **kwargs: False)
+
+    selected = await balancer.select_account(
+        sticky_key="thread-after-probe-loss",
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key="process-after-probe-loss",
+        sticky_seed_key="process-seed-after-probe-loss",
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == healthy.id
+    assert selected.lease is not None
+    assert sticky_repo.account_ids_by_key == {
+        "process-seed-after-probe-loss": healthy.id,
+        "thread-after-probe-loss": healthy.id,
+    }
+    assert sticky_repo.seeded_upserts == [
+        (
+            "thread-after-probe-loss",
+            healthy.id,
+            StickySessionKind.PROMPT_CACHE,
+            "process-seed-after-probe-loss",
+            StickySessionKind.CODEX_SESSION,
+        )
+    ]
+
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
 async def test_sticky_probe_reservation_restore_does_not_clobber_newer_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2595,6 +2927,150 @@ async def test_bare_codex_session_keeps_unsaturated_owner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner_excluded", [True, False])
+async def test_raw_legacy_codex_session_owner_excluded_by_the_caller_reports_a_self_inflicted_saturation(
+    owner_excluded: bool,
+) -> None:
+    """#2163: a raw legacy ``CODEX_SESSION`` row (the un-namespaced
+    compatibility row an old replica persisted for a bare session header,
+    consulted through ``legacy_sticky_key`` and never aged out) is hard
+    ownership evidence, so selection narrows to its owner and never spills --
+    not even to a healthy alternate. A caller that excluded that owner, which
+    is what the HTTP bridge's created-only and model-fallback replays do to
+    move a fresh turn off a failing account, therefore cannot be served by any
+    re-selection while the exclusion holds. ``hard_affinity_saturated`` alone
+    does not say that: the same code covers a briefly unavailable owner that a
+    short recovery wait may recover. Only the selector knows which account the
+    row resolved to, so it reports the distinction."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer(
+        f"legacy-hard-owner-{'excluded' if owner_excluded else 'eligible'}"
+    )
+    assert alternate is not None
+    raw_session = "legacy-process"
+    # Raw row only: no namespaced row exists for this session (pre-v1.22.0 /
+    # #1382 shape), so the raw owner is the hard owner.
+    sticky_repo.account_ids_by_key = {raw_session: owner.id}
+
+    selected = await balancer.select_account(
+        sticky_key=_codex_session_selection_key(raw_session),
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="session_header",
+        legacy_sticky_key=raw_session,
+        spill_bare_session_on_account_cap=True,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+        exclude_account_ids={owner.id} if owner_excluded else set(),
+    )
+
+    if not owner_excluded:
+        # Control: unexcluded, the same raw row resolves to its owner.
+        assert selected.account is not None
+        assert selected.account.id == owner.id
+        assert selected.hard_affinity_owner_excluded is False
+        await balancer.release_account_lease(selected.lease)
+        return
+    assert selected.account is None
+    assert selected.error_code == "hard_affinity_saturated"
+    assert selected.hard_affinity_owner_excluded is True
+    # Ownership is untouched: the exclusion is request-local evidence, never a
+    # reason to rebind or delete the row the alternate would inherit.
+    assert sticky_repo.account_ids_by_key == {raw_session: owner.id}
+    assert sticky_repo.upserts == []
+    assert sticky_repo.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_soft_bare_session_owner_excluded_by_the_caller_is_not_a_hard_affinity_saturation() -> None:
+    """Scope guard for #2163: only ``hard_affinity_saturated`` may be reported
+    as caller-excluded. A namespaced soft row for the same bare session header
+    (no raw legacy row) is a preference, so excluding its owner spills to the
+    alternate and the selection succeeds -- nothing for a caller to stop
+    waiting on."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("soft-owner-excluded")
+    assert alternate is not None
+    raw_session = "soft-bare-session-excluded"
+    sticky_repo.account_ids_by_key = {_codex_session_selection_key(raw_session): owner.id}
+
+    selected = await balancer.select_account(
+        sticky_key=_codex_session_selection_key(raw_session),
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="session_header",
+        legacy_sticky_key=raw_session,
+        spill_bare_session_on_account_cap=True,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+        exclude_account_ids={owner.id},
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert selected.error_code is None
+    assert selected.hard_affinity_owner_excluded is False
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_account_cap_failure_with_an_excluded_sticky_owner_is_not_a_hard_affinity_saturation() -> None:
+    """Scope guard for #2163: the caller-excluded report is scoped to
+    ``hard_affinity_saturated``. Here the same excluded sticky owner ends in a
+    local account-cap failure instead, whose own recovery wait must survive:
+    the cap clears on its own, unlike an exclusion."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("soft-owner-excluded-capped")
+    assert alternate is not None
+    raw_session = "soft-bare-session-excluded-capped"
+    sticky_repo.account_ids_by_key = {_codex_session_selection_key(raw_session): owner.id}
+    saturated_leases = [await balancer.acquire_account_lease(alternate.id, kind="stream") for _ in range(8)]
+
+    selected = await balancer.select_account(
+        sticky_key=_codex_session_selection_key(raw_session),
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="session_header",
+        legacy_sticky_key=raw_session,
+        spill_bare_session_on_account_cap=True,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+        exclude_account_ids={owner.id},
+    )
+
+    assert selected.account is None
+    assert selected.error_code == "account_stream_cap"
+    assert selected.hard_affinity_owner_excluded is False
+
+    for lease in saturated_leases:
+        await balancer.release_account_lease(lease)
+
+
+@pytest.mark.asyncio
+async def test_hard_codex_session_owner_unavailable_without_an_exclusion_keeps_its_recovery_wait() -> None:
+    """Parity guard for #2163: an owner the caller did NOT exclude may be
+    unselectable only for as long as its status/health transition lasts, so the
+    saturation is not self-inflicted and the caller's short owner-recovery wait
+    must stay intact."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("legacy-hard-owner-unavailable")
+    assert alternate is not None
+    owner.status = AccountStatus.RATE_LIMITED
+    owner.reset_at = int(datetime.now(tz=timezone.utc).timestamp()) + 3600
+    raw_session = "legacy-process-unavailable"
+    sticky_repo.account_ids_by_key = {raw_session: owner.id}
+
+    selected = await balancer.select_account(
+        sticky_key=_codex_session_selection_key(raw_session),
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="session_header",
+        legacy_sticky_key=raw_session,
+        spill_bare_session_on_account_cap=True,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+    )
+
+    assert selected.account is None
+    assert selected.error_code == "hard_affinity_saturated"
+    assert selected.hard_affinity_owner_excluded is False
+    assert sticky_repo.upserts == []
+    assert sticky_repo.deleted == []
+
+
+@pytest.mark.asyncio
 async def test_bare_codex_stream_avoids_owner_at_response_create_cap() -> None:
     balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("cap-second-stage")
     assert alternate is not None
@@ -2659,6 +3135,541 @@ async def test_bare_codex_session_preserves_mapping_when_no_alternate_is_below_c
 
     for lease in saturated_leases:
         await balancer.release_account_lease(lease)
+
+
+def _thread_row_kwargs(
+    thread_key: str,
+    *,
+    lease_kind: Literal["stream", "response_create"] = "stream",
+) -> dict[str, Any]:
+    # The soft TTL-bounded row current Codex thread headers derive
+    # (see affinity._thread_codex_session_affinity).
+    return {
+        "sticky_key": thread_key,
+        "sticky_kind": StickySessionKind.PROMPT_CACHE,
+        "sticky_source": "thread_header",
+        "sticky_max_age_seconds": 1800,
+        "routing_strategy": "usage_weighted",
+        "lease_kind": lease_kind,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("lease_kind", "cap"), [("stream", 8), ("response_create", 4)])
+async def test_prompt_cache_thread_owner_spills_without_rebinding_when_owner_at_account_cap(
+    lease_kind: Literal["stream", "response_create"],
+    cap: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=load_balancer_module.__name__)
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer(f"thread-cap-spill-{lease_kind}")
+    assert alternate is not None
+    thread_key = f"thread-cap-spill-{lease_kind}-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    saturated_leases = [await balancer.acquire_account_lease(owner.id, kind=lease_kind) for _ in range(cap)]
+
+    selected = await balancer.select_account(**_thread_row_kwargs(thread_key, lease_kind=lease_kind))
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.account_ids_by_key[thread_key] == owner.id
+    assert sticky_repo.deleted == []
+    assert sticky_repo.upserts == []
+    assert "internal_soft_affinity_spillover" in caplog.text
+
+    for lease in [*saturated_leases, selected.lease]:
+        await balancer.release_account_lease(lease)
+
+    # Once the cap clears, the conversation returns to its warm owner.
+    reselected = await balancer.select_account(**_thread_row_kwargs(thread_key, lease_kind=lease_kind))
+    assert reselected.account is not None
+    assert reselected.account.id == owner.id
+    assert sticky_repo.account_ids_by_key[thread_key] == owner.id
+    await balancer.release_account_lease(reselected.lease)
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_owner_excluded_by_retry_loop_spills_without_rebinding(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=load_balancer_module.__name__)
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-excluded-spill")
+    assert alternate is not None
+    thread_key = "thread-excluded-spill-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+
+    # The retry loop excludes the owner after one transient upstream failure
+    # on this turn; the owner's persisted status is still recoverable.
+    selected = await balancer.select_account(
+        **_thread_row_kwargs(thread_key),
+        exclude_account_ids={owner.id},
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.account_ids_by_key[thread_key] == owner.id
+    assert sticky_repo.deleted == []
+    assert sticky_repo.upserts == []
+    assert "internal_soft_affinity_spillover" in caplog.text
+    await balancer.release_account_lease(selected.lease)
+
+    # Next turn has no exclusion: the mapping still points at the owner.
+    reselected = await balancer.select_account(**_thread_row_kwargs(thread_key))
+    assert reselected.account is not None
+    assert reselected.account.id == owner.id
+    await balancer.release_account_lease(reselected.lease)
+
+
+@pytest.mark.asyncio
+async def test_select_account_forwards_exclusions_to_sticky_selection_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The retry loop's excluded set reaches the sticky predicate only through
+    # this StickySelectionRequest field; pin the plumbing boundary.
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-exclusion-plumbing")
+    assert alternate is not None
+    thread_key = "thread-exclusion-plumbing-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    forwarded: list[frozenset[str]] = []
+    real_run = load_balancer_module.run_sticky_selection_path
+
+    async def capture(owner_balancer: Any, *, request: Any) -> Any:
+        forwarded.append(request.exclude_account_ids)
+        return await real_run(owner_balancer, request=request)
+
+    monkeypatch.setattr(load_balancer_module, "run_sticky_selection_path", capture)
+
+    selected = await balancer.select_account(
+        **_thread_row_kwargs(thread_key),
+        exclude_account_ids={owner.id},
+    )
+
+    assert forwarded == [frozenset({owner.id})]
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_isolated_and_excluded_prompt_cache_owner_keeps_its_mapping() -> None:
+    """Isolation must not convert a request-local spillover into a rebind: an
+    owner excluded by this request's own retry loop keeps its mapping whether
+    or not it is also isolated for overload."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-isolated-excluded")
+    assert alternate is not None
+    thread_key = "thread-isolated-excluded-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    now = balancer._clock.time()
+    balancer._runtime[owner.id] = RuntimeState(
+        overload_backoff_until=now + 900.0,
+        overload_isolated_until=now + 900.0,
+        overload_backoff_level=3,
+        overload_last_trip_at=now,
+    )
+
+    selected = await balancer.select_account(
+        **_thread_row_kwargs(thread_key),
+        exclude_account_ids={owner.id},
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    # Kept, not rebound -- and kept *alive*: the row is rewritten onto its own
+    # owner so a 1800 s TTL cannot expire it inside a 1800 s isolation window.
+    assert sticky_repo.upserts == [(thread_key, owner.id, StickySessionKind.PROMPT_CACHE)]
+    assert sticky_repo.deleted == []
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_security_work_excluded_prompt_cache_owner_is_rebound() -> None:
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-security-excluded")
+    assert alternate is not None
+    owner.security_work_authorized = False
+    alternate.security_work_authorized = True
+    thread_key = "thread-security-excluded-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+
+    # The owner leaves the request's continuity scope, so exclusion is not
+    # the only reason it is absent: permanent rebind, as today.
+    selected = await balancer.select_account(
+        **_thread_row_kwargs(thread_key),
+        require_security_work_authorized=True,
+        exclude_account_ids={owner.id},
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.upserts == [(thread_key, alternate.id, StickySessionKind.PROMPT_CACHE)]
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "owner_status",
+    [AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED, AccountStatus.REAUTH_REQUIRED],
+)
+async def test_excluded_prompt_cache_owner_with_recoverable_status_is_preserved(
+    owner_status: AccountStatus,
+) -> None:
+    # The snapshot a just-failed owner typically carries after the retry
+    # loop recorded its 429/quota/refresh failure: still recoverable.
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer(f"thread-{owner_status.value}-excluded")
+    assert alternate is not None
+    owner.status = owner_status
+    thread_key = f"thread-{owner_status.value}-excluded-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+
+    selected = await balancer.select_account(
+        **_thread_row_kwargs(thread_key),
+        exclude_account_ids={owner.id},
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.account_ids_by_key[thread_key] == owner.id
+    assert sticky_repo.deleted == []
+    assert sticky_repo.upserts == []
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_excluded_deactivated_prompt_cache_owner_is_rebound() -> None:
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-deactivated-excluded")
+    assert alternate is not None
+    owner.status = AccountStatus.DEACTIVATED
+    thread_key = "thread-deactivated-excluded-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+
+    selected = await balancer.select_account(
+        **_thread_row_kwargs(thread_key),
+        exclude_account_ids={owner.id},
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.upserts == [(thread_key, alternate.id, StickySessionKind.PROMPT_CACHE)]
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_spillover_log_redacts_account_ids_when_requested(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=load_balancer_module.__name__)
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-redacted-spill")
+    assert alternate is not None
+    thread_key = "thread-redacted-spill-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+
+    selected = await balancer.select_account(
+        **_thread_row_kwargs(thread_key),
+        exclude_account_ids={owner.id},
+        redact_sensitive_details=True,
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    spillover_lines = [line for line in caplog.text.splitlines() if "internal_soft_affinity_spillover" in line]
+    assert spillover_lines
+    assert all(owner.id not in line and alternate.id not in line for line in spillover_lines)
+    assert "old_account_id=<redacted> new_account_id=<redacted>" in spillover_lines[0]
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_excluded_paused_prompt_cache_owner_is_rebound() -> None:
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-paused-excluded")
+    assert alternate is not None
+    owner.status = AccountStatus.PAUSED
+    thread_key = "thread-paused-excluded-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+
+    selected = await balancer.select_account(
+        **_thread_row_kwargs(thread_key),
+        exclude_account_ids={owner.id},
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.upserts == [(thread_key, alternate.id, StickySessionKind.PROMPT_CACHE)]
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_excluded_prompt_cache_owner_not_in_pool_is_rebound() -> None:
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-ghost-owner")
+    assert alternate is not None
+    thread_key = "thread-ghost-owner-key"
+    sticky_repo.account_ids_by_key = {thread_key: "thread-ghost-owner-removed"}
+
+    selected = await balancer.select_account(
+        **_thread_row_kwargs(thread_key),
+        exclude_account_ids={"thread-ghost-owner-removed"},
+    )
+
+    assert selected.account is not None
+    assert selected.account.id in {owner.id, alternate.id}
+    assert [upsert[1] for upsert in sticky_repo.upserts] == [selected.account.id]
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_isolated_and_capped_prompt_cache_owner_keeps_its_mapping() -> None:
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-isolated-capped")
+    assert alternate is not None
+    thread_key = "thread-isolated-capped-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    now = balancer._clock.time()
+    balancer._runtime[owner.id] = RuntimeState(
+        overload_backoff_until=now + 900.0,
+        overload_isolated_until=now + 900.0,
+        overload_backoff_level=3,
+        overload_last_trip_at=now,
+    )
+    saturated_leases = [await balancer.acquire_account_lease(owner.id, kind="stream") for _ in range(8)]
+
+    selected = await balancer.select_account(**_thread_row_kwargs(thread_key))
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    # Request-local release: the alternate serves the turn and the thread row
+    # still points at the isolated owner, so the thread returns home once
+    # isolation lifts instead of gaining a permanent new owner.
+    # Kept, not rebound -- and kept *alive*: the row is rewritten onto its own
+    # owner so a 1800 s TTL cannot expire it inside a 1800 s isolation window.
+    assert sticky_repo.upserts == [(thread_key, owner.id, StickySessionKind.PROMPT_CACHE)]
+    for lease in [*saturated_leases, selected.lease]:
+        await balancer.release_account_lease(lease)
+
+
+def _make_probing_pool_balancer(
+    prefix: str,
+    *,
+    probing_count: int = 3,
+) -> tuple[LoadBalancer, Account, Account, _StubStickySessionsRepository]:
+    """An owner, one healthy sibling, and several due PROBING siblings."""
+    now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+    owner = _make_account(f"{prefix}-owner")
+    healthy = _make_account(f"{prefix}-healthy")
+    probing = [_make_account(f"{prefix}-probing-{index}") for index in range(probing_count)]
+    accounts = [owner, healthy, *probing]
+    usage_rows = {
+        account.id: _usage_row(index + 100, account.id, window="primary", reset_at=now_epoch + 300)
+        for index, account in enumerate(accounts)
+    }
+    secondary_rows = {
+        account.id: _usage_row(index + 200, account.id, window="secondary", reset_at=now_epoch + 3600)
+        for index, account in enumerate(accounts)
+    }
+    sticky_repo = _StubStickySessionsRepository()
+    sticky_repo.account_id = owner.id
+    balancer = LoadBalancer(
+        lambda: _repo_factory(
+            _StubAccountsRepository(accounts),
+            _StubUsageRepository(usage_rows, secondary_rows),
+            sticky_repo,
+        )
+    )
+    for index, account in enumerate(probing):
+        balancer._runtime[account.id] = RuntimeState(
+            health_tier=HEALTH_TIER_PROBING,
+            last_selected_at=balancer._clock.time() - PROBE_QUIET_SECONDS * 10 - index,
+        )
+    return balancer, owner, healthy, sticky_repo
+
+
+@pytest.mark.asyncio
+async def test_a_retained_release_is_counted_once_admission_succeeded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The counter is emitted from the admitted path, not from selection.
+
+    Selection can still lose its candidate to a concurrent lease, or be retried
+    on stale account state; a release that never served must not appear in the
+    metric the accounts-per-conversation change is judged by, and a retried
+    attempt must not appear twice.
+    """
+
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-counted-release")
+    assert alternate is not None
+    thread_key = "thread-counted-release-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    now = balancer._clock.time()
+    balancer._runtime[owner.id] = RuntimeState(
+        overload_backoff_until=now + 900.0,
+        overload_isolated_until=now + 900.0,
+        overload_backoff_level=3,
+        overload_last_trip_at=now,
+    )
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
+    selected = await balancer.select_account(**_thread_row_kwargs(thread_key))
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    messages = [record.getMessage() for record in caplog.records]
+    retained = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
+    assert len(retained) == 1, messages
+    assert "mapping=retained" in retained[0]
+    assert owner.id not in retained[0] and alternate.id not in retained[0]
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_retained_thread_does_not_rotate_through_due_probes() -> None:
+    """The public routing path, with probing siblings in the pool.
+
+    A recovery probe is the one admission that is *meant* to move: the due
+    probe is whichever probing account went quiet longest, so admitting one
+    advances its clock and hands the next turn to a sibling. A retained thread
+    following that rotation would fan out across the pool exactly as the
+    rebinding it replaces did.
+    """
+
+    balancer, owner, healthy, sticky_repo = _make_probing_pool_balancer("thread-probe-rotation")
+    thread_key = "thread-probe-rotation-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    now = balancer._clock.time()
+    balancer._runtime[owner.id] = RuntimeState(
+        overload_backoff_until=now + 900.0,
+        overload_isolated_until=now + 900.0,
+        overload_backoff_level=3,
+        overload_last_trip_at=now,
+    )
+
+    picks = []
+    for _ in range(8):
+        selected = await balancer.select_account(**_thread_row_kwargs(thread_key))
+        assert selected.account is not None, selected.error_message
+        picks.append(selected.account.id)
+        await balancer.release_account_lease(selected.lease)
+
+    assert set(picks) == {healthy.id}, picks
+    # Retained throughout: every write is a refresh onto the isolated owner.
+    assert {upsert[1] for upsert in sticky_repo.upserts} == {owner.id}
+    assert sticky_repo.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_an_isolated_owner_dropped_before_selection_is_still_counted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The counter has to see releases it never gets a state for.
+
+    ``_selectable_accounts`` removes paused and deactivated accounts before
+    states are built, so an isolated owner in that condition never reaches
+    selection at all -- yet its mapping is still rebound, which is exactly the
+    permanent half of what isolation does to a conversation.
+    """
+
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-isolated-offpool")
+    assert alternate is not None
+    thread_key = "thread-isolated-offpool-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    owner.status = AccountStatus.PAUSED
+    now = balancer._clock.time()
+    balancer._runtime[owner.id] = RuntimeState(
+        overload_backoff_until=now + 900.0,
+        overload_isolated_until=now + 900.0,
+        overload_backoff_level=3,
+        overload_last_trip_at=now,
+    )
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.load_balancer")
+    selected = await balancer.select_account(**_thread_row_kwargs(thread_key))
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.upserts == [(thread_key, alternate.id, StickySessionKind.PROMPT_CACHE)]
+    messages = [record.getMessage() for record in caplog.records]
+    released = [message for message in messages if "sticky_owner_overload_isolation_reroute" in message]
+    assert len(released) == 1, messages
+    assert "mapping=rebound" in released[0]
+    assert owner.id not in released[0] and alternate.id not in released[0]
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_capped_prompt_cache_owner_that_is_gone_is_rebound() -> None:
+    """Retention is for owners that come back.
+
+    A capped owner is absent from the selection states whatever its status, so
+    the decision has to be made here, where the pre-cap states are still
+    visible: a paused owner would otherwise keep its mapping -- and, while it
+    is also isolated, keep it refreshed -- forever.
+    """
+
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-capped-paused")
+    assert alternate is not None
+    thread_key = "thread-capped-paused-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    owner.status = AccountStatus.PAUSED
+    now = balancer._clock.time()
+    balancer._runtime[owner.id] = RuntimeState(
+        overload_backoff_until=now + 900.0,
+        overload_isolated_until=now + 900.0,
+        overload_backoff_level=3,
+        overload_last_trip_at=now,
+    )
+    # Capped as well, so the owner leaves the selection states for a reason
+    # that on its own would have preserved the mapping.
+    saturated_leases = [await balancer.acquire_account_lease(owner.id, kind="stream") for _ in range(8)]
+
+    selected = await balancer.select_account(**_thread_row_kwargs(thread_key))
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.upserts == [(thread_key, alternate.id, StickySessionKind.PROMPT_CACHE)]
+    for lease in [*saturated_leases, selected.lease]:
+        await balancer.release_account_lease(lease)
+
+
+@pytest.mark.asyncio
+async def test_reallocate_sticky_still_rebinds_capped_prompt_cache_owner() -> None:
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-reallocate-capped")
+    assert alternate is not None
+    thread_key = "thread-reallocate-capped-key"
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    saturated_leases = [await balancer.acquire_account_lease(owner.id, kind="stream") for _ in range(8)]
+
+    selected = await balancer.select_account(
+        **_thread_row_kwargs(thread_key),
+        reallocate_sticky=True,
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.upserts == [(thread_key, alternate.id, StickySessionKind.PROMPT_CACHE)]
+    for lease in [*saturated_leases, selected.lease]:
+        await balancer.release_account_lease(lease)
+
+
+@pytest.mark.asyncio
+async def test_bare_codex_session_excluded_owner_still_persists_fallback() -> None:
+    # Durable kind without TTL: the fallback is persisted so the session
+    # sticks to one account during the outage (unchanged by the TTL gate).
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("bare-excluded-durable")
+    assert alternate is not None
+    raw_session = "bare-excluded-durable-session"
+    selection_key = _codex_session_selection_key(raw_session)
+    sticky_repo.account_ids_by_key = {selection_key: owner.id}
+
+    selected = await balancer.select_account(
+        sticky_key=selection_key,
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="session_header",
+        legacy_sticky_key=raw_session,
+        spill_bare_session_on_account_cap=False,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+        exclude_account_ids={owner.id},
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.upserts == [(selection_key, alternate.id, StickySessionKind.CODEX_SESSION)]
+    await balancer.release_account_lease(selected.lease)
 
 
 @pytest.mark.asyncio
@@ -2765,6 +3776,341 @@ async def test_legacy_raw_session_mapping_wins_when_namespaced_row_also_exists()
 
 
 @pytest.mark.asyncio
+async def test_new_codex_thread_is_seeded_from_process_preference_without_rewriting_process_row() -> None:
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-process-seed")
+    assert alternate is not None
+    process_session = "process-seed"
+    process_key = _codex_session_selection_key(process_session)
+    thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "thread-new"}
+    ).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {process_key: owner.id}
+
+    selected = await balancer.select_account(
+        sticky_key=thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key=process_session,
+        sticky_seed_key=process_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == owner.id
+    assert sticky_repo.account_ids_by_key == {
+        process_key: owner.id,
+        thread_key: owner.id,
+    }
+    assert sticky_repo.deleted == []
+    assert sticky_repo.upserts == [(thread_key, owner.id, StickySessionKind.PROMPT_CACHE)]
+
+
+@pytest.mark.asyncio
+async def test_first_codex_thread_initializes_process_preference_once_for_later_siblings() -> None:
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-first-process")
+    assert alternate is not None
+    process_session = "process-first-thread"
+    process_key = _codex_session_selection_key(process_session)
+    first_thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "thread-first"}
+    ).thread_selection_key
+    sibling_thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "thread-sibling"}
+    ).thread_selection_key
+    assert first_thread_key is not None
+    assert sibling_thread_key is not None
+    sticky_repo.account_ids_by_key = {}
+
+    first = await balancer.select_account(
+        sticky_key=first_thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key=process_session,
+        sticky_seed_key=process_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+    assert first.account is not None
+    first_account_id = first.account.id
+
+    sibling = await balancer.select_account(
+        sticky_key=sibling_thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key=process_session,
+        sticky_seed_key=process_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+
+    assert sibling.account is not None
+    assert sibling.account.id == first_account_id
+    assert sticky_repo.account_ids_by_key[process_key] == first_account_id
+    assert sticky_repo.insert_if_absent_calls == []
+    assert sticky_repo.seeded_upserts == [
+        (
+            first_thread_key,
+            first_account_id,
+            StickySessionKind.PROMPT_CACHE,
+            process_key,
+            StickySessionKind.CODEX_SESSION,
+        )
+    ]
+    assert sticky_repo.upserts == [
+        (first_thread_key, first_account_id, StickySessionKind.PROMPT_CACHE),
+        (sibling_thread_key, first_account_id, StickySessionKind.PROMPT_CACHE),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fresh_same_owner_retention_skips_refresh_write_when_seed_exists() -> None:
+    """A hot same-owner retention whose lookup observed the row inside the
+    refresh-skip window issues no sticky write at all."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-skip-refresh")
+    assert alternate is not None
+    process_session = "process-skip-refresh"
+    process_key = _codex_session_selection_key(process_session)
+    thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "thread-skip"}
+    ).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {process_key: owner.id, thread_key: owner.id}
+    sticky_repo.refresh_skip_deadlines_by_key[thread_key] = datetime.now(tz=timezone.utc).replace(
+        tzinfo=None
+    ) + timedelta(seconds=10)
+
+    selected = await balancer.select_account(
+        sticky_key=thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key=process_session,
+        sticky_seed_key=process_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == owner.id
+    assert sticky_repo.upserts == []
+    assert sticky_repo.seeded_upserts == []
+    assert sticky_repo.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_fresh_thread_row_with_missing_seed_still_writes_and_initializes_seed() -> None:
+    """Seed initialization piggybacks on the thread retention write; a fresh
+    thread row must not suppress it while the process seed is absent."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-skip-seedless")
+    assert alternate is not None
+    process_session = "process-skip-seedless"
+    process_key = _codex_session_selection_key(process_session)
+    thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "thread-seedless"}
+    ).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    sticky_repo.refresh_skip_deadlines_by_key[thread_key] = datetime.now(tz=timezone.utc).replace(
+        tzinfo=None
+    ) + timedelta(seconds=10)
+
+    selected = await balancer.select_account(
+        sticky_key=thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key=process_session,
+        sticky_seed_key=process_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == owner.id
+    assert sticky_repo.account_ids_by_key[process_key] == owner.id
+    assert sticky_repo.seeded_upserts == [
+        (
+            thread_key,
+            owner.id,
+            StickySessionKind.PROMPT_CACHE,
+            process_key,
+            StickySessionKind.CODEX_SESSION,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_expired_refresh_skip_deadline_still_writes_through() -> None:
+    """A deadline that lapsed between lookup and persist must not suppress the
+    refresh: the skip window is revalidated at write time."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-skip-expired")
+    assert alternate is not None
+    process_session = "process-skip-expired"
+    process_key = _codex_session_selection_key(process_session)
+    thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "thread-expired"}
+    ).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {process_key: owner.id, thread_key: owner.id}
+    sticky_repo.refresh_skip_deadlines_by_key[thread_key] = datetime.now(tz=timezone.utc).replace(
+        tzinfo=None
+    ) - timedelta(seconds=1)
+
+    selected = await balancer.select_account(
+        sticky_key=thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key=process_session,
+        sticky_seed_key=process_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == owner.id
+    assert sticky_repo.upserts == [(thread_key, owner.id, StickySessionKind.PROMPT_CACHE)]
+
+
+@pytest.mark.asyncio
+async def test_required_file_owner_does_not_rewrite_existing_thread_row() -> None:
+    balancer, thread_owner, file_owner, sticky_repo = _make_cap_spillover_balancer("file-pin-thread")
+    assert file_owner is not None
+    process_session = "file-pin-process"
+    thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "file-pin-thread"}
+    ).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {thread_key: thread_owner.id}
+    preferred = _AffinityPolicy.preferred_owner_sticky_inputs(
+        thread_key,
+        StickySessionKind.PROMPT_CACHE,
+        False,
+        300,
+        "thread_header",
+        process_session,
+    )
+
+    selected = await balancer.select_account(
+        sticky_key=preferred[0],
+        sticky_kind=preferred[1],
+        reallocate_sticky=preferred[2],
+        sticky_max_age_seconds=preferred[3],
+        sticky_source=preferred[4],
+        legacy_sticky_key=preferred[5],
+        required_account_id=file_owner.id,
+        required_account_is_ownership_constraint=True,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == file_owner.id
+    assert sticky_repo.account_ids_by_key == {thread_key: thread_owner.id}
+    assert sticky_repo.upserts == []
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_required_file_owner_seeds_process_preference_for_later_sibling() -> None:
+    balancer, thread_owner, file_owner, sticky_repo = _make_cap_spillover_balancer("file-pin-seed")
+    assert file_owner is not None
+    process_session = "file-pin-seed-process"
+    process_key = _codex_session_selection_key(process_session)
+    first_thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "file-pin-first"}
+    ).thread_selection_key
+    sibling_thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "file-pin-sibling"}
+    ).thread_selection_key
+    assert first_thread_key is not None
+    assert sibling_thread_key is not None
+    sticky_repo.account_ids_by_key = {}
+    preferred = _AffinityPolicy.preferred_owner_sticky_inputs(
+        first_thread_key,
+        StickySessionKind.PROMPT_CACHE,
+        False,
+        300,
+        "thread_header",
+        process_session,
+    )
+
+    first = await balancer.select_account(
+        sticky_key=preferred[0],
+        sticky_kind=preferred[1],
+        reallocate_sticky=preferred[2],
+        sticky_max_age_seconds=preferred[3],
+        sticky_source=preferred[4],
+        legacy_sticky_key=preferred[5],
+        sticky_seed_key=process_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        required_account_id=file_owner.id,
+        required_account_is_ownership_constraint=True,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+    )
+    assert first.account is not None
+    assert first.account.id == file_owner.id
+    assert first_thread_key not in (sticky_repo.account_ids_by_key or {})
+    assert sticky_repo.account_ids_by_key == {process_key: file_owner.id}
+
+    sibling = await balancer.select_account(
+        sticky_key=sibling_thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key=process_session,
+        sticky_seed_key=process_key,
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+    )
+    assert sibling.account is not None
+    assert sibling.account.id == file_owner.id
+    assert sticky_repo.account_ids_by_key[process_key] == file_owner.id
+    await balancer.release_account_lease(first.lease)
+    await balancer.release_account_lease(sibling.lease)
+
+
+@pytest.mark.asyncio
+async def test_legacy_raw_process_owner_wins_over_thread_locality() -> None:
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-legacy-owner")
+    assert alternate is not None
+    process_session = "legacy-process-owner"
+    thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "thread-existing"}
+    ).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {
+        process_session: owner.id,
+        thread_key: alternate.id,
+    }
+
+    selected = await balancer.select_account(
+        sticky_key=thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        legacy_sticky_key=process_session,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == owner.id
+    assert sticky_repo.account_ids_by_key == {
+        process_session: owner.id,
+        thread_key: alternate.id,
+    }
+    assert sticky_repo.deleted == []
+    assert sticky_repo.upserts == []
+
+
+@pytest.mark.asyncio
 async def test_legacy_raw_owner_conflict_blocks_resolved_preferred_owner() -> None:
     balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("legacy-preferred-conflict")
     assert alternate is not None
@@ -2787,6 +4133,208 @@ async def test_legacy_raw_owner_conflict_blocks_resolved_preferred_owner() -> No
 
 
 @pytest.mark.asyncio
+async def test_goal_restart_does_not_repin_retired_owner_from_stale_selection_snapshot() -> None:
+    now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+    stale_owner = _make_account("goal-restart-stale-snapshot-owner")
+    replacement = _make_account("goal-restart-stale-snapshot-replacement")
+    raw_session = "goal-restart-stale-snapshot"
+    selection_key = _codex_session_selection_key(raw_session)
+    sticky_repo = _RetiringStaleOwnerStickySessionsRepository(
+        raw_key=raw_session,
+        owner_account_id=stale_owner.id,
+    )
+    # Keep both account objects ACTIVE to model inputs loaded before the
+    # repository's guarded retirement observes the owner's unavailable row.
+    balancer = LoadBalancer(
+        lambda: _repo_factory(
+            _StubAccountsRepository([stale_owner, replacement]),
+            _StubUsageRepository(
+                {
+                    stale_owner.id: _usage_row(301, stale_owner.id, window="primary", reset_at=now_epoch + 300),
+                    replacement.id: _usage_row(302, replacement.id, window="primary", reset_at=now_epoch + 300),
+                },
+                {},
+            ),
+            sticky_repo,
+        )
+    )
+
+    selected = await balancer.select_account(
+        sticky_key=selection_key,
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="session_header",
+        legacy_sticky_key=raw_session,
+        abandon_unavailable_legacy_owner=True,
+        routing_strategy="single_account",
+        lease_kind="stream",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == replacement.id
+    assert sticky_repo.tombstones == [(raw_session, stale_owner.id)]
+    assert sticky_repo.account_ids_by_key == {
+        raw_session: stale_owner.id,
+        selection_key: replacement.id,
+    }
+    assert all(account_id != stale_owner.id for _, account_id, _ in sticky_repo.upserts)
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_goal_restart_with_thread_header_retires_unavailable_legacy_owner() -> None:
+    now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+    stale_owner = _make_account("goal-restart-thread-header-owner")
+    replacement = _make_account("goal-restart-thread-header-replacement")
+    raw_session = "goal-restart-thread-header-session"
+    thread_key = _codex_backend_identity(
+        {"session-id": raw_session, "thread-id": "goal-restart-thread"}
+    ).thread_selection_key
+    assert thread_key is not None
+    sticky_repo = _RetiringStaleOwnerStickySessionsRepository(
+        raw_key=raw_session,
+        owner_account_id=stale_owner.id,
+    )
+    balancer = LoadBalancer(
+        lambda: _repo_factory(
+            _StubAccountsRepository([stale_owner, replacement]),
+            _StubUsageRepository(
+                {
+                    stale_owner.id: _usage_row(311, stale_owner.id, window="primary", reset_at=now_epoch + 300),
+                    replacement.id: _usage_row(312, replacement.id, window="primary", reset_at=now_epoch + 300),
+                },
+                {},
+            ),
+            sticky_repo,
+        )
+    )
+
+    selected = await balancer.select_account(
+        sticky_key=thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        sticky_max_age_seconds=300,
+        legacy_sticky_key=raw_session,
+        abandon_unavailable_legacy_owner=True,
+        routing_strategy="single_account",
+        lease_kind="stream",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == replacement.id
+    assert sticky_repo.tombstones == [(raw_session, stale_owner.id)]
+    assert sticky_repo.account_ids_by_key == {
+        raw_session: stale_owner.id,
+        thread_key: replacement.id,
+    }
+    assert all(account_id != stale_owner.id for _, account_id, _ in sticky_repo.upserts)
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_goal_restart_cas_loser_does_not_repin_concurrently_retired_owner() -> None:
+    now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+    stale_owner = _make_account("goal-restart-cas-loser-owner")
+    replacement = _make_account("goal-restart-cas-loser-replacement")
+    raw_session = "goal-restart-cas-loser"
+    selection_key = _codex_session_selection_key(raw_session)
+    sticky_repo = _LosingRetirementRaceStickySessionsRepository(
+        raw_key=raw_session,
+        owner_account_id=stale_owner.id,
+    )
+    balancer = LoadBalancer(
+        lambda: _repo_factory(
+            _StubAccountsRepository([stale_owner, replacement]),
+            _StubUsageRepository(
+                {
+                    stale_owner.id: _usage_row(305, stale_owner.id, window="primary", reset_at=now_epoch + 300),
+                    replacement.id: _usage_row(306, replacement.id, window="primary", reset_at=now_epoch + 300),
+                },
+                {},
+            ),
+            sticky_repo,
+        )
+    )
+
+    selected = await balancer.select_account(
+        sticky_key=selection_key,
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="session_header",
+        legacy_sticky_key=raw_session,
+        abandon_unavailable_legacy_owner=True,
+        routing_strategy="single_account",
+        lease_kind="stream",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == replacement.id
+    assert sticky_repo.tombstones == [(raw_session, stale_owner.id)]
+    assert sticky_repo.account_ids_by_key == {
+        raw_session: stale_owner.id,
+        selection_key: replacement.id,
+    }
+    assert all(account_id != stale_owner.id for _, account_id, _ in sticky_repo.upserts)
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_goal_restart_mutation_authority_precedes_model_eligibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+    owner = _make_account("goal-restart-model-ineligible-owner")
+    replacement = _make_account("goal-restart-model-eligible-replacement")
+    raw_session = "goal-restart-model-authority"
+    selection_key = _codex_session_selection_key(raw_session)
+    sticky_repo = _RetiringStaleOwnerStickySessionsRepository(
+        raw_key=raw_session,
+        owner_account_id=owner.id,
+    )
+    balancer = LoadBalancer(
+        lambda: _repo_factory(
+            _StubAccountsRepository([owner, replacement]),
+            _StubUsageRepository(
+                {
+                    owner.id: _usage_row(303, owner.id, window="primary", reset_at=now_epoch + 300),
+                    replacement.id: _usage_row(304, replacement.id, window="primary", reset_at=now_epoch + 300),
+                },
+                {},
+            ),
+            sticky_repo,
+        )
+    )
+
+    monkeypatch.setattr(load_balancer_module, "_mapped_model_has_registry_entry", lambda _model: True)
+    monkeypatch.setattr(
+        load_balancer_module,
+        "_filter_accounts_for_model",
+        lambda accounts, _model, **_kwargs: [account for account in accounts if account.id == replacement.id],
+    )
+    monkeypatch.setattr(
+        load_balancer_module,
+        "_filter_accounts_for_model_with_catalog_evidence",
+        lambda accounts, _model, **_kwargs: load_balancer_module._ModelAccountFilterResult(
+            accounts=[account for account in accounts if account.id == replacement.id],
+            general_model_account_ids=frozenset({replacement.id}),
+        ),
+    )
+
+    selected = await balancer.select_account(
+        sticky_key=selection_key,
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="session_header",
+        legacy_sticky_key=raw_session,
+        abandon_unavailable_legacy_owner=True,
+        model="gpt-model-authority",
+        lease_kind="stream",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == replacement.id
+    assert sticky_repo.tombstones == [(raw_session, owner.id)]
+    await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
 async def test_bare_session_mapping_does_not_prove_ambiguous_conversation_owner() -> None:
     balancer, owner, _, sticky_repo = _make_cap_spillover_balancer("conversation-ambiguous")
     raw_session = "conversation-session"
@@ -2794,6 +4342,31 @@ async def test_bare_session_mapping_does_not_prove_ambiguous_conversation_owner(
 
     selected = await balancer.select_account(
         sticky_key=_codex_session_selection_key(raw_session),
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="session_header",
+        legacy_sticky_key=raw_session,
+        require_unambiguous_account=True,
+        lease_kind="response_create",
+    )
+
+    assert selected.account is None
+    assert selected.error_code == "conversation_owner_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_scoped_restart_marker_does_not_prove_ambiguous_conversation_owner() -> None:
+    balancer, retired_owner, replacement, sticky_repo = _make_cap_spillover_balancer("conversation-scoped-restart")
+    assert replacement is not None
+    raw_session = "conversation-scoped-restart-session"
+    selection_key = _codex_session_selection_key(raw_session)
+    sticky_repo.account_ids_by_key = {
+        raw_session: retired_owner.id,
+        selection_key: replacement.id,
+    }
+    sticky_repo.scoped_abandoned_account_ids_by_key[raw_session] = retired_owner.id
+
+    selected = await balancer.select_account(
+        sticky_key=selection_key,
         sticky_kind=StickySessionKind.CODEX_SESSION,
         sticky_source="session_header",
         legacy_sticky_key=raw_session,
@@ -3816,3 +5389,201 @@ async def test_api_key_fair_share_concurrent_sticky_selections_cannot_overshoot_
     # The commit re-check kept heavy at exactly its share across both paths.
     heavy_total = sum((runtime.stream_key_inflight or {}).get("heavy", 0) for runtime in balancer._runtime.values())
     assert heavy_total == 2
+
+
+@pytest.mark.asyncio
+async def test_fresh_same_owner_retention_skips_refresh_write_on_probe_admission() -> None:
+    """The recovery-probe admission path honors the refresh-skip deadline the
+    same way the non-probe persist site does: a fresh same-owner retention of
+    a due-probing pinned owner issues no sticky write."""
+    now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+    healthy = _make_account("acc-probe-skip-healthy")
+    probing = _make_account("acc-probe-skip-probing")
+    key = "probe-skip-session"
+
+    def _build(sticky_repo: _StubStickySessionsRepository) -> LoadBalancer:
+        accounts_repo = _StubAccountsRepository([healthy, probing])
+        usage_repo = _StubUsageRepository(
+            primary={
+                healthy.id: _usage_row_with_percent(
+                    150,
+                    healthy.id,
+                    used_percent=30.0,
+                    reset_at=now_epoch + 300,
+                ),
+                probing.id: _usage_row_with_percent(
+                    151,
+                    probing.id,
+                    used_percent=10.0,
+                    reset_at=now_epoch + 300,
+                ),
+            },
+            secondary={},
+        )
+        balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+        balancer._runtime[probing.id] = RuntimeState(
+            health_tier=HEALTH_TIER_PROBING,
+            last_selected_at=0.0,
+            version=17,
+        )
+        return balancer
+
+    # Control: without a freshness observation the probe admission persists
+    # the retention write, proving this scenario exercises the probe branch.
+    control_repo = _StubStickySessionsRepository()
+    control_repo.account_ids_by_key = {key: probing.id}
+    control_balancer = _build(control_repo)
+    control = await control_balancer.select_account(
+        sticky_key=key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+    )
+    assert control.account is not None
+    assert control.account.id == probing.id
+    assert control_repo.upserts == [(key, probing.id, StickySessionKind.PROMPT_CACHE)]
+    await control_balancer.release_account_lease(control.lease)
+
+    skip_repo = _StubStickySessionsRepository()
+    skip_repo.account_ids_by_key = {key: probing.id}
+    skip_repo.refresh_skip_deadlines_by_key[key] = datetime.now(tz=timezone.utc).replace(tzinfo=None) + timedelta(
+        seconds=10
+    )
+    skip_balancer = _build(skip_repo)
+    selected = await skip_balancer.select_account(
+        sticky_key=key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+        lease_kind="stream",
+    )
+    assert selected.account is not None
+    assert selected.account.id == probing.id
+    assert skip_repo.upserts == []
+    assert skip_repo.deleted == []
+    # The probe reservation itself still committed: runtime advanced.
+    probing_runtime = skip_balancer._runtime[probing.id]
+    assert probing_runtime.version > 17
+    assert probing_runtime.last_selected_at is not None
+    assert probing_runtime.last_selected_at > 0.0
+    await skip_balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_fresh_thread_only_retention_without_seed_key_skips_refresh_write() -> None:
+    """Thread-only affinity (no process seed key at all) has nothing to
+    initialize, so a fresh same-owner retention skips its refresh write."""
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-skip-no-seedkey")
+    assert alternate is not None
+    thread_key = _codex_backend_identity({"thread-id": "thread-only-skip"}).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {thread_key: owner.id}
+    sticky_repo.refresh_skip_deadlines_by_key[thread_key] = datetime.now(tz=timezone.utc).replace(
+        tzinfo=None
+    ) + timedelta(seconds=10)
+
+    selected = await balancer.select_account(
+        sticky_key=thread_key,
+        sticky_kind=StickySessionKind.PROMPT_CACHE,
+        sticky_source="thread_header",
+        sticky_max_age_seconds=300,
+        routing_strategy="usage_weighted",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == owner.id
+    assert sticky_repo.upserts == []
+    assert sticky_repo.seeded_upserts == []
+    assert sticky_repo.deleted == []
+
+
+class _LookupCountingStickyRepo(_StubStickySessionsRepository):
+    """Records owner-lookup and snapshot-release events, each stamped with the
+    repository context that issued it, so tests can pin lookup count/order and
+    the one-session/fresh-transaction-per-source contract."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Set by the test's repo factory each time a repo bundle opens.
+        self.current_context_id: int | None = None
+        self.owner_lookup_events: list[tuple[str, int | None, str | None]] = []
+
+    async def get_account_id_and_abandonment(self, *args: Any, **kwargs: Any) -> StickyOwnerLookup:
+        self.owner_lookup_events.append(("lookup", self.current_context_id, cast(str, args[0])))
+        return await super().get_account_id_and_abandonment(*args, **kwargs)
+
+    async def release_read_snapshot(self) -> None:
+        self.owner_lookup_events.append(("release_snapshot", self.current_context_id, None))
+        await super().release_read_snapshot()
+
+
+@pytest.mark.asyncio
+async def test_shared_owner_lookup_session_reads_each_owner_key_exactly_once() -> None:
+    """Regression for the shared owner-lookup session.
+
+    The legacy/seed/first-sticky owner reads moved into one repo bundle in
+    ``select_account``; the sticky selection loop consumes the hoisted first
+    read exactly once instead of re-reading. Each owner key must be looked up
+    exactly once, in the legacy -> seed -> sticky order, all three reads must
+    share one repository context (one session), each later ownership source
+    must first release the shared read snapshot so it starts a fresh
+    transaction, and the resolved hard owner must still win selection.
+    """
+    now_epoch = int(datetime.now(tz=timezone.utc).timestamp())
+    owner = _make_account("acc-shared-owner-lookup")
+    other = _make_account("acc-shared-owner-other")
+    accounts_repo = _StubAccountsRepository([owner, other])
+    usage_repo = _StubUsageRepository(
+        primary={
+            owner.id: _usage_row(70, owner.id, window="primary", reset_at=now_epoch + 300),
+            other.id: _usage_row(71, other.id, window="primary", reset_at=now_epoch + 300),
+        },
+        secondary={},
+    )
+    sticky_repo = _LookupCountingStickyRepo()
+    sticky_repo.account_ids_by_key = {"shared-lookup-sticky": owner.id}
+    opened_context_count = 0
+
+    @asynccontextmanager
+    async def context_stamping_repo_factory() -> AsyncIterator[ProxyRepositories]:
+        # Stamp every bundle open with a distinct identifier so the events
+        # recorded by the sticky repo prove which context issued each read;
+        # the old per-lookup-session flow would record three distinct ids.
+        nonlocal opened_context_count
+        opened_context_count += 1
+        sticky_repo.current_context_id = opened_context_count
+        async with _repo_factory(accounts_repo, usage_repo, sticky_repo) as repos:
+            yield repos
+
+    balancer = LoadBalancer(context_stamping_repo_factory)
+
+    selected = await balancer.select_account(
+        sticky_key="shared-lookup-sticky",
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="turn_state",
+        legacy_sticky_key="shared-lookup-legacy",
+        sticky_seed_key="shared-lookup-seed",
+        sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+        routing_strategy="usage_weighted",
+    )
+
+    assert selected.account is not None
+    assert selected.account.id == owner.id
+    # get_account_id (seed) delegates to get_account_id_and_abandonment in the
+    # stub, so this also proves the seed lookup ran exactly once. The
+    # release_snapshot events pin the fix semantics: one shared session, but a
+    # fresh read transaction before each later ownership source so a
+    # concurrently committed owner stays visible on SQLite/WAL.
+    assert [(event, key) for event, _, key in sticky_repo.owner_lookup_events] == [
+        ("lookup", "shared-lookup-legacy"),
+        ("release_snapshot", None),
+        ("lookup", "shared-lookup-seed"),
+        ("release_snapshot", None),
+        ("lookup", "shared-lookup-sticky"),
+    ]
+    lookup_context_ids = {context_id for _, context_id, _ in sticky_repo.owner_lookup_events}
+    # One repository context served every ownership source; the old
+    # session-per-lookup flow would have recorded three distinct ids here.
+    assert len(lookup_context_ids) == 1
+    assert None not in lookup_context_ids

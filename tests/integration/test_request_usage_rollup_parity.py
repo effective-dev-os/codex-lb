@@ -35,13 +35,13 @@ from app.db.models import (
 )
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
-from app.modules.accounts.usage_rollup import FOLD_LAG
 from app.modules.accounts.usage_time_rollup import (
     floor_to_hour,
     run_conversation_fold_pass,
     run_hourly_fold_pass,
 )
 from app.modules.api_keys.repository import ApiKeysRepository
+from app.modules.quota_planner.logic import _bin_demand_units
 from app.modules.quota_planner.repository import QuotaPlannerRepository
 from app.modules.reports.repository import ReportsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
@@ -50,10 +50,24 @@ pytestmark = pytest.mark.integration
 
 _EPOCH = datetime(1970, 1, 1)
 
+# The 10-day corpus geometry below (TARGET_W at BASE + 9d, prune floor at
+# BASE + 8d, unaligned windows and boundary rows placed between them) was
+# authored against a 24h fold lag. The parity semantics under test are
+# lag-independent, so the lag is pinned here to keep the corpus exercising
+# every boundary it was designed around; the production FOLD_LAG's own
+# tail/absorption behavior is covered in test_account_usage_rollup.py.
+CORPUS_FOLD_LAG = timedelta(hours=24)
+
+
+@pytest.fixture(autouse=True)
+def _pin_corpus_fold_lag(monkeypatch):
+    monkeypatch.setattr("app.modules.accounts.usage_time_rollup.FOLD_LAG", CORPUS_FOLD_LAG)
+
+
 # Fixed 10-day corpus timeline (all naive UTC, matching requested_at).
 BASE = datetime(2025, 7, 1)
 NOW = BASE + timedelta(days=10, minutes=37)
-TARGET_W = floor_to_hour(NOW - FOLD_LAG)  # BASE + 9d
+TARGET_W = floor_to_hour(NOW - CORPUS_FOLD_LAG)  # BASE + 9d
 MID_W = BASE + timedelta(days=5, hours=3)  # whole hour mid-history
 
 SINCE_ALIGNED = BASE + timedelta(days=2)
@@ -140,9 +154,9 @@ def _corpus() -> list[RequestLog]:
     for offset in (timedelta(hours=30), timedelta(days=5, hours=1), timedelta(days=9, hours=20)):
         rows.append(_log(BASE + offset, request_id_suffix="w", request_kind="warmup", cost_usd=0.002))
         rows.append(_log(BASE + offset + timedelta(minutes=20), request_id_suffix="lw", request_kind="limit_warmup"))
-    # Cancelled rows on both sides of every candidate watermark: the listing
-    # count's default status split (success+error) must exclude them from
-    # the folded sum and the raw tail alike.
+    # Cancelled rows on both sides of every candidate watermark: the default
+    # listing must include them as a distinct status in both the folded sum
+    # and the raw tail.
     for offset in (timedelta(days=1, hours=5), timedelta(days=9, hours=23)):
         rows.append(
             _log(
@@ -281,6 +295,11 @@ async def _snapshot(*, lead_since: datetime = SINCE_UNALIGNED) -> dict:
         planner = QuotaPlannerRepository(session)
         api_keys = ApiKeysRepository(session)
         reports = ReportsRepository(session)
+        demand_bins = await planner.aggregate_demand_bins(since=BASE + timedelta(hours=1))
+        demand_slot_units = await planner.aggregate_demand_slot_units(since=BASE + timedelta(hours=1))
+        # Independent cross-check of the SQL reduction against the exact-grain
+        # Python reduction: per-row ``max()`` before the per-slot sum.
+        _assert_slot_units_match_bins(demand_slot_units, demand_bins)
         return {
             "buckets_1h": await logs.aggregate_by_bucket(lead_since, 3600),
             "buckets_6h": await logs.aggregate_by_bucket(lead_since, 21600),
@@ -311,7 +330,8 @@ async def _snapshot(*, lead_since: datetime = SINCE_UNALIGNED) -> dict:
             "top_error_tie": await logs.top_error_between(BASE + timedelta(days=3), BASE + timedelta(days=3, hours=3)),
             "top_error_empty": await logs.top_error_between(*EMPTY_ERROR_WINDOW),
             "earliest": await logs.earliest_activity_at(),
-            "demand": _project_demand(await planner.aggregate_demand_bins(since=BASE + timedelta(hours=1))),
+            "demand": _project_demand(demand_bins),
+            "demand_slot_units": _project_demand_slot_units(demand_slot_units),
             "trends_key1": await api_keys.trends_by_key("key_1", lead_since, NOW, 3600),
             "trends_key2": await api_keys.trends_by_key("key_2", SINCE_ALIGNED, UNTIL_UNALIGNED, 7200),
             "trends_raw_degrade": await api_keys.trends_by_key("key_1", lead_since, NOW, 5400),
@@ -330,9 +350,18 @@ async def _listing_totals(logs: RequestLogsRepository, lead_since: datetime) -> 
 
     return {
         "default": await _total(),
-        "success_only": await _total(include_error_other=False),
-        "error_only": await _total(include_success=False),
-        "no_status_filter": await _total(include_success=False, include_error_other=False),
+        "success_only": await _total(include_cancelled=False, include_error_other=False),
+        "cancelled_only": await _total(
+            include_success=False,
+            include_cancelled=True,
+            include_error_other=False,
+        ),
+        "error_only": await _total(include_success=False, include_cancelled=False),
+        "no_status_filter": await _total(
+            include_success=False,
+            include_cancelled=False,
+            include_error_other=False,
+        ),
         "windowed": await _total(since=lead_since, until=UNTIL_UNALIGNED),
         "folded_only": await _total(since=FOLDED_ONLY_WINDOW[0], until=FOLDED_ONLY_WINDOW[1]),
         "tail_only": await _total(since=TAIL_ONLY_WINDOW[0], until=TAIL_ONLY_WINDOW[1]),
@@ -369,6 +398,28 @@ def _project_demand(bins) -> dict:
     return projected
 
 
+def _assert_slot_units_match_bins(slots, bins) -> None:
+    expected: dict[tuple, float] = {}
+    for bin_row in bins:
+        key = (bin_row.slot_epoch, bin_row.request_kind)
+        expected[key] = expected.get(key, 0.0) + _bin_demand_units(bin_row)
+    actual = _project_demand_slot_units(slots)
+    assert actual.keys() == expected.keys()
+    for key, expected_units in expected.items():
+        assert actual[key] == pytest.approx(expected_units, rel=1e-9, abs=1e-9), key
+
+
+def _project_demand_slot_units(slots) -> dict:
+    """Per-(slot, request_kind) units from the SQL-reduced reader. The planner
+    only ever consumes per-slot totals, so this is the grain the reduced path
+    must hold across watermark states."""
+    projected: dict[tuple, float] = {}
+    for slot in slots:
+        key = (slot.slot_epoch, slot.request_kind)
+        projected[key] = projected.get(key, 0.0) + slot.demand_units
+    return projected
+
+
 def _assert_snapshots_equal(actual: dict, expected: dict, *, skip_keys: tuple[str, ...] = ()) -> None:
     assert actual.keys() == expected.keys()
     for key, expected_value in expected.items():
@@ -386,6 +437,10 @@ def _assert_snapshots_equal(actual: dict, expected: dict, *, skip_keys: tuple[st
                 actual_entry = actual_value[demand_key]
                 assert actual_entry[:4] == expected_entry[:4], (key, demand_key)
                 assert actual_entry[4] == pytest.approx(expected_entry[4], rel=1e-9, abs=1e-12), (key, demand_key)
+        elif key == "demand_slot_units":
+            assert actual_value.keys() == expected_value.keys(), key
+            for slot_key, expected_units in expected_value.items():
+                assert actual_value[slot_key] == pytest.approx(expected_units, rel=1e-9, abs=1e-9), (key, slot_key)
         elif key.startswith("reports_summary"):
             assert replace(actual_value, total_cost_usd=0.0) == replace(expected_value, total_cost_usd=0.0), key
             assert actual_value.total_cost_usd == pytest.approx(expected_value.total_cost_usd, rel=1e-9, abs=1e-12), key
@@ -453,10 +508,10 @@ async def test_switched_readers_match_legacy_across_watermark_states(db_setup):
     # Watermark state 2 — mid-history whole hour. The hourly and conversation
     # folds advance separately (mixed-watermark states in between must hold
     # parity too: each satellite degrades on its own watermark).
-    await run_hourly_fold_pass(now=MID_W + FOLD_LAG)
+    await run_hourly_fold_pass(now=MID_W + CORPUS_FOLD_LAG)
     assert await _watermark() == MID_W
     _assert_snapshots_equal(await _snapshot(), reference)
-    await run_conversation_fold_pass(now=MID_W + FOLD_LAG)
+    await run_conversation_fold_pass(now=MID_W + CORPUS_FOLD_LAG)
     assert await _conversation_watermark() == MID_W
     _assert_snapshots_equal(await _snapshot(), reference)
 
@@ -477,8 +532,8 @@ async def test_reader_is_consistent_under_concurrent_fold_commit(db_setup, monke
     came from, and folding never deletes raw rows."""
     await _seed_corpus()
     reference = await _snapshot()
-    await run_hourly_fold_pass(now=MID_W + FOLD_LAG)
-    await run_conversation_fold_pass(now=MID_W + FOLD_LAG)
+    await run_hourly_fold_pass(now=MID_W + CORPUS_FOLD_LAG)
+    await run_conversation_fold_pass(now=MID_W + CORPUS_FOLD_LAG)
 
     real_read_hourly_window = request_logs_repository_module.read_hourly_window
     fold_injections = {"count": 0}
@@ -559,7 +614,7 @@ async def test_escape_hatch_reset_degrades_to_legacy_then_rebackfills(db_setup):
 @pytest.mark.asyncio
 async def test_statistics_survive_retention_pruning_folded_raw(db_setup, monkeypatch):
     """The headline guarantee: after raw rows below the retention gate
-    (watermark - FOLD_LAG) are physically deleted, every rollup-served
+    (watermark - fold lag) are physically deleted, every rollup-served
     statistic is unchanged — INCLUDING the distinct-conversation metrics,
     which the conversation presence satellite now serves for folded history
     (they used to be raw-bound and shrink here). earliest_activity_at falls
@@ -568,6 +623,11 @@ async def test_statistics_survive_retention_pruning_folded_raw(db_setup, monkeyp
     reference = await _snapshot()
     await run_hourly_fold_pass(now=NOW)
     await run_conversation_fold_pass(now=NOW)
+    from app.modules.reports.rollup import fold_next_report_slice
+
+    async with SessionLocal() as session:
+        while await fold_next_report_slice(session, TARGET_W):
+            pass
     # The reference for unaligned window starts once their partial leading
     # hour is un-servable: identical to starting at the ceil hour (that
     # partial slice is ALWAYS raw-served, by design). Captured pre-prune;
@@ -575,7 +635,7 @@ async def test_statistics_survive_retention_pruning_folded_raw(db_setup, monkeyp
     lead_ceil = floor_to_hour(SINCE_UNALIGNED) + timedelta(hours=1)
     leadless = await _snapshot(lead_since=lead_ceil)
 
-    prune_cutoff = TARGET_W - FOLD_LAG
+    prune_cutoff = TARGET_W - CORPUS_FOLD_LAG
     async with SessionLocal() as session:
         await session.execute(delete(RequestLog).where(RequestLog.requested_at < prune_cutoff))
         await session.commit()
@@ -604,13 +664,7 @@ async def test_statistics_survive_retention_pruning_folded_raw(db_setup, monkeyp
             "buckets_raw_degrade",
             "trends_raw_degrade",
             "conv_buckets_raw_degrade",
-            # Reports measures other than conversation_count are raw-bound
-            # (documented non-goal); the satellite-served conversation counts
-            # are asserted to survive below. The half-hour-offset local days
-            # additionally lose their pruned partial leading half hours.
-            "reports_summary",
-            "reports_summary_filtered",
-            "reports_daily_utc",
+            # Half-hour-offset local days lose their pruned partial raw edges.
             "reports_daily_offset",
             "listing_totals",  # tracks listable rows (asserted below)
         ),
@@ -628,23 +682,14 @@ async def test_statistics_survive_retention_pruning_folded_raw(db_setup, monkeyp
     raw_expected = (await _snapshot())["listing_totals"]
     assert pruned["listing_totals"] == raw_expected
     monkeypatch.undo()
-    # Satellite-served conversation counts survive pruning exactly: the
-    # summary window is hour-aligned at the start and its unaligned tail is
-    # served from surviving raw; UTC local days are hour-aligned throughout.
+    # Every UTC report day and filtered summary now survives pruning;
+    # report history carries the filter and conversation dimensions.
     assert pruned["reports_summary"].conversation_count == reference["reports_summary"].conversation_count
-    # Daily-report day-row membership stays raw-driven (the day CTE INNER
-    # joins request_logs, exactly as before the satellite): a fully pruned
-    # day drops out of the report; days that still have raw rows keep their
-    # satellite-served conversation counts unchanged.
-    pruned_daily = {row.date: row.conversation_count for row in pruned["reports_daily_utc"]}
-    reference_daily = {row.date: row.conversation_count for row in reference["reports_daily_utc"]}
-    assert pruned_daily
-    assert pruned_daily == {date: reference_daily[date] for date in pruned_daily}
-    # The filtered summary path stays fully raw-bound by design.
     assert (
         pruned["reports_summary_filtered"].conversation_count
-        <= reference["reports_summary_filtered"].conversation_count
+        == reference["reports_summary_filtered"].conversation_count
     )
+    assert [row.date for row in pruned["reports_daily_utc"]] == [row.date for row in reference["reports_daily_utc"]]
     # earliest_activity_at: raw min is gone; the rollup fallback reports the
     # first countable bucket at hour precision.
     assert pruned["earliest"] == floor_to_hour(reference["earliest"])
@@ -684,7 +729,7 @@ async def test_dashboard_overview_json_is_identical_before_and_after_fold(async_
     before = await async_client.get("/api/dashboard/overview?timeframe=7d")
     assert before.status_code == 200
 
-    folded_slices = await run_hourly_fold_pass()  # real now: rows are > FOLD_LAG old
+    folded_slices = await run_hourly_fold_pass()  # real now: rows are > fold lag old
     assert folded_slices > 0
     assert await run_conversation_fold_pass() > 0
     async with SessionLocal() as session:

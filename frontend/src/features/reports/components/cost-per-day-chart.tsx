@@ -11,7 +11,9 @@ import {
 } from "@/components/lazy-recharts";
 import type { DailyReportRow } from "../schemas";
 import { buildContinuousDailyRows } from "../daily-series";
+import { formatCurrency } from "@/utils/formatters";
 import { ChartTooltip } from "./chart-tooltip";
+import { ReportChartCard } from "./report-chart-card";
 
 export type CostPerDayChartProps = {
   startDate: string;
@@ -27,9 +29,7 @@ export function CostPerDayChart({ startDate, endDate, data }: CostPerDayChartPro
   }));
 
   return (
-    <div className="rounded-xl border bg-card p-5">
-      <div className="text-sm font-semibold text-foreground">{t("reports.charts.costByDay")}</div>
-      <div className="mt-4 h-[200px]">
+    <ReportChartCard title={t("reports.charts.costByDay")} empty={data.length === 0}>
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={chartData} margin={{ top: 5, right: 10, left: 10, bottom: 0 }}>
             <defs>
@@ -49,10 +49,10 @@ export function CostPerDayChart({ startDate, endDate, data }: CostPerDayChartPro
               tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
               axisLine={false}
               tickLine={false}
-              tickFormatter={(v: number) => `$${v}`}
+              tickFormatter={formatCurrency}
             />
             <Tooltip
-              content={<ChartTooltip names={{ cost: t("reports.dailyBreakdown.columns.cost") }} formatValue={(v) => `$${v.toFixed(2)}`} />}
+              content={<ChartTooltip names={{ cost: t("reports.dailyBreakdown.columns.cost") }} formatValue={formatCurrency} />}
             />
             <Area
               type="monotone"
@@ -65,7 +65,6 @@ export function CostPerDayChart({ startDate, endDate, data }: CostPerDayChartPro
             />
           </AreaChart>
         </ResponsiveContainer>
-      </div>
-    </div>
+    </ReportChartCard>
   );
 }

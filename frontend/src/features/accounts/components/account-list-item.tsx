@@ -6,6 +6,8 @@ import { cn } from "@/lib/utils";
 import { isEmailLabel } from "@/components/blur-email";
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { useAccountQuotaDisplayStore } from "@/hooks/use-account-quota-display";
+import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
+import { useSmoothPercent } from "@/hooks/use-smooth-percent";
 import { StatusBadge } from "@/components/status-badge";
 import { MiniQuotaBar } from "@/components/mini-quota-bar";
 import type {
@@ -39,6 +41,7 @@ export function AccountListItem({
   const { t } = useTranslation();
   const blurred = usePrivacyStore((s) => s.blurred);
   const quotaDisplay = useAccountQuotaDisplayStore((s) => s.quotaDisplay);
+  const dateDisplayFormat = useDateDisplayFormatStore((s) => s.dateDisplayFormat);
   const status = normalizeStatus(account.status);
   const title = account.displayName || account.email;
   const titleIsEmail = isEmailLabel(title, account.email);
@@ -49,21 +52,27 @@ export function AccountListItem({
   const seatLabel = account.seatType ? ` | ${formatSlug(account.seatType)}` : "";
   const slotSubtitle = `${formatSlug(account.planType)} | ${workspaceLabel}${seatLabel}`;
   const idSuffix = showAccountId ? ` | ID ${formatCompactAccountId(account.accountId)}` : "";
-  const primary = account.usage?.primaryRemainingPercent ?? null;
-  const secondary = account.usage?.secondaryRemainingPercent ?? null;
-  const monthly = account.usage?.monthlyRemainingPercent ?? null;
+  const primaryState = useSmoothPercent(account.usage?.primaryRemainingPercent ?? null);
+  const secondaryState = useSmoothPercent(account.usage?.secondaryRemainingPercent ?? null);
+  const monthlyState = useSmoothPercent(account.usage?.monthlyRemainingPercent ?? null);
+  const primary = primaryState.percent;
+  const secondary = secondaryState.percent;
+  const monthly = monthlyState.percent;
   const hasPrimaryWindow =
     account.windowMinutesPrimary != null ||
     primary !== null ||
-    account.resetAtPrimary != null;
+    account.resetAtPrimary != null ||
+    primaryState.everKnown;
   const hasSecondaryWindow =
     account.windowMinutesSecondary != null ||
     secondary !== null ||
-    account.resetAtSecondary != null;
+    account.resetAtSecondary != null ||
+    secondaryState.everKnown;
   const hasMonthlyWindow =
     account.windowMinutesMonthly != null ||
     monthly !== null ||
-    account.resetAtMonthly != null;
+    account.resetAtMonthly != null ||
+    monthlyState.everKnown;
   const monthlyOnly = hasMonthlyWindow && !hasPrimaryWindow && !hasSecondaryWindow;
   const showMonthlyRow = monthlyOnly;
   const showPrimaryRow =
@@ -74,14 +83,19 @@ export function AccountListItem({
   const showRoutingPolicy = status !== "reauth" && status !== "deactivated";
   const warmupLabel = account.limitWarmupEnabled ? t("accounts.listItem.warmupOn") : t("accounts.listItem.warmupOff");
   const warmupMeta = account.limitWarmup
-    ? `${formatSlug(account.limitWarmup.status)} | ${formatSlug(account.limitWarmup.model)} | ${formatDateTimeInline(account.limitWarmup.completedAt ?? account.limitWarmup.attemptedAt)}`
+    ? `${formatSlug(account.limitWarmup.status)} | ${formatSlug(account.limitWarmup.model)} | ${formatDateTimeInline(account.limitWarmup.completedAt ?? account.limitWarmup.attemptedAt, dateDisplayFormat)}`
     : t("accounts.listItem.noAttempts");
   const availableResetCredits = account.availableResetCredits ?? 0;
   const resetBadgeLabel = availableResetCredits > 99 ? "99+" : String(availableResetCredits);
+  const statusEligibilityHint = status === "active" ? t("accounts.listItem.statusActiveHint") : undefined;
 
   return (
     <button
       type="button"
+      // Native title on the focusable row doubles as the accessible
+      // description, so keyboard and screen-reader users get the
+      // status-vs-eligibility hint without hovering the badge.
+      title={statusEligibilityHint}
       onClick={() => onSelect(account.accountId)}
       className={cn(
         "relative min-w-0 w-full rounded-lg px-3 py-2.5 text-left transition-colors",
@@ -117,7 +131,7 @@ export function AccountListItem({
             aria-label={t("accounts.actions.trustedAccess")}
           />
         ) : null}
-        <StatusBadge status={status} />
+        <StatusBadge status={status} title={statusEligibilityHint} />
       </div>
       <div
         className={cn(
@@ -208,7 +222,7 @@ function MiniQuotaRow({
       <div className="flex items-center justify-between text-[11px]">
         <span className="text-muted-foreground">{label}</span>
         <span className="tabular-nums font-medium">
-          {formatPercentNullable(percent)}
+          {formatPercentNullable(percent, 1)}
         </span>
       </div>
       <MiniQuotaBar

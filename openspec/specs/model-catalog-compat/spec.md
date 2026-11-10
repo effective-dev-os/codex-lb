@@ -1,7 +1,7 @@
 # model-catalog-compat Specification
 
 ## Purpose
-TBD - created by archiving change populate-bootstrap-model-metadata. Update Purpose after archive.
+Governs the model catalogs codex-lb serves to Codex-native and OpenAI-compatible clients, and how those catalogs feed routing. Fresh instances need a usable bootstrap catalog before the first upstream refresh, refreshed upstream data must then stay authoritative and replica-coherent, and catalog metadata (context windows, speed tiers, reasoning efforts, model-source identity) must be preserved exactly so clients can parse it. It also fixes how per-account catalog knowledge constrains or degrades pooled routing without falsely excluding accounts.
 ## Requirements
 ### Requirement: Bootstrap model catalog is available before refresh
 
@@ -102,7 +102,7 @@ when the requested slug matches a bootstrap entry.
 
 ### Requirement: OpenAI-compatible model metadata uses backend context windows
 
-When serving `GET /v1/models`, the system SHALL expose `metadata.context_window` as the upstream backend `context_window` budget by default. The system MUST NOT promote raw `max_context_window` values or hard-coded full-context guesses into `metadata.context_window`. Explicit operator context-window overrides remain the highest-priority reported-context value.
+When serving `GET /v1/models`, the system SHALL expose `metadata.context_window` as the upstream backend `context_window` budget by default. The system MUST NOT promote raw `max_context_window` values or hard-coded full-context guesses into `metadata.context_window`. Explicit operator context-window overrides — a `model_context_window_overrides` dashboard row for the slug, else the `CODEX_LB_MODEL_CONTEXT_WINDOW_OVERRIDES` entry for the slug (see "Per-model context window overrides are dashboard settings") — remain the highest-priority reported-context value, clamped to the upstream-declared `max_context_window` when upstream declares one above the backend `context_window`.
 
 #### Scenario: GPT-5 Codex models are reported with the backend context window on /v1/models
 
@@ -116,7 +116,7 @@ When serving `GET /v1/models`, the system SHALL expose `metadata.context_window`
 
 ### Requirement: OpenAI-compatible model metadata preserves the backend input budget explicitly
 
-When serving `GET /v1/models`, the system SHALL expose the upstream backend input/context budget in `metadata.input_context_window`. For models whose reported `metadata.context_window` is not operator-overridden, `metadata.context_window` and `metadata.input_context_window` SHOULD be equal. The system SHOULD expose `metadata.max_output_tokens` for known GPT-5 Codex models when that output-budget value is known; that value MUST NOT be used to inflate `metadata.context_window`.
+When serving `GET /v1/models`, the system SHALL expose the upstream backend input/context budget in `metadata.input_context_window`. When an explicit operator context-window override (dashboard row, else environment entry) applies to a model, that override SHALL be the reported input budget as well, clamped to the upstream-declared `max_context_window` when upstream declares one above the backend `context_window`, so `metadata.input_context_window` and the OpenAI-compatible `context_length`, `contextLength`, and `capabilities.context_length` fields never contradict `metadata.context_window` and never advertise more input than the backend sanctions. A `max_context_window` equal to the backend `context_window` — the parseability default synthesized for bootstrap and source-catalog models — MUST NOT clamp an override, so raise overrides for those models keep working. For models whose reported `metadata.context_window` is not operator-overridden, `metadata.context_window` and `metadata.input_context_window` SHOULD be equal. The system SHOULD expose `metadata.max_output_tokens` for known GPT-5 Codex models when that output-budget value is known; that value MUST NOT be used to inflate `metadata.context_window`.
 
 #### Scenario: /v1/models exposes the 272k backend input budget explicitly
 
@@ -127,9 +127,26 @@ When serving `GET /v1/models`, the system SHALL expose the upstream backend inpu
 #### Scenario: Explicit reported-context overrides do not hide the backend input budget
 
 - **WHEN** an operator override sets a model's reported `metadata.context_window` to `515000`
-- **AND** the upstream model catalog contains that model with `context_window=272000`
+- **AND** the upstream model catalog contains that model with `context_window=272000` and no `max_context_window`
 - **THEN** `GET /v1/models` returns that model with `metadata.context_window=515000`
-- **AND** `metadata.input_context_window=272000`
+- **AND** `metadata.input_context_window=515000`
+- **AND** `context_length`, `contextLength`, and `capabilities.context_length` of `515000`
+
+#### Scenario: An override never advertises more input than the backend ceiling
+
+- **WHEN** an operator override sets a model's reported context window to `1000000`
+- **AND** the upstream model catalog contains that model with `context_window=272000` and `max_context_window=872000`
+- **THEN** `GET /v1/models` returns that model with `metadata.context_window=872000`
+- **AND** `metadata.input_context_window=872000`
+- **AND** `context_length`, `contextLength`, and `capabilities.context_length` of `872000`
+
+#### Scenario: A synthesized ceiling equal to the backend budget does not clamp an override
+
+- **WHEN** an operator override sets a source-catalog model's reported context window to `32768`
+- **AND** that model declares `context_window=8192` and no explicit `max_context_window`, so the catalog synthesizes `max_context_window=8192`
+- **THEN** `GET /v1/models` returns that model with `metadata.context_window=32768`
+- **AND** `metadata.input_context_window=32768`
+- **AND** `context_length`, `contextLength`, and `capabilities.context_length` of `32768`
 
 #### Scenario: /v1/models exposes max output budget for known GPT-5 Codex models
 
@@ -139,6 +156,8 @@ When serving `GET /v1/models`, the system SHALL expose the upstream backend inpu
 ### Requirement: Codex-native model catalog keeps backend catalog fields
 
 When serving `GET /backend-api/codex/models`, the system MUST keep Codex-native model catalog semantics unchanged: the top-level `context_window` field remains the backend compact/input budget unless an explicit operator override applies, and upstream raw fields such as `max_context_window` remain available when upstream provides them. The `/v1/models` compatibility metadata MUST NOT mutate the native Codex endpoint.
+
+When an explicit operator context-window override (dashboard row, else environment entry) applies to a model, the native entry SHALL report the single resolved value — the override clamped to the upstream-declared `max_context_window` when upstream declares one above the backend `context_window`; a `max_context_window` equal to the backend `context_window` (the synthesized parseability default) MUST NOT clamp — on `context_window`, and SHALL rewrite `max_context_window` to that same resolved value when upstream provides the field. The endpoint's OpenAI-compatible `data` alias SHALL report the same resolved value on its `context_length`, `contextLength`, `capabilities.context_length`, `metadata.context_window`, and `metadata.input_context_window` fields, so the native and alias views of one model never advertise different budgets.
 
 #### Scenario: Native Codex route preserves compact budget
 
@@ -153,6 +172,21 @@ When serving `GET /backend-api/codex/models`, the system MUST keep Codex-native 
 - **AND** the response includes `object: "list"` and an OpenAI-compatible `data` list
 - **AND** `data` contains model entries whose Codex visibility is `list`
 - **AND** `data` excludes entries whose Codex visibility is `hide`
+
+#### Scenario: Native Codex catalog reports one resolved budget for a clamped override
+
+- **WHEN** an operator override sets a model's reported context window to `1000000`
+- **AND** the upstream model catalog contains that model with `context_window=272000` and `max_context_window=872000`
+- **THEN** `GET /backend-api/codex/models` returns that model with `context_window=872000`
+- **AND** `max_context_window=872000`
+
+#### Scenario: Codex data alias reports the resolved input budget for an override
+
+- **WHEN** an operator override sets a model's reported context window to `515000`
+- **AND** the upstream model catalog contains that model with `context_window=272000` and no explicit `max_context_window`
+- **THEN** the `GET /backend-api/codex/models` `data` alias entry for that model reports `context_length`, `contextLength`, and `capabilities.context_length` of `515000`
+- **AND** `metadata.context_window=515000` and `metadata.input_context_window=515000`
+- **AND** the native `models` entry reports `context_window=515000`
 
 ### Requirement: OpenAI-compatible model metadata preserves speed tiers
 
@@ -169,33 +203,76 @@ When serving `GET /v1/models`, the system SHALL preserve upstream speed-tier met
 
 ### Requirement: GPT-5.6 bootstrap metadata matches the upstream bundled catalog
 
-The GPT-5.6 bootstrap catalog entries (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`) MUST mirror the upstream bundled catalog (`codex-rs/models-manager/models.json` at codex release rust-v0.144.1) field-for-field for every metadata field codex-lb serves. In particular each
-entry MUST carry: `context_window` and `max_context_window` of `372000`;
-`minimal_client_version` `"0.144.0"`; `tool_mode` `"code_mode_only"`;
-`use_responses_lite` `true`; `apply_patch_tool_type` `"freeform"`;
-`web_search_tool_type` `"text_and_image"`; `supports_image_detail_original`
-`true`; `truncation_policy` `{"mode": "tokens", "limit": 10000}`;
-`comp_hash` `"3000"`; `reasoning_summary_format` `"experimental"`;
-`default_reasoning_summary` `"none"`; `include_skills_usage_instructions`
-`false`; `experimental_supported_tools` `[]` (a field the Codex client's
-deserializer requires); `supports_search_tool` `true`; `additional_speed_tiers`
-`["fast"]`; the `priority`/`Fast` service tier entry; `shell_type`
-`"shell_command"`; `prefer_websockets` `true`; and the 21-plan
-`available_in_plans` list upstream advertises (including `edu_plus`,
+The GPT-5.6 bootstrap catalog entries (`gpt-5.6-sol`, `gpt-5.6-terra`,
+`gpt-5.6-luna`) MUST mirror the upstream bundled catalog
+(`codex-rs/models-manager/models.json` at Codex release `rust-v0.145.0`)
+field-for-field for every metadata field codex-lb serves, with one tracked
+exception: `max_context_window`, which upstream raised from `272000` to
+`872000` in openai/codex commit
+`2eee483e49f88b868f67364134a658b3298e6c14` (openai/codex#39102) and which no
+`rust-v*` release tag carries as of `rust-v0.148.0-alpha.21`. In particular
+each entry MUST carry: `context_window` of `272000` and `max_context_window`
+of `872000`; `minimal_client_version` `"0.144.0"`; `tool_mode`
+`"code_mode_only"`; `use_responses_lite` `true`; `apply_patch_tool_type`
+`"freeform"`; `web_search_tool_type` `"text_and_image"`;
+`supports_image_detail_original` `true`; `truncation_policy` `{ "mode":
+"tokens", "limit": 10000 }`; `comp_hash` `"3000"`; `reasoning_summary_format`
+`"experimental"`; `default_reasoning_summary` `"none"`;
+`include_skills_usage_instructions` `false`; `experimental_supported_tools`
+`[]` (a field the Codex client's deserializer requires); `supports_search_tool`
+`true`; `additional_speed_tiers` `["fast"]`; the `priority`/`Fast` service tier
+entry; `shell_type` `"shell_command"`; `prefer_websockets` `true`; and the
+21-plan `available_in_plans` list upstream advertises (including `edu_plus`,
 `edu_pro`, `enterprise_cbp_automation`, and `sci`). `multi_agent_version` MUST
 be `"v2"` for Sol and Terra and `"v1"` for Luna. Sol MUST carry the upstream
-`availability_nux` message while Terra and Luna carry `null`. Default
-reasoning levels MUST be `low` for Sol and `medium` for Terra and Luna, and
+`availability_nux` message while Terra and Luna carry `null`. Default reasoning
+levels MUST be `low` for Sol and `medium` for Terra and Luna, and
 reasoning-level descriptions MUST be the verbatim upstream strings.
+
+`context_window` is the default input budget and `max_context_window` is the
+ceiling a client may opt into; the two MUST NOT be collapsed into one value
+for these entries.
 
 The ~16.5 KB upstream `base_instructions` prompt and the personality-templated
 `model_messages` object are deliberately NOT bundled in the bootstrap catalog;
 the first successful live registry refresh supplies them. This is the only
-sanctioned divergence from the upstream GPT-5.6 entries.
+sanctioned divergence from the upstream GPT-5.6 entries beyond the
+`max_context_window` exception above.
+
+#### Scenario: GPT-5.6 bootstrap entries retain the corrected upstream context budget
+
+- **GIVEN** the model registry has no refreshed upstream snapshot
+- **AND** no persisted snapshot is loaded
+- **AND** no context-window override (dashboard row or `CODEX_LB_MODEL_CONTEXT_WINDOW_OVERRIDES` entry) applies to these slugs
+- **WHEN** a client calls `GET /backend-api/codex/models`
+- **THEN** `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` report
+  `context_window=272000`
+
+#### Scenario: GPT-5.6 bootstrap entries advertise the raised upstream ceiling
+
+- **GIVEN** the model registry has no refreshed upstream snapshot
+- **AND** no persisted snapshot is loaded
+- **AND** no context-window override (dashboard row or `CODEX_LB_MODEL_CONTEXT_WINDOW_OVERRIDES` entry) applies to these slugs
+- **WHEN** a client calls `GET /backend-api/codex/models`
+- **THEN** `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` report
+  `context_window=272000`
+- **AND** each reports `max_context_window=872000`
+
+#### Scenario: OpenAI-compatible metadata keeps the default input budget
+
+- **GIVEN** the model registry has no refreshed upstream snapshot
+- **AND** no persisted snapshot is loaded
+- **AND** no context-window override (dashboard row or `CODEX_LB_MODEL_CONTEXT_WINDOW_OVERRIDES` entry) applies to these slugs
+- **WHEN** a client calls `GET /v1/models`
+- **THEN** each GPT-5.6 entry reports `context_window=272000` and
+  `input_context_window=272000`
+- **AND** the raised Codex-native ceiling is not promoted into the
+  OpenAI-compatible input budget fields
 
 #### Scenario: GPT-5.6 entries expose upstream tool and multi-agent metadata
 
 - **GIVEN** the model registry has no refreshed upstream snapshot
+- **AND** no persisted snapshot is loaded
 - **WHEN** a client calls `GET /backend-api/codex/models`
 - **THEN** `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` carry `tool_mode: "code_mode_only"`, `use_responses_lite: true`, `experimental_supported_tools: []`, and `minimal_client_version: "0.144.0"`
 - **AND** `multi_agent_version` is `"v2"` for Sol and Terra and `"v1"` for Luna
@@ -203,6 +280,7 @@ sanctioned divergence from the upstream GPT-5.6 entries.
 #### Scenario: GPT-5.6 entries expose upstream reasoning-summary and plan metadata
 
 - **GIVEN** the model registry has no refreshed upstream snapshot
+- **AND** no persisted snapshot is loaded
 - **WHEN** a client calls `GET /backend-api/codex/models`
 - **THEN** each GPT-5.6 entry carries `default_reasoning_summary: "none"`, `reasoning_summary_format: "experimental"`, and `comp_hash: "3000"`
 - **AND** each GPT-5.6 entry's `available_in_plans` includes `edu_plus`, `edu_pro`, `enterprise_cbp_automation`, and `sci`
@@ -375,6 +453,22 @@ capability. Requests that omit a tier or use the omit-equivalent `auto` or
 `default` tiers MUST use model-only account filtering, including when reusing
 an HTTP bridge session.
 
+A service tier imposed by an API key's enforced service tier is not an explicit
+request for that tier. When the requested tier originates from API key
+enforcement and the model's catalog does not advertise that tier at all, the
+system MUST remove the tier from the account-routed request, MUST select
+accounts and reuse HTTP bridge sessions using model-only filtering, MUST
+reserve, settle, and log API-key usage at the effective default tier, and MUST
+omit the unsupported tier from the upstream request. This account-catalog
+fallback MUST NOT alter a request selected for an external model source, and an
+unknown or account-catalog-absent model MUST retain the enforced tier. When the model's catalog
+does advertise the tier, account-level tier filtering MUST continue to apply
+regardless of the tier's origin. A tier supplied explicitly by the client MUST
+continue to filter accounts even when it equals the enforced value or uses an
+equivalent alias and the model does not advertise it. When an
+unavailable service tier is what excluded every account, the selection error
+MUST name that tier.
+
 #### Scenario: Same-plan accounts expose different models
 
 - **GIVEN** two active accounts share a plan
@@ -389,6 +483,38 @@ an HTTP bridge session.
 - **AND** only one advertises the priority service tier
 - **WHEN** a request explicitly asks for priority
 - **THEN** selection considers only the account that advertised priority
+
+#### Scenario: Enforced tier does not exclude a model that never advertises it
+
+- **GIVEN** an active account advertises a model at its default tier
+- **AND** the model's catalog advertises no `priority` service tier
+- **AND** an API key sets `enforced_service_tier` to `priority`
+- **WHEN** account selection is requested for that model
+- **THEN** the enforced tier is removed from the account-routed request
+- **AND** API-key accounting, bridge compatibility, and upstream forwarding use the effective default tier
+- **AND** the advertising account is selected
+
+#### Scenario: Account-catalog fallback does not alter a model source
+
+- **GIVEN** an API key enforces the `priority` service tier
+- **AND** the selected model is routed through an external model source
+- **WHEN** the subscription-account catalog does not advertise `priority` for that model
+- **THEN** the source-routed request retains `priority`
+
+#### Scenario: Explicitly requested unadvertised tier is still rejected
+
+- **GIVEN** an active account advertises a model at its default tier
+- **AND** the model's catalog advertises no `priority` service tier
+- **WHEN** a client explicitly requests that model with `priority` or an equivalent `fast` alias
+- **THEN** no account is selected
+
+#### Scenario: Unavailable advertised tier names the tier in the error
+
+- **GIVEN** a model's catalog advertises the `priority` service tier
+- **AND** no active account carries `priority` for that model
+- **WHEN** account selection is requested for that model with `priority`
+- **THEN** no account is selected
+- **AND** the selection error names the `priority` service tier
 
 ### Requirement: Unknown account catalogs degrade without false exclusion
 
@@ -672,10 +798,9 @@ emit `codex-lb` and MUST NOT advertise the external upstream provider name.
 
 ### Requirement: Refreshed model catalog is replica-coherent
 
-The leader refresh cycle SHALL persist the complete registry state (models, plan maps, per-account tier maps, suppression set, authoritative flags, metadata retention state, and the refresh wall-clock timestamp) to the single-row `model_registry_snapshot` table and SHALL bump the `model_registry` cache-invalidation namespace only after the persist commits (write-then-bump). The payload write and the bump SHALL be skipped when the serialized content hash is unchanged from the last persisted state AND the stored row was still within `model_registry_snapshot_max_age_seconds`; the stored `refreshed_at` timestamp SHALL still be advanced so snapshot age reflects the leader's latest successful refresh. When the content hash is unchanged but the stored row had already aged past `model_registry_snapshot_max_age_seconds` before this refresh revived it, the leader SHALL still bump the `model_registry` namespace (only the payload rewrite stays skipped): an expired row causes followers to clear their local registry and reset their applied-content-hash marker, so an unchanged-content revival still requires a bump for them to re-apply within the cache-invalidation poll bound instead of waiting for the non-leader scheduler backstop. Every replica MUST apply a newly persisted snapshot within the cache-invalidation poll bound and MUST invalidate its local account-selection cache on apply; that account-selection invalidation MUST be local-only (non-propagating), because reconcile only applies a change the leader already published (which bumped `model_registry` to reach every replica) and each replica clears its own selection cache on apply, so a propagating clear would make every follower durably re-bump `account_selection` and amplify bus traffic with no peer-visible effect. When the reconcile is driven by the `model_registry` invalidation callback and the snapshot load fails (transient DB read error or malformed payload), the callback MUST surface the failure to the invalidation poller so the poller leaves the `model_registry` version unacknowledged and retries on the next poll cycle (matching the `account_routing` refresh callback), rather than acknowledging the bump and stranding the replica on the stale catalog until the non-leader scheduler backstop; the startup one-shot reconcile and the refresh-tick backstop instead swallow such a load failure (keeping the current in-memory state) so they never fail startup or the scheduler loop. Payload decode MUST treat a set-backed or mapping-backed catalog field whose persisted value has the wrong type — for example a `model_plans`/`plan_models`/`model_accounts`/per-account tier entry persisted as a scalar or object where a list of slugs is expected, or a model entry that is not an object — as a malformed payload and raise, rather than silently dropping the offending entry and applying a partial catalog; a genuinely-absent or empty container (an absent key, an empty map, or an empty list) is not malformed and MUST decode successfully. After apply, `/v1/models`, plan gating (`plan_types_for_model`), suppression (`is_suppressed_model`), and per-account service-tier routing on a non-leader MUST be identical to the leader. A non-leader refresh tick MUST NOT fetch the upstream catalog and SHALL instead reconcile from the persisted snapshot when the stored snapshot header differs from the last applied one (backstop for a lost invalidation bump). A leader catalog clear SHALL persist an explicit cleared marker and bump, so followers revert to the bootstrap floor rather than serving a withdrawn catalog. Every replica SHALL install its `model_registry` cache-invalidation callback (the global invalidation poller) before starting the model refresh scheduler, so a first leader tick that persists a changed snapshot cannot silently drop its bump. Every replica SHALL record the invalidation-poller version baseline before running its one-shot startup reconcile, so a leader bump that lands in the window between that reconcile's snapshot read and the poller's first background tick is delivered as an invalidation callback (within the poll bound) rather than absorbed as the poller's initial callback-less baseline (which would defer convergence to the non-leader scheduler backstop). The baseline-priming read SHALL surface a failure to its caller (the poller MUST remain uninitialized) rather than silently continuing, so a transient failure of the startup seed is logged and explicitly degraded to first-poll-baseline behavior instead of being mistaken for a recorded baseline — otherwise the first successful background poll would absorb a peer bump as its initial callback-less baseline and void the delivery guarantee priming exists to provide.
+The leader refresh cycle SHALL persist the complete registry state (models, plan maps, per-account tier maps, suppression set, authoritative flags, metadata retention state, and the refresh wall-clock timestamp) to the single-row `model_registry_snapshot` table and SHALL bump the `model_registry` cache-invalidation namespace only after the persist commits (write-then-bump). The payload write and the bump SHALL be skipped when the serialized content hash is unchanged from the last persisted state AND the stored row was still within `model_registry_snapshot_max_age_seconds`; the stored `refreshed_at` timestamp SHALL still be advanced so snapshot age reflects the leader's latest successful refresh. When the content hash is unchanged but the stored row had already aged past `model_registry_snapshot_max_age_seconds` before this refresh revived it, the leader SHALL still bump the `model_registry` namespace (only the payload rewrite stays skipped): an expired row causes followers to clear their local registry and reset their applied-content-hash marker, so an unchanged-content revival still requires a bump for them to re-apply within the cache-invalidation poll bound instead of waiting for the non-leader scheduler backstop. Every replica MUST apply a newly persisted snapshot within the cache-invalidation poll bound and MUST invalidate its local account-selection cache on apply; that account-selection invalidation MUST be local-only (non-propagating), because reconcile only applies a change the leader already published (which bumped `model_registry` to reach every replica) and each replica clears its own selection cache on apply, so a propagating clear would make every follower durably re-bump `account_selection` and amplify bus traffic with no peer-visible effect. When the reconcile is driven by the `model_registry` invalidation callback and the snapshot load fails (transient DB read error or malformed payload), the callback MUST surface the failure to the invalidation poller so the poller leaves the `model_registry` version unacknowledged and retries on the next poll cycle (matching the `account_routing` refresh callback), rather than acknowledging the bump and stranding the replica on the stale catalog until the non-leader scheduler backstop; the startup one-shot reconcile and the refresh-tick backstop instead swallow such a load failure (keeping the current in-memory state) so they never fail startup or the scheduler loop. Payload decode MUST treat a set-backed or mapping-backed catalog field whose persisted value has the wrong type — for example a `model_plans`/`plan_models`/`model_accounts`/per-account tier entry persisted as a scalar or object where a list of slugs is expected, or a model entry that is not an object — as a malformed payload and raise, rather than silently dropping the offending entry and applying a partial catalog; a genuinely-absent or empty container (an absent key, an empty map, or an empty list) is not malformed and MUST decode successfully. After apply, `/v1/models`, plan gating (`plan_types_for_model`), suppression (`is_suppressed_model`), and per-account service-tier routing on a non-leader MUST be identical to the leader. A non-leader refresh tick MUST NOT fetch the upstream catalog and SHALL instead reconcile from the persisted snapshot when the stored snapshot header differs from the last applied one (backstop for a lost invalidation bump). A leader catalog clear SHALL persist an explicit cleared marker and bump, so followers revert to the bootstrap floor rather than serving a withdrawn catalog. Every replica SHALL install its `model_registry` cache-invalidation callback (the global invalidation poller) before starting the model refresh scheduler, so a first leader tick that persists a changed snapshot cannot silently drop its bump. Every replica SHALL record the invalidation-poller version baseline before running its one-shot startup reconcile, so a leader bump that lands in the window between that reconcile's snapshot read and the poller's first background tick is delivered as an invalidation callback (within the poll bound) rather than absorbed as the poller's initial callback-less baseline (which would defer convergence to the non-leader scheduler backstop). The baseline-priming read SHALL surface a failure to its caller (the poller MUST remain uninitialized) rather than silently continuing, so a transient failure of the startup seed is logged instead of being mistaken for a recorded baseline. If startup continues without a recorded baseline, the first successful background poll MUST conservatively treat a positive `model_registry` version observed without a baseline as changed, invoke the reconcile callback, and acknowledge it only after that callback succeeds; this MAY replay a pre-startup version, but MUST NOT absorb a peer bump as a callback-less baseline (which would void the delivery guarantee priming exists to provide).
 
 #### Scenario: Follower serves the refreshed catalog on /v1/models
-
 - **GIVEN** replica A (leader) completes a registry refresh whose catalog adds a new slug and withdraws a bootstrap slug
 - **AND** replica A persists the snapshot and bumps the `model_registry` namespace
 - **WHEN** replica B's cache-invalidation poller observes the version change
@@ -683,31 +808,26 @@ The leader refresh cycle SHALL persist the complete registry state (models, plan
 - **AND** `GET /v1/models` served by replica B lists the new slug and omits the withdrawn slug
 
 #### Scenario: Follower enforces suppression of a withdrawn slug
-
 - **GIVEN** the leader's refreshed snapshot marks a previously served slug as suppressed
 - **WHEN** a follower applies the persisted snapshot
 - **THEN** `is_suppressed_model` returns true for that slug on the follower
 
 #### Scenario: Follower enforces plan gating for a newly gated slug
-
 - **GIVEN** the leader's refreshed snapshot maps a slug to exactly one plan type
 - **WHEN** a follower applies the persisted snapshot
 - **THEN** `plan_types_for_model` on the follower returns exactly that plan set instead of no filtering
 
 #### Scenario: Catalog clear propagates to followers
-
 - **GIVEN** the leader clears the registry because no active accounts remain
 - **WHEN** the leader persists the cleared marker and bumps, and a follower applies it
 - **THEN** the follower reverts to the bootstrap catalog floor
 
 #### Scenario: Lost bump converges via the refresh-tick backstop
-
 - **GIVEN** a snapshot was persisted but the invalidation bump was lost
 - **WHEN** a non-leader replica's next refresh tick runs
 - **THEN** the replica detects the header mismatch, applies the persisted snapshot, and converges within one refresh interval
 
 #### Scenario: Transient load failure in the callback is retried, not acknowledged
-
 - **GIVEN** the leader persisted a changed snapshot and bumped the `model_registry` namespace
 - **AND** a follower's snapshot load transiently fails on the invalidation callback (e.g. a DB read error or a momentarily unreadable payload)
 - **WHEN** the follower's poll cycle runs the callback and it fails
@@ -715,54 +835,53 @@ The leader refresh cycle SHALL persist the complete registry state (models, plan
 - **AND** once the transient failure clears, the retry applies the persisted snapshot within the poll bound without requiring a new leader bump
 
 #### Scenario: Malformed set-backed field is rejected, not silently dropped
-
 - **GIVEN** the leader bumped the `model_registry` namespace and the persisted payload is valid JSON but a set-backed field is wrong-typed (e.g. `model_plans` maps a slug to `{"gpt-x": "pro"}` instead of a list of plan slugs)
 - **WHEN** a follower's invalidation callback loads and decodes the payload
 - **THEN** the decode raises rather than dropping the offending entry
 - **AND** the poller leaves the `model_registry` version unacknowledged and no partial catalog is applied (the follower keeps its prior in-memory state and retries on the next poll)
 
 #### Scenario: Empty set-backed maps decode successfully
-
 - **GIVEN** a persisted snapshot whose set-backed fields are genuinely empty (empty maps, or a slug mapped to an empty list)
 - **WHEN** a replica decodes the payload
 - **THEN** the decode succeeds and the corresponding sets are empty (empty is not treated as malformed)
 
 #### Scenario: Applying a snapshot does not re-bump account_selection
-
 - **GIVEN** the leader persisted a changed snapshot and bumped `model_registry`
 - **WHEN** a follower applies the snapshot and invalidates its local account-selection cache
 - **THEN** the follower does not enqueue or write an `account_selection` cache-invalidation bump
 
 #### Scenario: Non-leader tick performs no upstream fetch
-
 - **WHEN** a non-leader replica's refresh tick runs
 - **THEN** it performs no upstream model-catalog fetch, regardless of whether it reconciled from the store
 
 #### Scenario: First leader bump is not dropped at startup
-
 - **GIVEN** a replica is starting up
 - **WHEN** the model refresh scheduler starts
 - **THEN** the global cache-invalidation poller with the `model_registry` callback is already installed, so an immediate leader persist-and-bump reaches followers within the poll bound
 
 #### Scenario: Bump during the startup reconcile window is not dropped
-
 - **GIVEN** a replica is starting up and has recorded the invalidation-poller version baseline
 - **AND** a leader persists a changed snapshot and bumps the `model_registry` namespace in the window between the replica's one-shot startup reconcile and the poller's first background tick
 - **WHEN** the poller's first background tick runs
 - **THEN** it observes the version advanced past the recorded baseline and invokes the reconcile callback, so the replica applies the new snapshot within the poll bound rather than waiting for the non-leader scheduler backstop
 
 #### Scenario: Reviving an expired unchanged snapshot bumps the bus
-
 - **GIVEN** a snapshot was persisted with content hash H and its stored row then aged past `model_registry_snapshot_max_age_seconds`, so followers dropped to the bootstrap floor and reset their applied-content-hash marker
 - **WHEN** the leader's next refresh succeeds with the same catalog bytes (content hash H again)
 - **THEN** the leader advances `refreshed_at` without rewriting the payload but still bumps the `model_registry` namespace
 - **AND** the followers observe the version change and re-apply the revived snapshot within the poll bound rather than waiting for the non-leader scheduler backstop
 
 #### Scenario: Failed startup baseline prime is surfaced, not silently absorbed
-
 - **GIVEN** a replica is starting up and the invalidation-poller baseline-priming read fails transiently
 - **WHEN** the priming step runs
-- **THEN** the poller remains uninitialized and the failure is surfaced (logged) rather than treated as a recorded baseline, degrading explicitly to first-poll-baseline behavior
+- **THEN** the poller remains uninitialized and the failure is surfaced (logged) rather than treated as a recorded baseline
+- **AND** background polling then recovers through conservative callback delivery rather than a callback-less first-poll baseline
+
+#### Scenario: Failed startup baseline prime recovers through reconciliation
+- **GIVEN** a replica's baseline-priming read fails transiently and no `model_registry` version baseline is recorded
+- **WHEN** its first successful background poll observes a positive `model_registry` version
+- **THEN** the poller MUST invoke the model-registry reconcile callback before acknowledging that version
+- **AND** the replica MUST NOT defer convergence to the scheduler backstop merely because startup baseline priming failed
 
 ### Requirement: Persisted model catalog survives restart and version skew
 
@@ -832,4 +951,453 @@ At startup every replica SHALL load the persisted model-registry snapshot into i
 - **AND** the only `model_registry_snapshot` row is a previously published snapshot whose age now exceeds `model_registry_snapshot_max_age_seconds`
 - **WHEN** the replica loses leadership and its next reconcile runs (poller callback or refresh-tick backstop)
 - **THEN** it drops the unpublished catalog, reverts to the bootstrap floor, and invalidates its account-selection cache
+
+### Requirement: Every Codex-native catalog entry is wire-parseable
+
+Every model entry returned by `GET /backend-api/codex/models` or the equivalent
+`GET /v1/models?client_version=<version>` route MUST include the non-defaulted
+Codex wire fields `truncation_policy` and `experimental_supported_tools`, even
+when the entry comes from hidden retained bootstrap metadata or a persisted
+legacy registry snapshot. When either field is absent from stored raw metadata,
+the mapper MUST provide a conservative model-compatible default. Wire-valid
+values provided by a live upstream catalog or model source MUST remain
+authoritative and MUST NOT be overwritten by the compatibility defaults. When
+`experimental_supported_tools` is not a list, the mapper MUST emit an empty
+list. When it contains non-string members, the mapper MUST omit those members
+rather than failing the complete catalog. A wire-valid `truncation_policy` MUST
+use the `bytes` or `tokens` mode and a JSON integer representable by Codex's
+signed 64-bit `limit` field. When an explicit policy does not satisfy that wire
+shape, the mapper MUST emit the same conservative model-compatible policy used
+when the field is absent.
+
+#### Scenario: Hidden bootstrap metadata cannot invalidate the live catalog
+
+- **GIVEN** a successful live refresh omits an older bundled model
+- **AND** codex-lb retains that model as hidden metadata whose raw payload lacks
+  required Codex wire fields
+- **WHEN** a Codex client requests the native model catalog
+- **THEN** the hidden entry includes a valid `truncation_policy`
+- **AND** it includes `experimental_supported_tools` as a list
+- **AND** the complete catalog can be deserialized instead of falling back to
+  bundled client metadata
+
+#### Scenario: Explicit valid upstream compatibility values win
+
+- **GIVEN** a live catalog or model source provides `truncation_policy` or
+  `experimental_supported_tools`
+- **WHEN** codex-lb renders the Codex-native catalog entry
+- **THEN** it preserves those explicit values unchanged
+
+#### Scenario: Invalid source tool members cannot fail the catalog
+
+- **GIVEN** a model source provides `experimental_supported_tools` with both
+  string and non-string members
+- **WHEN** codex-lb renders the Codex-native catalog entry
+- **THEN** it retains the string tool names
+- **AND** it omits non-string members instead of returning a server error
+
+#### Scenario: Non-list source tool metadata cannot fail the catalog
+
+- **GIVEN** a model source provides a non-list value for
+  `experimental_supported_tools`
+- **WHEN** codex-lb renders the Codex-native catalog entry
+- **THEN** it emits an empty list instead of returning a server error
+
+#### Scenario: Malformed source truncation policy cannot fail the catalog
+
+- **GIVEN** a model source provides an invalid `truncation_policy`, such as a
+  null, non-object, incomplete object, unknown mode, non-integer limit, or
+  out-of-range limit
+- **WHEN** codex-lb renders the Codex-native catalog entry
+- **THEN** it emits the conservative model-compatible truncation policy
+- **AND** it does not return a server error
+
+#### Scenario: Client-version alias has the same complete contract
+
+- **WHEN** Codex requests `GET /v1/models` with a non-empty `client_version`
+- **THEN** every returned `models` entry satisfies the same required-field
+  contract as `GET /backend-api/codex/models`
+
+### Requirement: Fresh additional-quota evidence can establish account support
+
+For a model canonically mapped to a separately metered additional quota, account selection MUST allow fresh account-specific additional-quota telemetry to establish model support when an authoritative general per-account model catalog omits that model. The system MUST continue to enforce registry plan and service-tier restrictions and MUST apply the existing additional-quota freshness, exhaustion, account-health, cooldown, capacity, security, and routing gates before selecting an account. When such a selected account is bound to an HTTP bridge session, every existing-session reuse entry point, including direct key lookup, previous-response alias fallback, and in-flight creation waiters, MUST enforce exact normalized model, canonical quota key, and normalized effective service-tier compatibility before returning the session. For a genuinely catalog-omitted account, reuse MUST re-evaluate current registry plan and requested service-tier plan eligibility without synchronously re-reading quota telemetry. This behavior MUST NOT apply to unknown models or to an unrelated additional-limit key supplied independently of the requested model.
+
+#### Scenario: Fresh Spark quota overrides general account-catalog omission
+
+- **GIVEN** an authoritative general account catalog omits `gpt-5.3-codex-spark` for a plan-compatible active account
+- **AND** that account has fresh, non-exhausted `codex_spark` quota telemetry
+- **WHEN** account selection is requested for `gpt-5.3-codex-spark`
+- **THEN** the general account-catalog omission does not remove that account from consideration
+- **AND** the account proceeds through the remaining additional-quota and routing gates
+
+#### Scenario: Quota-admitted bridge session remains reusable
+
+- **GIVEN** an account omitted from the authoritative general account catalog was selected for `gpt-5.3-codex-spark` using fresh, non-exhausted `codex_spark` telemetry
+- **AND** an HTTP bridge session records that selection's normalized model, canonical quota key, and effective service tier
+- **WHEN** a later turn requests the same normalized model, canonical quota mapping, and effective service tier
+- **THEN** the existing bridge session remains reusable
+- **AND** the synchronous reuse check does not re-read quota telemetry
+
+#### Scenario: Bridge admission provenance is narrowly bound
+
+- **GIVEN** an HTTP bridge session carries quota-backed catalog-omission provenance
+- **WHEN** a later request reaches that session through direct key lookup, previous-response alias fallback, or an in-flight creation waiter with a different normalized model, canonical quota key, or effective service tier
+- **THEN** that provenance does not bypass the normal catalog and service-tier checks
+- **AND** a catalog-supported account rejected by the requested account-level service-tier index remains rejected
+
+#### Scenario: Reuse rechecks current plan-tier eligibility for a catalog omission
+
+- **GIVEN** an HTTP bridge session carries exact quota-backed catalog-omission provenance for a requested service tier
+- **AND** the registry's current requested service-tier plan restrictions exclude the session account's current plan
+- **WHEN** a later request reaches that session through any reuse entry point
+- **THEN** the existing session is not returned under the recorded provenance
+- **AND** the current request follows a request-scope fork or fail-closed path without synchronously re-reading quota telemetry or mutating the existing live session
+
+#### Scenario: Incompatible request preserves another request's live bridge state
+
+- **GIVEN** a live or in-flight HTTP bridge session is compatible with its creator request
+- **AND** another direct, previous-response-alias, turn-state-alias, or in-flight-waiter request has mismatched quota-backed admission provenance or current plan-tier eligibility
+- **WHEN** bridge request compatibility rejects that second request
+- **THEN** an unanchored request uses an independent collision-resistant request-scope session, or an anchored request alone fails closed
+- **AND** the creator's session remains registered, open, and unscheduled for close with its request model, service tier, and transport unchanged
+- **AND** live previous-response and turn-state aliases remain unchanged so a subsequent compatible request can resolve and reuse the owner
+- **AND** an alias mapping is removed only when its target is missing, closed, or inactive
+
+#### Scenario: Forwarded prompt-cache mismatch forks on the receiving owner
+
+- **GIVEN** two bridge replicas agree that a prompt-cache key belongs to one canonical owner
+- **AND** that owner has an open quota-admitted Spark session whose effective service tier is incompatible with a priority request already forwarded to the owner
+- **AND** the priority request's collision-resistant `internal_request_parallel` fork key rendezvous-hashes to the other replica
+- **WHEN** compatibility rejects either the registered session or a session returned to an in-flight creation waiter
+- **THEN** the receiving canonical owner creates and owns the request-local mismatch fork without forwarding again
+- **AND** both requests can complete on independent transports while the creator session remains open and registered
+- **AND** normal rendezvous ownership remains unchanged for canonical prompt-cache, session, turn-state, previous-response, and unforwarded fork keys
+
+#### Scenario: Catalog-supported account-level service-tier exclusion remains authoritative
+
+- **GIVEN** an authoritative general per-account catalog includes a mapped separately metered model for two plan-compatible accounts
+- **AND** the authoritative requested service-tier account index includes only one of those accounts
+- **AND** both accounts have fresh, non-exhausted additional-quota telemetry for the model
+- **WHEN** account selection requests that model and service tier
+- **THEN** the account absent from the requested service-tier account index is not selected
+- **AND** quota evidence does not reclassify that catalog-supported account as model-catalog-omitted
+
+#### Scenario: Plan incompatibility remains authoritative
+
+- **GIVEN** a requested separately metered model is mapped to an additional quota
+- **AND** an account's plan is excluded by the model registry's plan or requested service-tier restrictions
+- **WHEN** account selection evaluates that account
+- **THEN** the account is not selected even if additional-quota telemetry exists
+
+#### Scenario: Missing or stale quota evidence fails closed
+
+- **GIVEN** the general account catalog omits a mapped separately metered model
+- **AND** no plan-compatible account has fresh additional-quota telemetry for that model
+- **WHEN** account selection is requested
+- **THEN** selection fails with the existing additional-quota data-unavailable behavior
+- **AND** the system does not route based only on bootstrap metadata
+- **AND** no quota-backed HTTP bridge session is admitted from that failed selection
+
+#### Scenario: Explicit unrelated quota cannot bypass model support
+
+- **GIVEN** a caller supplies an additional-limit key that is not the requested model's canonical quota mapping
+- **WHEN** the general per-account catalog excludes an account for that model
+- **THEN** the supplied quota key does not override the account-catalog exclusion
+
+### Requirement: Model catalog reservations are released on every exit path
+
+The model catalog builders for `GET /v1/models` and `GET /backend-api/codex/models` SHALL release the API-key usage reservation after acquisition on normal return, exception, or cancellation. The builders MUST preserve the existing reservation amount and successful response shape.
+
+#### Scenario: OpenAI-compatible catalog lookup fails
+
+- **WHEN** `_list_enabled_source_catalog_models` raises after reservation
+  acquisition while serving `GET /v1/models`
+- **THEN** the reservation row is released
+- **AND** its reserved usage is no longer charged to the key
+
+#### Scenario: Codex-native catalog lookup fails
+
+- **WHEN** `_list_enabled_source_catalog_models` raises after reservation
+  acquisition while serving `GET /backend-api/codex/models`
+- **THEN** the reservation row is released
+- **AND** its reserved usage is no longer charged to the key
+
+#### Scenario: Catalog request is cancelled
+
+- **WHEN** either model catalog builder is cancelled after reservation
+  acquisition
+- **THEN** the reservation is released before cancellation propagates
+
+### Requirement: Ultrafast routing follows live account entitlement
+
+The system MUST treat `ultrafast` as an access-controlled service tier and MUST derive account eligibility from live or retained per-account upstream catalog metadata. The bundled bootstrap catalog MUST NOT invent Ultrafast entitlement.
+
+#### Scenario: Only an advertising account is eligible
+
+- **GIVEN** two accounts advertise `gpt-5.6-sol`
+- **AND** only one account advertises the `ultrafast` service tier
+- **WHEN** a request explicitly asks for `service_tier: "ultrafast"`
+- **THEN** account selection considers only the advertising account
+
+#### Scenario: Bootstrap metadata does not grant preview access
+
+- **WHEN** no live or retained account catalog advertises `ultrafast`
+- **THEN** bootstrap model metadata does not expose or grant that tier
+
+### Requirement: Source-model catalog entries advertise operator-declared reasoning efforts
+
+Codex catalog entries built for OpenAI-compatible source models MUST derive
+`supported_reasoning_levels`, `default_reasoning_level`, and
+`supports_reasoning_summaries` from the source model's `raw_metadata_json`
+rather than reporting a fixed no-reasoning capability.
+
+Derivation MUST be gated on `"supports_reasoning": true`. That flag is the only
+reasoning control the dashboard exposes, so a model whose operator left it off
+MUST advertise no efforts, no default, and no summary support regardless of what
+else the metadata declares. Levels say *which* efforts an opted-in backend
+accepts, not *whether* reasoning is permitted, and gating them on the same flag
+that gates the chat-completions sanitizer is what keeps the Codex catalog,
+`/v1/models` and the dashboard checkbox in agreement.
+
+`supported_reasoning_levels` MUST accept a list of effort slugs and a list of
+`{"effort", "description"}` objects. Entries that are neither a string nor a
+mapping with a string `effort`, and duplicate efforts, MUST be ignored. A
+non-list value MUST yield no advertised efforts. `default_reasoning_level` MUST
+be reported only when it matches one of the advertised efforts. A source model
+without reasoning metadata MUST continue to advertise no efforts, no default,
+and no summary support.
+
+Declared efforts MUST be normalized (trimmed and lowercased) and
+deduplicated. They MUST NOT be filtered against a fixed vocabulary: backends
+disagree on which efforts exist -- `none` is real on GLM and Alibaba Model
+Studio, while others stop at `low`/`high`/`max` -- so an enum would drop
+efforts a provider genuinely accepts. Only shape is validated; an entry that
+is not a string, a mapping without a string `effort`, or an empty slug MUST be
+dropped.
+
+#### Scenario: Effort slugs are advertised in declaration order
+
+- **GIVEN** a source model whose `raw_metadata_json` sets
+  `"supported_reasoning_levels": ["low", "medium", "high", "xhigh"]` and
+  `"default_reasoning_level": "high"`
+- **WHEN** a client fetches the Codex model catalog
+- **THEN** the entry advertises efforts `low`, `medium`, `high`, `xhigh` in that order
+- **AND** `default_reasoning_level` is `high`
+
+#### Scenario: Effort objects carry operator descriptions and summary support
+
+- **GIVEN** a source model whose `raw_metadata_json` sets
+  `"supported_reasoning_levels": [{"effort": "low", "description": "Low effort"}]`
+  and `"supports_reasoning_summaries": true`
+- **WHEN** a client fetches the Codex model catalog
+- **THEN** the `low` effort is advertised with description `Low effort`
+- **AND** `supports_reasoning_summaries` is `true`
+
+#### Scenario: Malformed entries and out-of-range defaults are dropped
+
+- **GIVEN** a source model whose `raw_metadata_json` sets
+  `"supported_reasoning_levels": ["low", "low", {"description": "x"}, 7, {"effort": "high"}]`
+  and `"default_reasoning_level": "ultra"`
+- **WHEN** a client fetches the Codex model catalog
+- **THEN** the entry advertises exactly `low` and `high`
+- **AND** `default_reasoning_level` is absent
+
+#### Scenario: Casing variants are normalized, unknown efforts are kept
+
+- **GIVEN** a source model whose `raw_metadata_json` sets
+  `"supported_reasoning_levels": [" Low ", "HIGH", "provider-specific"]` and
+  `"default_reasoning_level": " HIGH "`
+- **WHEN** a client fetches the Codex model catalog
+- **THEN** the entry advertises `low`, `high`, and `provider-specific`
+- **AND** `default_reasoning_level` is `high`
+
+#### Scenario: An operator-declared `none` survives
+
+- **GIVEN** a source model whose `raw_metadata_json` sets
+  `"supported_reasoning_levels": ["none", "high", "max"]` and
+  `"default_reasoning_level": "none"`
+- **WHEN** a client fetches the Codex model catalog
+- **THEN** the entry advertises `none`, `high`, and `max`
+- **AND** `default_reasoning_level` is `none`
+
+#### Scenario: Models without reasoning metadata keep the previous behavior
+
+- **GIVEN** a source model with no `raw_metadata_json`
+- **WHEN** a client fetches the Codex model catalog
+- **THEN** the entry advertises no reasoning efforts, no default effort, and no
+  reasoning-summary support
+
+### Requirement: The reasoning switch is the single opt-in across every surface
+
+`"supports_reasoning": true` MUST remain the only reasoning opt-in for a source
+model. Declared levels or `supports_reasoning_summaries` MUST NOT imply it.
+
+Because catalog derivation is gated on the same flag, the surfaces cannot
+disagree: with the switch off the model advertises no efforts, `/v1/models`
+reports `supports_reasoning: false`, the chat-completions sanitizer strips the
+client's reasoning fields, and the unsupported-effort restore has no declared
+effort to act on. With it on, the operator's declared efforts reach all of them.
+
+#### Scenario: The switch is off
+
+- **GIVEN** a source model that declares `supported_reasoning_levels` and
+  `supports_reasoning_summaries` but not `"supports_reasoning": true`
+- **WHEN** its catalog entry is built and a chat-completions request for it
+  carries reasoning fields
+- **THEN** the entry advertises no efforts, no default, and no summary support
+- **AND** `/v1/models` reports `supports_reasoning: false`
+- **AND** the request's reasoning fields are stripped
+
+#### Scenario: The switch is on
+
+- **GIVEN** the same source model with `"supports_reasoning": true` added
+- **WHEN** its catalog entry is built and a chat-completions request for it
+  carries reasoning fields
+- **THEN** the entry advertises the declared efforts and summary support
+- **AND** the request's reasoning fields are forwarded
+
+#### Scenario: The switch alone still opts in
+
+- **GIVEN** a source model that sets only `"supports_reasoning": true`
+- **WHEN** a chat-completions request for that model carries reasoning fields
+- **THEN** the fields are forwarded, and the entry advertises no specific efforts
+
+### Requirement: The unsupported-effort rewrite is undone for source-routed requests
+
+The `minimal` normalization works around a ChatGPT/Codex backend that drops the
+value, hanging the stream. Model sources do not have that defect, so a request
+served by one MUST NOT be downgraded by it.
+
+Whether a request is served by a model source is known only after source
+selection, which runs after enforcement. The rewrite MUST therefore be applied
+unconditionally at enforcement time, and the replaced effort MUST be reported to
+the caller so it can be restored once a source has actually been selected.
+Restoration MUST occur only when a source was selected and the replaced effort
+is among the efforts that source declares for the model. Declared efforts are
+read through the same `"supports_reasoning"` gate as the catalog, so a model
+whose switch is off has none and is never restored. The reported effort
+MUST be the post-enforcement value, so restoring it cannot resurrect an effort
+an API key overrode, and MUST be the normalized (trimmed, lowercased) form, so
+restoration cannot reintroduce a casing variant the normalizer removed.
+
+Restoration MUST apply only to efforts replaced by the unsupported-effort
+fallback. The `ultra` -> `max` rewrite is a wire alias rather than a workaround:
+it mirrors the reference client and is required on every upstream surface, so it
+MUST remain applied to source-routed payloads even when the source declares
+`ultra`.
+
+Registry membership MUST NOT be used to decide this. A populated snapshot can
+omit a genuine subscription model — a partial refresh, an account unavailable
+during refresh, or an operator-mapped slug outside the bootstrap set — and those
+requests still reach the ChatGPT backend, where skipping the rewrite restores
+the hang. Conversely a source model whose slug shadows a subscription slug is
+present in the snapshot yet source-routed.
+
+#### Scenario: A source that declared the effort receives it unchanged
+
+- **GIVEN** a source model declaring `["minimal", "low", "high"]`
+- **AND** a request for that model with `reasoning.effort` of `minimal`
+- **WHEN** the request is routed to the source
+- **THEN** the source receives `minimal`
+
+#### Scenario: A source that did not declare the effort keeps the safe value
+
+- **GIVEN** a source model declaring `["low", "high"]`
+- **AND** a request for that model with `reasoning.effort` of `minimal`
+- **WHEN** the request is routed to the source
+- **THEN** the source receives the rewritten effort
+
+#### Scenario: A source declaring ultra still receives the max alias
+
+- **GIVEN** a source model declaring `["ultra", "max"]`
+- **AND** a request for that model with `reasoning.effort` of `ultra`
+- **WHEN** the request is routed to the source
+- **THEN** the source receives `max`
+
+#### Scenario: Subscription requests keep the workaround
+
+- **GIVEN** a request with `reasoning.effort` of `minimal` that is not routed to
+  a model source, including one whose model is absent from a populated registry
+  snapshot
+- **WHEN** the request is forwarded
+- **THEN** the effort is rewritten to the model's lowest supported effort
+
+#### Scenario: WebSocket requests keep the workaround
+
+- **GIVEN** a WebSocket Responses request with `reasoning.effort` of `minimal`
+- **WHEN** the request is forwarded
+- **THEN** the effort is rewritten, because the WebSocket transport never
+  reaches a model source
+
+#### Scenario: An enforced effort is not resurrected by restoration
+
+- **GIVEN** an API key that enforces a reasoning effort
+- **AND** a request for a source model that declares the client's original effort
+- **WHEN** the request is routed to the source
+- **THEN** the source receives the enforced effort
+
+### Requirement: Daybreak profile can initialize from the local model catalog
+
+`GET /backend-api/codex/models` MUST validate the proxy API key whenever `X-Codex-LB-Required-Capability` is present, even when deployment-wide API-key authentication is disabled. With a valid key it MUST return the existing local Codex catalog without applying the unsupported-transport denial, selecting an account, or dispatching an upstream request. Headerless model-catalog requests MUST retain their existing behavior.
+
+#### Scenario: Authenticated Daybreak catalog request remains available
+
+- **WHEN** the Daybreak provider requests the Codex-native model catalog with its valid key and capability carrier
+- **THEN** the route returns the existing catalog response
+- **AND** no account is selected and no upstream request is made
+
+#### Scenario: Catalog carrier requires authentication
+
+- **WHEN** a capability-bearing catalog request omits its proxy API key or supplies an invalid key
+- **THEN** the route returns the existing HTTP 401 `invalid_api_key` response
+- **AND** no catalog response or routing attempt occurs
+
+#### Scenario: Headerless catalog behavior remains unchanged
+
+- **WHEN** a model-catalog request omits the required-capability carrier
+- **THEN** the existing deployment-level authentication and catalog behavior remains in effect
+
+### Requirement: Per-model context window overrides are dashboard settings
+
+The per-model reported context window override (`model_context_window_overrides`, `slug -> window`) MUST be managed from the dashboard as one row per slug in the `model_context_window_overrides` table (`slug`, `context_window`), resolved per slug as environment entry < dashboard row: a slug with a row reports the row's window, a slug without a row inherits the `CODEX_LB_MODEL_CONTEXT_WINDOW_OVERRIDES` entry for that slug, and a slug with neither has no override (the catalog reports the upstream window). The migration and the first boot MUST NOT copy the environment dict into rows. The settings API MUST expose the overrides under `GET /api/settings/model-context-window-overrides` as the merged per-slug list, each entry carrying `slug`, the effective `context_window`, a `source` of `"dashboard"` or `"env"`, and `env_value` (the environment entry for the slug, `null` when none); `PUT /api/settings/model-context-window-overrides/{slug}` with `{"context_window": n}` MUST create or replace the row for `slug` in a single upsert, so concurrent creates of the same absent slug both succeed, and `DELETE /api/settings/model-context-window-overrides/{slug}` MUST remove it (404 when no row exists, including for a slug that only the environment knows). A write MUST reject a `context_window` that is not an integer between 1 and 2147483647 (the width of the stored column) — a float, a numeric string and a boolean are rejected, not coerced — and a slug that is empty, longer than 256 characters, or contains whitespace or non-printable characters; a slug MUST NOT be trimmed into validity, and the slug segment MUST accept `/`. The catalog endpoints (`GET /v1/models`, `GET /backend-api/codex/models`) MUST resolve the merged overrides once per catalog build from a cached snapshot of the rows that the settings API invalidates durably through the cross-replica `settings` cache namespace on every write — an invalidation MUST NOT be overwritten by a load that was already in flight when it happened —, MUST NOT read the database per model entry, and MUST apply the existing `max_context_window` clamp to a dashboard value exactly as to an environment value. Each store and delete MUST be recorded as a `settings_changed` audit event naming `model_context_window_overrides` and the slug. A stored or deleted row takes effect on the next catalog request on every replica without a restart; when the database is unreachable past the snapshot's TTL the catalog MUST keep serving the last known rows rather than failing the request. The environment variable remains as a deprecated per-slug fallback for one release and is removed in the next minor.
+
+#### Scenario: Dashboard row overrides the environment entry for its slug
+
+- **GIVEN** the process environment sets `CODEX_LB_MODEL_CONTEXT_WINDOW_OVERRIDES={"gpt-5.4": 300000}` and the upstream catalog reports `gpt-5.4` with `context_window=272000`
+- **WHEN** `PUT /api/settings/model-context-window-overrides/gpt-5.4` stores `{"context_window": 515000}`
+- **THEN** the next `GET /backend-api/codex/models` reports `gpt-5.4` with `context_window=515000` without a restart
+- **AND** `GET /api/settings/model-context-window-overrides` lists `gpt-5.4` with `context_window=515000`, `source="dashboard"` and `env_value=300000`
+
+#### Scenario: Deleted row returns the slug to the environment entry
+
+- **GIVEN** a dashboard row `gpt-5.4 -> 515000` while the environment entry for `gpt-5.4` is `300000`
+- **WHEN** `DELETE /api/settings/model-context-window-overrides/gpt-5.4` succeeds
+- **THEN** the next catalog request reports `gpt-5.4` with `context_window=300000`
+- **AND** the settings API lists `gpt-5.4` with `source="env"` and `env_value=300000`
+
+#### Scenario: Slug known only to the environment has no row to delete
+
+- **GIVEN** the environment entry `gpt-5.4 -> 300000` and no dashboard row for `gpt-5.4`
+- **WHEN** `DELETE /api/settings/model-context-window-overrides/gpt-5.4` is called
+- **THEN** the response is 404 with code `model_context_window_override_not_found`
+- **AND** the environment entry keeps applying
+
+#### Scenario: Dashboard value is clamped like an environment value
+
+- **GIVEN** the upstream catalog reports a model with `context_window=272000` and `max_context_window=872000`
+- **WHEN** a dashboard row stores `1000000` for that slug
+- **THEN** `GET /v1/models` and `GET /backend-api/codex/models` report `872000` for every context budget field of that model
+
+#### Scenario: Invalid window or slug is rejected
+
+- **WHEN** `PUT /api/settings/model-context-window-overrides/gpt-5.4` sends `{"context_window": 0}`, `-1`, `1.5`, `515000.0`, `"515000"`, `true` or `2147483648`
+- **THEN** the response is 422 and no row is written
+- **WHEN** the slug segment is empty, longer than 256 characters, or contains whitespace (including leading or trailing whitespace) or a control character
+- **THEN** the response is 400 with code `invalid_model_slug` and no row is written
+
+#### Scenario: Catalog build reads one cached snapshot
+
+- **WHEN** `GET /v1/models` or `GET /backend-api/codex/models` builds its entries
+- **THEN** the merged overrides are resolved once before the per-model loop from the cached row snapshot and the process settings
+- **AND** no database read happens per model entry
 

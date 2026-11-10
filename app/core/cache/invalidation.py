@@ -29,6 +29,7 @@ NAMESPACE_SETTINGS = "settings"
 NAMESPACE_RESET_CREDITS = "reset_credits"
 NAMESPACE_MODEL_REGISTRY = "model_registry"
 NAMESPACE_UPSTREAM_ROUTE = "upstream_route"
+NAMESPACE_DASHBOARD_USERS = "dashboard_users"
 # Callback return values are ignored; awaitables are awaited for their side
 # effects only, so callbacks may return a status (e.g. bool) for other callers.
 type InvalidationCallback = Callable[[], object | Awaitable[object]]
@@ -47,6 +48,7 @@ _NAMESPACE_LOG_LABELS: dict[str, str] = {
     "reset_credits": "reset_credits",
     "model_registry": "model_registry",
     "upstream_route": "upstream_route",
+    "dashboard_users": "dashboard_users",
 }
 
 _BUMP_RETRY_ATTEMPTS = 3
@@ -284,8 +286,29 @@ class CacheInvalidationPoller:
             # later bump instead of being coalesced into the version already
             # being written.
             self._pending_bumps.discard(namespace)
-            if not await self.bump(namespace):
+            try:
+                if not await self.bump(namespace):
+                    self._pending_bumps.add(namespace)
+            except asyncio.CancelledError:
+                # The marker is cleared before the write, so an aborted write
+                # would otherwise leave the namespace neither written nor
+                # pending, breaking the required retry. Restored even when the
+                # abort is ambiguous — a redundant bump only re-runs peers'
+                # idempotent callbacks.
                 self._pending_bumps.add(namespace)
+                raise
+            except Exception:
+                # ``bump()`` reports normal failure by returning False, so a
+                # raise is abnormal — but re-raising would abort the flush and,
+                # since the loop is sorted, a persistently raising namespace
+                # would starve every namespace sorting after it on every cycle.
+                # Restore it and keep flushing the rest.
+                self._pending_bumps.add(namespace)
+                logger.warning(
+                    "cache_invalidation flush bump raised for namespace %s; kept pending",
+                    _NAMESPACE_LOG_LABELS.get(namespace, "unknown"),
+                    exc_info=True,
+                )
 
     async def _poll_once(self) -> bool:
         """Flush pending bumps and reconcile observed versions once.

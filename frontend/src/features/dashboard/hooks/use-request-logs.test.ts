@@ -2,10 +2,15 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { HttpResponse, http } from "msw";
 import { createElement, type PropsWithChildren, useEffect } from "react";
-import { MemoryRouter, useLocation } from "react-router-dom";
-import { describe, expect, it } from "vitest";
+import {
+  MemoryRouter,
+  useLocation,
+  useNavigate,
+  type NavigateFunction,
+} from "react-router-dom";
+import { describe, expect, it, vi } from "vitest";
 
-import { useRequestLogs } from "@/features/dashboard/hooks/use-request-logs";
+import { requestLogFiltersApplied, useRequestLogs } from "@/features/dashboard/hooks/use-request-logs";
 import { server } from "@/test/mocks/server";
 
 function createTestQueryClient(): QueryClient {
@@ -19,12 +24,23 @@ function createTestQueryClient(): QueryClient {
   });
 }
 
-function LocationSpy({ onChange }: { onChange?: (search: string) => void }) {
+function LocationSpy({
+  onChange,
+  onNavigateReady,
+}: {
+  onChange?: (search: string) => void;
+  onNavigateReady?: (navigate: NavigateFunction) => void;
+}) {
   const routeLocation = useLocation();
+  const navigate = useNavigate();
 
   useEffect(() => {
     onChange?.(routeLocation.search);
   }, [routeLocation.search, onChange]);
+
+  useEffect(() => {
+    onNavigateReady?.(navigate);
+  }, [navigate, onNavigateReady]);
 
   return null;
 }
@@ -33,6 +49,7 @@ function createWrapper(
   queryClient: QueryClient,
   initialEntry = "/dashboard",
   onLocationChange?: (search: string) => void,
+  onNavigateReady?: (navigate: NavigateFunction) => void,
 ) {
   return function Wrapper({ children }: PropsWithChildren) {
     return createElement(
@@ -41,7 +58,7 @@ function createWrapper(
       createElement(
         MemoryRouter,
         { initialEntries: [initialEntry] },
-        createElement(LocationSpy, { onChange: onLocationChange }),
+        createElement(LocationSpy, { onChange: onLocationChange, onNavigateReady }),
         children,
       ),
     );
@@ -49,6 +66,64 @@ function createWrapper(
 }
 
 describe("useRequestLogs", () => {
+  it("keeps symbolic timeframes stable across refetch despite browser clock skew", async () => {
+    const listCalls: URLSearchParams[] = [];
+    const optionCalls: URLSearchParams[] = [];
+    server.use(
+      http.get("/api/request-logs", ({ request }) => {
+        listCalls.push(new URL(request.url).searchParams);
+        return HttpResponse.json({ requests: [], total: 0, hasMore: false });
+      }),
+      http.get("/api/request-logs/options", ({ request }) => {
+        optionCalls.push(new URL(request.url).searchParams);
+        return HttpResponse.json({
+          accountIds: [],
+          apiKeys: [],
+          modelOptions: [],
+          statuses: [],
+        });
+      }),
+    );
+    const browserClock = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2036-08-31T12:00:00Z"));
+
+    try {
+      const queryClient = createTestQueryClient();
+      const wrapper = createWrapper(
+        queryClient,
+        "/dashboard?timeframe=24h&search=quota&accountId=acc_primary&apiKeyId=key_1&modelOption=gpt-5.1:::high&status=ok&limit=10&offset=20",
+      );
+      const { result } = renderHook(() => useRequestLogs(), { wrapper });
+
+      await waitFor(() => {
+        expect(result.current.logsQuery.isSuccess).toBe(true);
+        expect(result.current.optionsQuery.isSuccess).toBe(true);
+      });
+      await act(async () => {
+        await Promise.all([
+          result.current.logsQuery.refetch(),
+          result.current.optionsQuery.refetch(),
+        ]);
+      });
+
+      expect(listCalls).toHaveLength(2);
+      expect(optionCalls).toHaveLength(2);
+      for (const params of [...listCalls, ...optionCalls]) {
+        expect(params.get("timeframe")).toBe("24h");
+        expect(params.has("since")).toBe(false);
+      }
+      for (const params of listCalls) {
+        expect(params.get("search")).toBe("quota");
+        expect(params.getAll("accountId")).toEqual(["acc_primary"]);
+        expect(params.getAll("apiKeyId")).toEqual(["key_1"]);
+        expect(params.getAll("modelOption")).toEqual(["gpt-5.1:::high"]);
+        expect(params.getAll("status")).toEqual(["ok"]);
+        expect(params.get("limit")).toBe("10");
+        expect(params.get("offset")).toBe("20");
+      }
+    } finally {
+      browserClock.mockRestore();
+    }
+  });
   it("maps URL params into filter state and query key", async () => {
     const queryClient = createTestQueryClient();
     const wrapper = createWrapper(
@@ -105,6 +180,87 @@ describe("useRequestLogs", () => {
     expect(locationSearch).toContain("search=quota");
   });
 
+  it("keeps filtered-empty semantics while clearing a filter", async () => {
+    let releaseUnfiltered: (() => void) | undefined;
+    const unfilteredResponse = new Promise<void>((resolve) => {
+      releaseUnfiltered = resolve;
+    });
+    server.use(
+      http.get("/api/request-logs", async ({ request }) => {
+        const url = new URL(request.url);
+        if (url.searchParams.get("search")) {
+          return HttpResponse.json({ requests: [], total: 0, hasMore: false });
+        }
+        await unfilteredResponse;
+        return HttpResponse.json({ requests: [], total: 1, hasMore: false });
+      }),
+    );
+
+    const queryClient = createTestQueryClient();
+    const wrapper = createWrapper(queryClient, "/dashboard?search=missing");
+    const { result } = renderHook(() => useRequestLogs(), { wrapper });
+
+    await waitFor(() => expect(result.current.logsQuery.isSuccess).toBe(true));
+    expect(result.current.emptyStateFiltersApplied).toBe(true);
+
+    act(() => {
+      result.current.updateFilters({ search: "", offset: 0 });
+    });
+
+    await waitFor(() => expect(result.current.filters.search).toBe(""));
+    expect(result.current.logsQuery.isPlaceholderData).toBe(true);
+    expect(result.current.logsQuery.data?.total).toBe(0);
+    expect(result.current.emptyStateFiltersApplied).toBe(true);
+
+    releaseUnfiltered?.();
+    await waitFor(() => expect(result.current.logsQuery.data?.total).toBe(1));
+    expect(result.current.emptyStateFiltersApplied).toBe(false);
+  });
+
+  it("keeps filtered-empty semantics when route navigation clears filters", async () => {
+    let releaseUnfiltered: (() => void) | undefined;
+    let navigate: NavigateFunction | undefined;
+    const unfilteredResponse = new Promise<void>((resolve) => {
+      releaseUnfiltered = resolve;
+    });
+    server.use(
+      http.get("/api/request-logs", async ({ request }) => {
+        const url = new URL(request.url);
+        if (url.searchParams.get("search")) {
+          return HttpResponse.json({ requests: [], total: 0, hasMore: false });
+        }
+        await unfilteredResponse;
+        return HttpResponse.json({ requests: [], total: 1, hasMore: false });
+      }),
+    );
+
+    const queryClient = createTestQueryClient();
+    const wrapper = createWrapper(
+      queryClient,
+      "/dashboard?search=missing",
+      undefined,
+      (routerNavigate) => {
+        navigate = routerNavigate;
+      },
+    );
+    const { result } = renderHook(() => useRequestLogs(), { wrapper });
+
+    await waitFor(() => expect(result.current.logsQuery.isSuccess).toBe(true));
+    await waitFor(() => expect(navigate).toBeDefined());
+
+    act(() => {
+      navigate?.("/dashboard");
+    });
+
+    await waitFor(() => expect(result.current.filters.search).toBe(""));
+    expect(result.current.logsQuery.isPlaceholderData).toBe(true);
+    expect(result.current.emptyStateFiltersApplied).toBe(true);
+
+    releaseUnfiltered?.();
+    await waitFor(() => expect(result.current.logsQuery.data?.total).toBe(1));
+    expect(result.current.emptyStateFiltersApplied).toBe(false);
+  });
+
   it("supports pagination updates with total/hasMore response", async () => {
     const queryClient = createTestQueryClient();
     const wrapper = createWrapper(queryClient, "/dashboard?limit=1&offset=0");
@@ -132,6 +288,7 @@ describe("useRequestLogs", () => {
       accountIds: string[];
       apiKeyIds: string[];
       modelOptions: string[];
+      timeframe: string | null;
       since: string | null;
     }> = [];
     server.use(
@@ -142,6 +299,7 @@ describe("useRequestLogs", () => {
           accountIds: url.searchParams.getAll("accountId"),
           apiKeyIds: url.searchParams.getAll("apiKeyId"),
           modelOptions: url.searchParams.getAll("modelOption"),
+          timeframe: url.searchParams.get("timeframe"),
           since: url.searchParams.get("since"),
         });
         return HttpResponse.json({
@@ -173,7 +331,8 @@ describe("useRequestLogs", () => {
     );
     expect(matchingCall).toBeDefined();
     expect(matchingCall?.statuses).toEqual([]);
-    expect(matchingCall?.since).toMatch(/T/);
+    expect(matchingCall?.timeframe).toBe("24h");
+    expect(matchingCall?.since).toBeNull();
   });
 
   it("removes stale status from request parameters immediately after unselect", async () => {
@@ -431,5 +590,30 @@ describe("useRequestLogs", () => {
     const decoded = result.current.filters.conversationId;
     expect(decoded).toBe(rawId);
     expect(apiParams.some((p) => p === rawId)).toBe(true);
+  });
+});
+
+describe("requestLogFiltersApplied", () => {
+  const defaults = {
+    search: "",
+    timeframe: "all" as const,
+    accountIds: [],
+    apiKeyIds: [],
+    modelOptions: [],
+    statuses: [],
+    conversationId: null,
+    limit: 25,
+    offset: 0,
+  };
+
+  it("is false for default request-log filters", () => {
+    expect(requestLogFiltersApplied(defaults)).toBe(false);
+  });
+
+  it("is true when a narrowing filter is set", () => {
+    expect(requestLogFiltersApplied({ ...defaults, timeframe: "24h" })).toBe(true);
+    expect(requestLogFiltersApplied({ ...defaults, search: "rate" })).toBe(true);
+    expect(requestLogFiltersApplied({ ...defaults, conversationId: "conv-1" })).toBe(true);
+    expect(requestLogFiltersApplied({ ...defaults, statuses: ["error"] })).toBe(true);
   });
 });

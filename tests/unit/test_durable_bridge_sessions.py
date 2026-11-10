@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
@@ -1498,9 +1499,14 @@ async def test_durable_bridge_stale_owner_cannot_register_turn_state_after_epoch
 
 
 @pytest.mark.asyncio
-async def test_durable_bridge_claim_renews_same_owner_epoch(
+async def test_durable_bridge_same_owner_reclaim_advances_epoch_to_fence_the_predecessor(
     coordinator: DurableBridgeSessionCoordinator,
 ) -> None:
+    """Claims come only from a successor in-memory session (a reused session
+    renews instead of claiming), so a live same-owner row means the predecessor
+    local session is retiring concurrently. The claim must advance the epoch so
+    the predecessor's outstanding fenced release no-ops instead of racing the
+    successor into a closed, ownerless row (issue #1695)."""
     claimed = await coordinator.claim_live_session(
         session_key_kind="session_header",
         session_key_value="sid-123",
@@ -1532,9 +1538,22 @@ async def test_durable_bridge_claim_renews_same_owner_epoch(
     )
 
     assert renewed.session_id == claimed.session_id
-    assert renewed.owner_epoch == claimed.owner_epoch
+    assert renewed.owner_epoch == claimed.owner_epoch + 1
     assert renewed.latest_turn_state == "http_turn_2"
     assert renewed.latest_response_id == "resp_2"
+
+    # The predecessor's release carries the old epoch: it must be fenced out,
+    # leaving the successor's claim live and owned.
+    released = await coordinator.release_live_session(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        draining=False,
+    )
+    assert released is not None
+    assert released.owner_instance_id == "instance-a"
+    assert released.state == HttpBridgeSessionState.ACTIVE
+    assert released.owner_epoch == renewed.owner_epoch
 
 
 @pytest.mark.asyncio
@@ -2399,6 +2418,138 @@ async def test_mark_instance_draining_keeps_current_owner_lease_active(
 
 
 @pytest.mark.asyncio
+async def test_claim_refuses_live_draining_lease_without_allow_takeover(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-draining-claim",
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state="http_turn_1",
+        latest_response_id="resp_1",
+        allow_takeover=True,
+    )
+    updated = await coordinator.mark_instance_draining(instance_id="instance-a")
+    assert updated == 1
+
+    refused = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-draining-claim",
+        api_key_id=None,
+        instance_id="instance-b",
+        owner_process_epoch="test-process-b",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state="http_turn_2",
+        latest_response_id="resp_2",
+        allow_takeover=False,
+    )
+
+    assert refused.owner_instance_id == "instance-a"
+    assert refused.state == "draining"
+    assert refused.lease_expires_at == claimed.lease_expires_at
+    assert refused.lease_is_active(now=utcnow()) is True
+
+
+@pytest.mark.asyncio
+async def test_claim_refuses_live_draining_lease_even_with_allow_takeover(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-draining-force",
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state="http_turn_1",
+        latest_response_id="resp_1",
+        allow_takeover=True,
+    )
+    updated = await coordinator.mark_instance_draining(instance_id="instance-a")
+    assert updated == 1
+
+    refused = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-draining-force",
+        api_key_id=None,
+        instance_id="instance-b",
+        owner_process_epoch="test-process-b",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state="http_turn_2",
+        latest_response_id="resp_2",
+        allow_takeover=True,
+    )
+
+    assert refused.owner_instance_id == "instance-a"
+    assert refused.state == "draining"
+    assert refused.lease_expires_at == claimed.lease_expires_at
+    assert refused.lease_is_active(now=utcnow()) is True
+
+
+@pytest.mark.asyncio
+async def test_claim_takes_over_expired_draining_lease(
+    coordinator: DurableBridgeSessionCoordinator,
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-draining-expired",
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state="http_turn_1",
+        latest_response_id="resp_1",
+        allow_takeover=True,
+    )
+    updated = await coordinator.mark_instance_draining(instance_id="instance-a")
+    assert updated == 1
+
+    async with async_session_factory() as session:
+        record = await session.get(HttpBridgeSessionRecord, claimed.session_id)
+        assert record is not None
+        record.lease_expires_at = utcnow() - timedelta(seconds=1)
+        await session.commit()
+
+    stolen = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-draining-expired",
+        api_key_id=None,
+        instance_id="instance-b",
+        owner_process_epoch="test-process-b",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state="http_turn_2",
+        latest_response_id="resp_2",
+        allow_takeover=False,
+    )
+
+    assert stolen.owner_instance_id == "instance-b"
+    assert stolen.state == "active"
+    assert stolen.lease_is_active(now=utcnow()) is True
+
+
+@pytest.mark.asyncio
 async def test_startup_purges_owned_bridge_rows(
     coordinator: DurableBridgeSessionCoordinator,
     async_session_factory: Callable[[], AsyncSession],
@@ -3119,6 +3270,80 @@ async def test_durable_bridge_retry_circuit_round_trip(
     assert cleared.last_detail is None
 
 
+@pytest.mark.asyncio
+async def test_durable_bridge_retry_circuit_generation_claim_is_compare_and_set(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    await coordinator.persist_retry_circuit(
+        session_key_kind="session_header",
+        session_key_value="sid-retry-circuit-claim",
+        api_key_id="key-claim",
+        consecutive_failures=2,
+        cooldown_until_epoch=1300.0,
+        last_detail="stream_incomplete",
+        updated_at_epoch=1200.0,
+    )
+
+    claimed = await coordinator.claim_retry_circuit_generation(
+        session_key_kind="session_header",
+        session_key_value="sid-retry-circuit-claim",
+        api_key_id="key-claim",
+        expected_updated_at_epoch=1200.0,
+        expected_admission_generation=0,
+        expected_consecutive_failures=2,
+        expected_cooldown_until_epoch=1300.0,
+    )
+    assert claimed is not None
+    assert claimed.updated_at_epoch == 1200.0
+    assert claimed.admission_generation == 1
+    assert claimed.consecutive_failures == 2
+    assert claimed.cooldown_until_epoch == 1300.0
+
+    stale_claim = await coordinator.claim_retry_circuit_generation(
+        session_key_kind="session_header",
+        session_key_value="sid-retry-circuit-claim",
+        api_key_id="key-claim",
+        expected_updated_at_epoch=1200.0,
+        expected_admission_generation=0,
+        expected_consecutive_failures=2,
+        expected_cooldown_until_epoch=1300.0,
+    )
+    assert stale_claim is None
+
+    absent_claim = await coordinator.claim_retry_circuit_generation(
+        session_key_kind="session_header",
+        session_key_value="sid-retry-circuit-claim-absent",
+        api_key_id="key-claim",
+        expected_updated_at_epoch=None,
+        expected_admission_generation=0,
+        expected_consecutive_failures=0,
+        expected_cooldown_until_epoch=0.0,
+    )
+    assert absent_claim is not None
+    assert absent_claim.admission_generation == 1
+
+    await coordinator.persist_retry_circuit(
+        session_key_kind="session_header",
+        session_key_value="sid-retry-circuit-claim",
+        api_key_id="key-claim",
+        consecutive_failures=3,
+        cooldown_until_epoch=1400.0,
+        last_detail="stream_incomplete",
+        # Simulate a delayed replica whose wall clock is behind the observed
+        # failure row. The admission claim must not disturb this base epoch.
+        updated_at_epoch=1100.0,
+        base_updated_at_epoch=1200.0,
+    )
+    after_delayed_failure = await coordinator.lookup_retry_circuit(
+        session_key_kind="session_header",
+        session_key_value="sid-retry-circuit-claim",
+        api_key_id="key-claim",
+    )
+    assert after_delayed_failure is not None
+    assert after_delayed_failure.consecutive_failures == 3
+    assert after_delayed_failure.admission_generation == 1
+
+
 def _lookup_with_lease(lease_expires_at):
     from app.db.models import HttpBridgeSessionState
     from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
@@ -3159,3 +3384,482 @@ def test_lease_is_active_accepts_timestamptz_aware_expiry():
     # Existing naive-vs-naive behaviour is unchanged.
     assert _lookup_with_lease(naive_now + timedelta(minutes=5)).lease_is_active(now=naive_now) is True
     assert _lookup_with_lease(None).lease_is_active(now=naive_now) is False
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_claim_survives_a_release_committing_mid_claim(
+    coordinator: DurableBridgeSessionCoordinator,
+    async_session_factory: Callable[[], AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deterministic reproduction of the #1695 CI flake.
+
+    SQLite's with_for_update is a no-op, so the retiring predecessor's fenced
+    release can commit between the successor claim's SELECT and its write.
+    Before the fix, the claim mutated ORM attributes, SQLAlchemy omitted
+    fields whose values matched the stale read (owner unchanged on a single
+    instance), the release's owner=None/state=CLOSED survived the claim's
+    commit, and the refresh handed the claimant a closed, ownerless row —
+    surfaced to the client as 409 bridge_instance_mismatch.
+    """
+    predecessor = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-race",
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state="http_turn_1",
+        latest_response_id="resp_1",
+        allow_takeover=True,
+    )
+
+    import app.modules.proxy.durable_bridge_repository as repository_module
+
+    real_writer_section = repository_module.sqlite_writer_section
+    release_injected = False
+
+    @contextlib.asynccontextmanager
+    async def writer_section_with_interleaved_release():
+        nonlocal release_injected
+        if not release_injected:
+            release_injected = True
+            # The predecessor's fenced release lands exactly between the
+            # successor claim's SELECT and its write.
+            async with async_session_factory() as release_session:
+                await DurableBridgeRepository(release_session).release_session(
+                    session_id=predecessor.session_id,
+                    instance_id="instance-a",
+                    owner_epoch=predecessor.owner_epoch,
+                    draining=False,
+                )
+        async with real_writer_section():
+            yield
+
+    monkeypatch.setattr(repository_module, "sqlite_writer_section", writer_section_with_interleaved_release)
+
+    successor = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-race",
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=False,
+    )
+
+    assert release_injected is True
+    assert successor.session_id == predecessor.session_id
+    # The claim's write must be authoritative over the interleaved release.
+    assert successor.owner_instance_id == "instance-a"
+    assert successor.state == HttpBridgeSessionState.ACTIVE
+    assert successor.owner_epoch == predecessor.owner_epoch + 1
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_concurrent_successor_claims_serialize_on_the_epoch_cas(
+    coordinator: DurableBridgeSessionCoordinator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two successor claims can both read epoch N (with_for_update is a no-op
+    on SQLite). Without the compare-and-set, both would write N+1 and both
+    believe they own the row with colliding fences. The loser must retry
+    against fresh state and land on a distinct, higher epoch."""
+    predecessor = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-cas",
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+
+    import app.modules.proxy.durable_bridge_repository as repository_module
+
+    real_writer_section = repository_module.sqlite_writer_section
+    competitor_epochs: list[int] = []
+    injected = False
+
+    @contextlib.asynccontextmanager
+    async def writer_section_with_competing_claim():
+        nonlocal injected
+        if not injected:
+            injected = True
+            # A competing successor claim commits between this claim's SELECT
+            # and its CAS write.
+            competitor = await coordinator.claim_live_session(
+                session_key_kind="session_header",
+                session_key_value="sid-cas",
+                api_key_id=None,
+                instance_id="instance-a",
+                owner_process_epoch="test-process",
+                lease_ttl_seconds=60.0,
+                account_id="acc-1",
+                model="gpt-5.4",
+                service_tier=None,
+                latest_turn_state=None,
+                latest_response_id=None,
+                allow_takeover=False,
+            )
+            competitor_epochs.append(competitor.owner_epoch)
+        async with real_writer_section():
+            yield
+
+    monkeypatch.setattr(repository_module, "sqlite_writer_section", writer_section_with_competing_claim)
+
+    loser_turned_winner = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-cas",
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=False,
+    )
+
+    assert competitor_epochs == [predecessor.owner_epoch + 1]
+    # The raced claim lost the CAS, retried against fresh state, and landed on
+    # its own distinct epoch above the competitor's.
+    assert loser_turned_winner.owner_instance_id == "instance-a"
+    assert loser_turned_winner.owner_epoch == competitor_epochs[0] + 1
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_cas_loser_does_not_steal_a_foreign_winners_live_lease(
+    coordinator: DurableBridgeSessionCoordinator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two replicas recovering the same released row both enter with takeover
+    permission decided against that released state. Once one wins the CAS, the
+    loser re-reads a live foreign ACTIVE lease — reusing the stale permission
+    would steal it. The loser must fail closed and report the real owner, which
+    the bridge surfaces as the cross-replica retry response."""
+    released = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-foreign-cas",
+        api_key_id=None,
+        instance_id="instance-old",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    # The previous owner released: both recovering replicas legitimately see a
+    # takeover-eligible row.
+    await coordinator.release_live_session(
+        session_id=released.session_id,
+        instance_id="instance-old",
+        owner_epoch=released.owner_epoch,
+        draining=False,
+    )
+
+    import app.modules.proxy.durable_bridge_repository as repository_module
+
+    real_writer_section = repository_module.sqlite_writer_section
+    injected = False
+    winner_epoch: list[int] = []
+
+    @contextlib.asynccontextmanager
+    async def writer_section_with_foreign_winner():
+        nonlocal injected
+        if not injected:
+            injected = True
+            winner = await coordinator.claim_live_session(
+                session_key_kind="session_header",
+                session_key_value="sid-foreign-cas",
+                api_key_id=None,
+                instance_id="instance-b",
+                owner_process_epoch="test-process",
+                lease_ttl_seconds=60.0,
+                account_id="acc-1",
+                model="gpt-5.4",
+                service_tier=None,
+                latest_turn_state=None,
+                latest_response_id=None,
+                allow_takeover=True,
+            )
+            winner_epoch.append(winner.owner_epoch)
+        async with real_writer_section():
+            yield
+
+    monkeypatch.setattr(repository_module, "sqlite_writer_section", writer_section_with_foreign_winner)
+
+    loser = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-foreign-cas",
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+
+    assert winner_epoch, "the foreign winner must have claimed first"
+    # The loser reports the winner as owner instead of stealing the live lease.
+    assert loser.owner_instance_id == "instance-b"
+    assert loser.owner_epoch == winner_epoch[0]
+    assert loser.state == HttpBridgeSessionState.ACTIVE
+
+
+async def _detach_rows_like_account_invalidation(
+    async_session_factory: Callable[[], AsyncSession], account_id: str
+) -> None:
+    """Run the real account-invalidation detach so the test tracks its shape."""
+
+    from app.modules.accounts.repository import AccountsRepository
+
+    async with async_session_factory() as session:
+        await AccountsRepository(session)._close_http_bridge_sessions_for_account(account_id)
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_lookup_ignores_rows_detached_by_account_invalidation(
+    async_session_factory: Callable[[], AsyncSession],
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="thread_header",
+        session_key_value="thread-detached",
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=120.0,
+        account_id="acc-invalidated",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    await coordinator.register_turn_state(
+        session_id=claimed.session_id,
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        turn_state="http_turn_detached",
+        lease_ttl_seconds=120.0,
+    )
+
+    # Account deactivation / reauth / deletion detach every row of the account:
+    # CLOSED, no owner account, no lease, no continuity anchors, no aliases.
+    await _detach_rows_like_account_invalidation(async_session_factory, "acc-invalidated")
+
+    async with async_session_factory() as session:
+        row = await session.scalar(
+            select(HttpBridgeSessionRecord).where(HttpBridgeSessionRecord.id == claimed.session_id)
+        )
+        assert row is not None
+        assert row.state == HttpBridgeSessionState.CLOSED
+        assert row.account_id is None
+
+    # The detached row must not surface as durable owner evidence: a hard
+    # thread continuation would otherwise fail closed forever with
+    # previous_response_owner_unavailable even after the account recovers.
+    assert (
+        await coordinator.lookup_request_targets(
+            session_key_kind="thread_header",
+            session_key_value="thread-detached",
+            api_key_id="key-1",
+            turn_state="http_turn_detached",
+            session_header=None,
+            previous_response_id=None,
+        )
+        is None
+    )
+
+    # A fresh selection re-owns the same canonical key.
+    reclaimed = await coordinator.claim_live_session(
+        session_key_kind="thread_header",
+        session_key_value="thread-detached",
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=120.0,
+        account_id="acc-replacement",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    assert reclaimed.session_id == claimed.session_id
+    assert reclaimed.account_id == "acc-replacement"
+    after = await coordinator.lookup_request_targets(
+        session_key_kind="thread_header",
+        session_key_value="thread-detached",
+        api_key_id="key-1",
+        turn_state=None,
+        session_header=None,
+        previous_response_id=None,
+    )
+    assert after is not None
+    assert after.account_id == "acc-replacement"
+    assert after.state == HttpBridgeSessionState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_lookup_keeps_closed_rows_that_still_name_their_account(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="thread_header",
+        session_key_value="thread-released",
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=120.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id="resp_released",
+        allow_takeover=True,
+    )
+    released = await coordinator.release_live_session(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        draining=False,
+    )
+    assert released is not None
+    assert released.state == HttpBridgeSessionState.CLOSED
+
+    # An ordinary release keeps the owner account and its anchors: the closed
+    # row remains owner evidence for the continuation.
+    lookup = await coordinator.lookup_request_targets(
+        session_key_kind="thread_header",
+        session_key_value="thread-released",
+        api_key_id="key-1",
+        turn_state=None,
+        session_header=None,
+        previous_response_id=None,
+    )
+    assert lookup is not None
+    assert lookup.account_id == "acc-1"
+    assert lookup.state == HttpBridgeSessionState.CLOSED
+    assert lookup.latest_response_id == "resp_released"
+
+
+@pytest.mark.asyncio
+async def test_reclaimed_detached_row_fences_prior_generation_operations(
+    async_session_factory: Callable[[], AsyncSession],
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    """Re-owning a detached row must fence the invalidated generation's writes.
+
+    Reclaiming a detached row reuses its ``session_id``, so the replacement
+    account inherits the row's retained ``http_bridge_operations`` (the
+    recovery ledger is intentionally never cascade-deleted). That reuse is
+    safe only because every claim advances ``owner_epoch`` and
+    ``record_operation`` fences on ``(instance_id, owner_epoch)`` owning the
+    session: a write from the dead generation lands on no owner and is
+    rejected, so the invalidated account can never mutate the re-owned row.
+    """
+
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="thread_header",
+        session_key_value="thread-fence",
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=120.0,
+        account_id="acc-invalidated",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    old_fingerprint = "fingerprint-old-generation"
+    old_operation_id = durable_bridge_operation_id(claimed.session_id, old_fingerprint)
+    recorded = await coordinator.record_operation(
+        operation_id=old_operation_id,
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        request_fingerprint=old_fingerprint,
+        account_id="acc-invalidated",
+        model="gpt-5.4",
+        parent_response_id=None,
+        request_text='{"model":"gpt-5.4","input":"old turn"}',
+    )
+    assert recorded is not None
+
+    await _detach_rows_like_account_invalidation(async_session_factory, "acc-invalidated")
+
+    reclaimed = await coordinator.claim_live_session(
+        session_key_kind="thread_header",
+        session_key_value="thread-fence",
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=120.0,
+        account_id="acc-replacement",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    assert reclaimed.session_id == claimed.session_id
+    assert reclaimed.owner_epoch > claimed.owner_epoch
+
+    # A write from the invalidated generation (old owner_epoch) is fenced:
+    # record_operation requires the current (instance_id, owner_epoch) to own
+    # the session, so the dead generation cannot mutate the re-owned row.
+    fenced = await coordinator.record_operation(
+        operation_id=durable_bridge_operation_id(claimed.session_id, "fingerprint-dead-generation"),
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        request_fingerprint="fingerprint-dead-generation",
+        account_id="acc-invalidated",
+        model="gpt-5.4",
+        parent_response_id=None,
+        request_text='{"model":"gpt-5.4","input":"replayed dead turn"}',
+    )
+    assert fenced is None
+
+    # The current generation owns the re-owned row and can record normally.
+    new_fingerprint = "fingerprint-new-generation"
+    accepted = await coordinator.record_operation(
+        operation_id=durable_bridge_operation_id(reclaimed.session_id, new_fingerprint),
+        session_id=reclaimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=reclaimed.owner_epoch,
+        request_fingerprint=new_fingerprint,
+        account_id="acc-replacement",
+        model="gpt-5.4",
+        parent_response_id=None,
+        request_text='{"model":"gpt-5.4","input":"new turn"}',
+    )
+    assert accepted is not None

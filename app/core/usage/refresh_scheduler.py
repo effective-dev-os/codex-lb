@@ -2,24 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import importlib
 import logging
 import time
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Collection
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, AsyncIterator, Protocol, TypeVar, cast
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator, Protocol, cast
 
-from app.core.config.settings import get_settings
-from app.core.usage import capacity_for_plan
+from app.core.balancer.logic import RATE_LIMITED_MIN_COOLDOWN_SECONDS
+from app.core.plan_types import normalize_account_plan_type
+from app.core.resilience.toggles import resolve_resilience_toggles
+from app.core.scheduling.leader_election_handle import get_leader_election as _get_leader_election
+from app.core.usage import capacity_for_plan, default_window_minutes
+from app.core.usage.refresh_policy import USAGE_REFRESH_INTERVAL_SECONDS
+from app.core.utils.time import naive_utc_to_epoch
 from app.db.models import Account, AccountLimitWarmup, AccountStatus, UsageHistory
 from app.db.session import detach_session_objects, get_background_session
 from app.modules.accounts.background_repository import BackgroundAccountsRepository
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.limit_warmup.repository import LimitWarmupRepository
-from app.modules.limit_warmup.service import LimitWarmupService, StreamingLimitWarmupSender
+from app.modules.limit_warmup.service import (
+    LimitWarmupService,
+    StreamingLimitWarmupSender,
+    usage_reset_confirmed,
+)
 from app.modules.proxy.account_cache import get_account_selection_cache
-from app.modules.proxy.load_balancer import background_recovery_state_from_account
+from app.modules.proxy.load_balancer import background_recovery_state_from_account, effective_routing_tunables
 from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.settings.repository import SettingsRepository
@@ -30,13 +38,48 @@ from app.modules.usage.updater import build_background_usage_updater
 logger = logging.getLogger(__name__)
 
 _RECOVERABLE_ACCOUNT_STATUSES = frozenset({AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED})
+_BLOCK_RESET_MATCH_TOLERANCE_SECONDS = 5
+# Quota-window slots a persisted rate-limit deadline can be anchored to.
+# Upstream reports the paid short window and the paid 7d window through the
+# primary/secondary slots and the free 30d window through the monthly slot, so
+# the anchor search covers all three instead of assuming one plan's shape.
+_RESET_EVIDENCE_WINDOWS: tuple[str, ...] = ("primary", "secondary", "monthly")
 
 
-_T = TypeVar("_T")
+def _normalized_usage_window(entry: UsageHistory) -> str:
+    """Return the slot an entry belongs to, matching the repository's filter.
+
+    Primary rows may persist a ``NULL`` window; ``UsageRepository`` normalizes
+    those to ``"primary"`` when filtering, so window comparisons here must use
+    the same normalization or a legacy primary row would never match its slot.
+    """
+
+    return entry.window or "primary"
 
 
-class _LeaderElectionLike(Protocol):
-    async def run_if_leader(self, fn: Callable[[], Awaitable[_T]]) -> _T | None: ...
+@dataclass(frozen=True, slots=True)
+class _ResolvedResetEvidence:
+    """The two independent uses of a reset transition, kept apart on purpose.
+
+    ``warmup`` feeds reset-confirmed warm-up and only ever holds monthly-slot
+    pairs. ``recovery`` holds transitions that passed the anchoring and
+    uniqueness checks and may therefore override a persisted cooldown. Sharing
+    one map let unvalidated warm-up evidence reach the recovery path.
+    """
+
+    warmup: "dict[str, _ResetEvidence]"
+    recovery: "dict[str, _ResetEvidence]"
+
+
+@dataclass(frozen=True, slots=True)
+class _ResetEvidence:
+    baseline: UsageHistory
+    before: UsageHistory
+    after: UsageHistory
+
+    @property
+    def window(self) -> str:
+        return _normalized_usage_window(self.baseline)
 
 
 class _RecoverableAccountsRepository(Protocol):
@@ -81,6 +124,7 @@ class _BackgroundLimitWarmupRepository:
         attempted_at: datetime,
         status: str = "pending",
         reset_at_tolerance_seconds: int = 0,
+        require_no_prior_attempt: bool = False,
     ) -> AccountLimitWarmup | None:
         async with get_background_session() as session:
             attempt = await LimitWarmupRepository(session).try_create_attempt(
@@ -91,6 +135,7 @@ class _BackgroundLimitWarmupRepository:
                 attempted_at=attempted_at,
                 status=status,
                 reset_at_tolerance_seconds=reset_at_tolerance_seconds,
+                require_no_prior_attempt=require_no_prior_attempt,
             )
             detach_session_objects(session)
             return attempt
@@ -120,11 +165,6 @@ class _BackgroundRequestLogsRepository:
     async def add_log(self, *args: Any, **kwargs: Any) -> object:
         async with get_background_session() as session:
             return await RequestLogsRepository(session).add_log(*args, **kwargs)
-
-
-def _get_leader_election() -> _LeaderElectionLike:
-    module = importlib.import_module("app.core.scheduling.leader_election")
-    return cast(_LeaderElectionLike, module.get_leader_election())
 
 
 @dataclass(slots=True)
@@ -182,6 +222,9 @@ class UsageRefreshScheduler:
                     selected_account, cycle_complete = self._select_next_account(accounts)
                     if selected_account is not None:
                         selected_account_ids = [selected_account.id]
+                        previous_plan_types = {
+                            selected_account.id: normalize_account_plan_type(selected_account.plan_type)
+                        }
                         before_primary = await usage_repo.latest_by_account(
                             window="primary",
                             account_ids=selected_account_ids,
@@ -225,7 +268,26 @@ class UsageRefreshScheduler:
                         refreshed_selected_accounts = [
                             account for account in refreshed_accounts if account.id == selected_account.id
                         ]
+                        resolved = await _resolve_reset_evidence(
+                            accounts=refreshed_selected_accounts,
+                            usage_repo=usage_repo,
+                            before_monthly=before_monthly,
+                            after_monthly=after_monthly,
+                        )
                         detach_session_objects(session)
+                    warmup_before_monthly = dict(before_monthly)
+                    warmup_after_monthly = dict(after_monthly)
+                    for account_id, account_evidence in resolved.warmup.items():
+                        warmup_before_monthly[account_id] = account_evidence.before
+                        warmup_after_monthly[account_id] = account_evidence.after
+                    async with get_background_session() as session:
+                        await reconcile_recoverable_account_statuses(
+                            accounts_repo=AccountsRepository(session),
+                            usage_repo=UsageRepository(session),
+                            accounts=refreshed_selected_accounts,
+                            reset_evidence=resolved.recovery,
+                            dashboard_settings=dashboard_settings,
+                        )
                     warmup_service = LimitWarmupService(
                         cast(Any, _BackgroundLimitWarmupRepository()),
                         cast(Any, _BackgroundRequestLogsRepository()),
@@ -241,26 +303,19 @@ class UsageRefreshScheduler:
                         before_primary=before_primary,
                         before_secondary=_select_long_window_entries(
                             accounts=refreshed_selected_accounts,
-                            monthly_entries=before_monthly,
+                            monthly_entries=warmup_before_monthly,
                             secondary_entries=before_secondary,
                         ),
                         after_primary=after_primary,
                         after_secondary=_select_long_window_entries(
                             accounts=refreshed_selected_accounts,
-                            monthly_entries=after_monthly,
+                            monthly_entries=warmup_after_monthly,
                             secondary_entries=after_secondary,
                         ),
+                        previous_plan_types=previous_plan_types,
                         refresh_started_at=refresh_started_at,
                         usage_refresh_interval_seconds=self.interval_seconds,
                     )
-                    async with get_background_session() as session:
-                        usage_repo = UsageRepository(session)
-                        accounts_repo = AccountsRepository(session)
-                        await reconcile_recoverable_account_statuses(
-                            accounts_repo=accounts_repo,
-                            usage_repo=usage_repo,
-                            accounts=refreshed_selected_accounts,
-                        )
                 if cycle_complete:
                     await _invalidate_usage_refresh_caches()
             except Exception:
@@ -279,11 +334,7 @@ class UsageRefreshScheduler:
 
 
 def build_usage_refresh_scheduler() -> UsageRefreshScheduler:
-    settings = get_settings()
-    return UsageRefreshScheduler(
-        interval_seconds=settings.usage_refresh_interval_seconds,
-        enabled=settings.usage_refresh_enabled,
-    )
+    return UsageRefreshScheduler(interval_seconds=USAGE_REFRESH_INTERVAL_SECONDS, enabled=True)
 
 
 def _ordered_usage_refresh_accounts(accounts: list[Account]) -> list[Account]:
@@ -311,7 +362,10 @@ async def _invalidate_usage_refresh_caches() -> None:
 @contextlib.asynccontextmanager
 async def _background_accounts_repo() -> AsyncIterator[AccountsRepository]:
     async with get_background_session() as session:
-        yield AccountsRepository(session)
+        try:
+            yield AccountsRepository(session)
+        finally:
+            detach_session_objects(session)
 
 
 async def reconcile_recoverable_account_statuses(
@@ -319,10 +373,22 @@ async def reconcile_recoverable_account_statuses(
     accounts_repo: _RecoverableAccountsRepository,
     usage_repo: _LatestUsageRepository,
     accounts: list[Account],
+    reset_evidence: dict[str, _ResetEvidence] | None = None,
+    dashboard_settings: object | None = None,
 ) -> int:
+    """Repair recoverable account statuses from the latest usage evidence.
+
+    ``dashboard_settings`` is the dashboard-settings row the refresh cycle
+    already read; the state builds below resolve soft drain and the routing
+    tunables from it once, so the health tier they compute follows the
+    dashboard toggle exactly like a request-path state build (``None`` = the
+    environment layer, for callers without a row).
+    """
     candidates = [account for account in accounts if account.status in _RECOVERABLE_ACCOUNT_STATUSES]
     if not candidates:
         return 0
+    routing_tunables = effective_routing_tunables(dashboard_settings)
+    soft_drain_enabled = resolve_resilience_toggles(dashboard_settings).soft_drain_enabled
 
     candidate_ids = [account.id for account in candidates]
     latest_primary = await usage_repo.latest_by_account(window="primary", account_ids=candidate_ids)
@@ -331,22 +397,40 @@ async def reconcile_recoverable_account_statuses(
 
     recovered = 0
     for account in candidates:
-        state = background_recovery_state_from_account(
+        monthly_entry = latest_monthly.get(account.id)
+        latest_by_window: dict[str, UsageHistory | None] = {
+            "primary": latest_primary.get(account.id),
+            "secondary": latest_secondary.get(account.id),
+            "monthly": monthly_entry,
+        }
+        if _confirmed_window_reset_recovery(
             account=account,
-            primary_entry=latest_primary.get(account.id),
-            secondary_entry=_select_long_window_entry(
+            evidence=(reset_evidence or {}).get(account.id),
+            latest_by_window=latest_by_window,
+        ):
+            status = AccountStatus.ACTIVE
+            reset_at = None
+            blocked_at = None
+        else:
+            state = background_recovery_state_from_account(
                 account=account,
-                monthly_entry=latest_monthly.get(account.id),
-                secondary_entry=latest_secondary.get(account.id),
-            ),
-        )
-        if state.status != AccountStatus.ACTIVE:
-            continue
-        reset_at = int(state.reset_at) if state.reset_at else None
-        blocked_at = int(state.blocked_at) if state.blocked_at else None
+                primary_entry=latest_primary.get(account.id),
+                secondary_entry=_select_long_window_entry(
+                    account=account,
+                    monthly_entry=monthly_entry,
+                    secondary_entry=latest_secondary.get(account.id),
+                ),
+                routing_tunables=routing_tunables,
+                soft_drain_enabled=soft_drain_enabled,
+            )
+            if state.status != AccountStatus.ACTIVE:
+                continue
+            status = state.status
+            reset_at = int(state.reset_at) if state.reset_at else None
+            blocked_at = int(state.blocked_at) if state.blocked_at else None
         deactivation_reason = None
         if (
-            state.status == account.status
+            status == account.status
             and deactivation_reason == account.deactivation_reason
             and reset_at == account.reset_at
             and blocked_at == account.blocked_at
@@ -354,7 +438,7 @@ async def reconcile_recoverable_account_statuses(
             continue
         updated = await accounts_repo.update_status_if_current(
             account.id,
-            state.status,
+            status,
             deactivation_reason,
             reset_at,
             blocked_at=blocked_at,
@@ -365,12 +449,239 @@ async def reconcile_recoverable_account_statuses(
         )
         if not updated:
             continue
-        account.status = state.status
+        account.status = status
         account.deactivation_reason = deactivation_reason
         account.reset_at = reset_at
         account.blocked_at = blocked_at
         recovered += 1
     return recovered
+
+
+def _is_long_window_minutes(window_minutes: int | None) -> bool:
+    """Return whether a duration is one of the recognized long quota windows."""
+
+    if window_minutes is None:
+        return False
+    return any(window_minutes == default_window_minutes(window) for window in ("secondary", "monthly"))
+
+
+def _short_window_blocks_recovery(entry: UsageHistory | None, *, account: Account, now: float) -> bool:
+    """Return whether the account's short window would immediately re-block it.
+
+    This is the risk the reset-confirmed exception was originally scoped away
+    from by restricting it to Free accounts: a paid account whose short window
+    is exhausted must not be released by a reset in a long window. Anchoring
+    already prevents an unrelated window's reset from matching this block's
+    deadline; this keeps the account blocked when its *own* short window is
+    still spent, so recovery cannot hand back an account that would spend one
+    request earning a fresh 429.
+
+    Deliberately only the short window. The long window is what a confirmed
+    reset and credit-backed quota act on, and reasoning about it here would
+    duplicate ``apply_usage_quota`` and the weekly-shape normalization that own
+    that question.
+
+    Three exclusions:
+
+    * A primary-slot row is not the short window when it reports a *recognized
+      long* window's duration. Upstream also delivers a weekly quota through
+      the primary slot (``should_use_weekly_primary``), and that row is a long
+      window wearing the short window's slot. Only recognized long durations
+      are excluded: an unfamiliar duration is treated as the short window, so
+      an upstream change to the short window's length keeps the account
+      blocked rather than silently disabling this guard.
+    * A slot known to carry zero capacity for the plan is not a window. The Free
+      primary row is a normalization artifact of the monthly-only payload, not a
+      live 5h window, and mirrors the monthly percentage. An *unknown* capacity
+      (an unrecognized stored plan, which ``coerce_account_plan_type``
+      preserves) is not evidence that a reported window does not exist, so it
+      does not exclude the slot.
+    * An elapsed window is stale exhaustion evidence rather than a live block
+      (see "Usage refresh does not trust elapsed reset windows"), which also
+      covers upstream having stopped reporting the short window. A 100% row with
+      no reset metadata is treated as current because nothing proves it rolled.
+    """
+
+    if entry is None or entry.used_percent < 100.0:
+        return False
+    if _is_long_window_minutes(entry.window_minutes):
+        return False
+    capacity = capacity_for_plan(account.plan_type, "primary")
+    if capacity is not None and capacity <= 0:
+        return False
+    return entry.reset_at is None or entry.reset_at > now
+
+
+def _confirmed_window_reset_recovery(
+    *,
+    account: Account,
+    evidence: _ResetEvidence | None,
+    latest_by_window: dict[str, UsageHistory | None],
+) -> bool:
+    """Return whether usage history proves the blocked quota window already reset.
+
+    The persisted ``reset_at`` is the cross-replica authority for a 429, so it
+    is only overridden when history identifies *the very window that deadline
+    came from* and shows it rolling. The baseline match on ``reset_at`` is what
+    binds the evidence to this block: a deadline derived from a generic
+    Retry-After hint or a model-scoped throttle matches no quota window's reset
+    metadata, and a reset in an unrelated window does not match this block's
+    deadline. That anchoring -- not the account's plan -- is what keeps a paid
+    account with an exhausted short window from being released by unrelated
+    long-window availability.
+    """
+
+    if account.status != AccountStatus.RATE_LIMITED:
+        return False
+    if account.reset_at is None or account.blocked_at is None:
+        return False
+    now = time.time()
+    if now >= account.reset_at:
+        return False
+    if now < account.blocked_at + RATE_LIMITED_MIN_COOLDOWN_SECONDS:
+        return False
+    if evidence is None:
+        return False
+    baseline = evidence.baseline
+    before = evidence.before
+    after = evidence.after
+    window = evidence.window
+    if _normalized_usage_window(before) != window or _normalized_usage_window(after) != window:
+        return False
+    latest = latest_by_window.get(window)
+    if latest is None or _normalized_usage_window(latest) != window:
+        return False
+    if baseline.reset_at is None:
+        return False
+    if abs(baseline.reset_at - account.reset_at) > _BLOCK_RESET_MATCH_TOLERANCE_SECONDS:
+        return False
+    if naive_utc_to_epoch(baseline.recorded_at) <= account.blocked_at:
+        return False
+    if not usage_reset_confirmed(before=before, after=after):
+        return False
+    if after.used_percent >= 100.0 or latest.used_percent >= 100.0:
+        return False
+    if window != "primary" and _short_window_blocks_recovery(latest_by_window.get("primary"), account=account, now=now):
+        return False
+    return (
+        naive_utc_to_epoch(after.recorded_at) > account.blocked_at
+        and naive_utc_to_epoch(latest.recorded_at) > account.blocked_at
+    )
+
+
+async def _resolve_reset_evidence(
+    *,
+    accounts: list[Account],
+    usage_repo: UsageRepository,
+    before_monthly: dict[str, UsageHistory],
+    after_monthly: dict[str, UsageHistory],
+) -> _ResolvedResetEvidence:
+    """Resolve reset transitions for warm-up and, separately, for recovery.
+
+    The in-cycle monthly pair feeds reset-confirmed warm-up for every account
+    and is unchanged. For a blocked account the persisted lookup additionally
+    searches each quota-window slot for a post-block transition anchored to the
+    account's own ``reset_at``, so recovery works after a restart and for
+    whichever window upstream actually blocked -- the paid 5h/7d primary and
+    secondary slots as well as the free monthly slot.
+
+    Only that anchored, unique transition is eligible to override a cooldown.
+    Warm-up evidence is never promoted into the recovery map, because it carries
+    no proof about which window produced the block.
+    """
+
+    warmup: dict[str, _ResetEvidence] = {}
+    recovery: dict[str, _ResetEvidence] = {}
+    for account in accounts:
+        before = before_monthly.get(account.id)
+        after = after_monthly.get(account.id)
+        if usage_reset_confirmed(before=before, after=after):
+            assert before is not None and after is not None
+            warmup[account.id] = _ResetEvidence(baseline=before, before=before, after=after)
+        if account.status != AccountStatus.RATE_LIMITED or account.reset_at is None or account.blocked_at is None:
+            continue
+        since = datetime.fromtimestamp(account.blocked_at, timezone.utc).replace(tzinfo=None)
+        matching_slots = 0
+        anchored: _ResetEvidence | None = None
+        for window in _RESET_EVIDENCE_WINDOWS:
+            history = [
+                entry
+                for entry in await usage_repo.history_since(account.id, window, since)
+                if entry.recorded_at > since
+            ]
+            baseline = _matching_baseline(
+                history,
+                expected_reset_at=account.reset_at,
+                reset_at_tolerance_seconds=_BLOCK_RESET_MATCH_TOLERANCE_SECONDS,
+            )
+            if baseline is None:
+                continue
+            # Uniqueness is decided by the matching baseline, not by whether a
+            # transition followed it. A second slot carrying this deadline means
+            # the deadline does not identify the blocked window even when that
+            # slot has not reset -- and that unreset slot may be the exhausted
+            # one that produced the 429.
+            matching_slots += 1
+            transition = _latest_confirmed_reset_transition_from(history, baseline)
+            if transition is not None:
+                anchored = transition
+        if matching_slots == 1 and anchored is not None:
+            recovery[account.id] = anchored
+            if anchored.window == "monthly":
+                warmup[account.id] = anchored
+    return _ResolvedResetEvidence(warmup=warmup, recovery=recovery)
+
+
+def _matching_baseline(
+    history: list[UsageHistory],
+    *,
+    expected_reset_at: int,
+    reset_at_tolerance_seconds: int,
+) -> tuple[int, UsageHistory] | None:
+    """Return the earliest row whose reset deadline matches the persisted marker."""
+
+    return next(
+        (
+            (index, entry)
+            for index, entry in enumerate(history)
+            if entry.reset_at is not None and abs(entry.reset_at - expected_reset_at) <= reset_at_tolerance_seconds
+        ),
+        None,
+    )
+
+
+def _latest_confirmed_reset_transition_after_baseline(
+    history: list[UsageHistory],
+    *,
+    expected_reset_at: int,
+    reset_at_tolerance_seconds: int,
+) -> _ResetEvidence | None:
+    baseline = _matching_baseline(
+        history,
+        expected_reset_at=expected_reset_at,
+        reset_at_tolerance_seconds=reset_at_tolerance_seconds,
+    )
+    if baseline is None:
+        return None
+    return _latest_confirmed_reset_transition_from(history, baseline)
+
+
+def _latest_confirmed_reset_transition_from(
+    history: list[UsageHistory],
+    baseline: tuple[int, UsageHistory],
+) -> _ResetEvidence | None:
+    baseline_index, baseline_entry = baseline
+    latest_transition: _ResetEvidence | None = None
+    for index in range(baseline_index, len(history) - 1):
+        before = history[index]
+        after = history[index + 1]
+        if usage_reset_confirmed(before=before, after=after):
+            latest_transition = _ResetEvidence(
+                baseline=baseline_entry,
+                before=before,
+                after=after,
+            )
+    return latest_transition
 
 
 def _select_long_window_entry(

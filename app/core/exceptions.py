@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
+from app.core.types import JsonValue
+
 
 class AppError(Exception):
     """Base exception for all domain errors."""
@@ -8,8 +12,19 @@ class AppError(Exception):
     code: str = "internal_error"
     message: str = "Unexpected error"
 
-    def __init__(self, message: str | None = None, *, code: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        code: str | None = None,
+        param: str | None = None,
+        details: Mapping[str, JsonValue] | None = None,
+    ) -> None:
         self.message = message or self.__class__.message
+        self.param = param
+        #: Structured hints for the client (dashboard envelope only), e.g. the
+        #: step-up methods a principal may use.
+        self.details = details
         if code is not None:
             self.code = code
         super().__init__(self.message)
@@ -30,6 +45,12 @@ class ProxyModelNotAllowed(AppError):
     error_type = "permission_error"
 
 
+class ProxyReasoningEffortNotAllowed(AppError):
+    status_code = 403
+    code = "reasoning_effort_not_allowed"
+    error_type = "permission_error"
+
+
 class ProxyRateLimitError(AppError):
     status_code = 429
     code = "rate_limit_exceeded"
@@ -40,6 +61,13 @@ class ProxyUpstreamError(AppError):
     status_code = 503
     code = "upstream_error"
     error_type = "server_error"
+
+
+class ProxyRequiredCapabilityTransportError(AppError):
+    status_code = 400
+    code = "required_capability_transport_unsupported"
+    error_type = "invalid_request_error"
+    message = "Required capability routing is only supported over the Responses WebSocket transport."
 
 
 # --- Dashboard-envelope errors ---

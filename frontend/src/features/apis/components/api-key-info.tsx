@@ -1,6 +1,7 @@
 import { useTranslation } from "react-i18next";
 
 import type { ApiKey, LimitType } from "@/features/api-keys/schemas";
+import { useDateDisplayFormatStore, type DateDisplayFormat } from "@/hooks/use-date-format";
 import { cn } from "@/lib/utils";
 import {
 	formatCompactNumber,
@@ -23,9 +24,9 @@ export type ApiKeyInfoProps = {
 	allowUsageSummaryFallback?: boolean;
 };
 
-function formatExpiry(value: string | null, neverLabel: string): string {
+function formatExpiry(value: string | null, neverLabel: string, displayFormat: DateDisplayFormat): string {
 	if (!value) return neverLabel;
-	const parsed = formatTimeLong(value);
+	const parsed = formatTimeLong(value, displayFormat);
 	return `${parsed.date} ${parsed.time}`;
 }
 
@@ -41,10 +42,14 @@ export function ApiKeyInfo({
 	allowUsageSummaryFallback = true,
 }: ApiKeyInfoProps) {
 	const { t } = useTranslation();
+	const dateDisplayFormat = useDateDisplayFormatStore((state) => state.dateDisplayFormat);
 	const expired = isExpired(apiKey);
 	const models = apiKey.allowedModels?.join(", ") || t("apiKeys.modelSelect.all");
 	const enforcedModel = apiKey.enforcedModel || null;
 	const enforcedEffort = apiKey.enforcedReasoningEffort || null;
+	const allowedEfforts = apiKey.allowedReasoningEfforts
+		?.map((effort) => t(`common.reasoning.${effort}`))
+		.join(", ") || null;
 	const trafficClass = apiKey.trafficClass === "opportunistic" ? t("common.traffic.opportunistic") : t("common.traffic.foreground");
 	const usage = allowUsageSummaryFallback
 		? (usageSummary ?? apiKey.usageSummary)
@@ -81,6 +86,12 @@ export function ApiKeyInfo({
 						<dd className="font-medium">{enforcedEffort}</dd>
 					</div>
 				) : null}
+				{allowedEfforts ? (
+					<div className="flex items-start justify-between gap-2">
+						<dt className="text-muted-foreground">{t("apiKeys.form.allowedReasoningEfforts")}</dt>
+						<dd className="text-right font-medium">{allowedEfforts}</dd>
+					</div>
+				) : null}
 				<div className="flex items-center justify-between gap-2">
 					<dt className="text-muted-foreground">{t("apiKeys.table.expiry")}</dt>
 					<dd
@@ -89,7 +100,7 @@ export function ApiKeyInfo({
 							expired ? "text-red-600 dark:text-red-400" : "",
 						)}
 					>
-						{expired ? t("common.states.expired") : formatExpiry(apiKey.expiresAt, t("common.time.never"))}
+						{expired ? t("common.states.expired") : formatExpiry(apiKey.expiresAt, t("common.time.never"), dateDisplayFormat)}
 					</dd>
 				</div>
 				<div className="flex items-start justify-between gap-2">

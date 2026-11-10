@@ -31,6 +31,7 @@ from app.core.clients.usage import (
 )
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
+from app.core.openai.host_models import resolve_default_host_model
 from app.core.plan_types import coerce_account_plan_type
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError, resolve_upstream_route
 from app.core.upstream_proxy.cache import get_upstream_route_cache
@@ -40,6 +41,7 @@ from app.core.utils.time import naive_utc_to_epoch, to_utc_naive, utcnow
 from app.db.models import Account, AccountStatus, DashboardSettings
 from app.db.session import get_background_session
 from app.modules.accounts.auth_manager import AuthManager
+from app.modules.accounts.deletion import request_account_deletion_run
 from app.modules.accounts.mappers import build_account_summaries, build_account_usage_trends
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.schemas import (
@@ -47,10 +49,8 @@ from app.modules.accounts.schemas import (
     AccountAdditionalWindow,
     AccountAuthExportResponse,
     AccountAuthExportTokens,
-    AccountExportResponse,
     AccountImportResponse,
     AccountOpenCodeAuthExportAccount,
-    AccountOpenCodeAuthExportResponse,
     AccountProbeResponse,
     AccountRequestUsage,
     AccountSummary,
@@ -83,9 +83,10 @@ logger = logging.getLogger(__name__)
 _SPARKLINE_DAYS = 7
 _DETAIL_BUCKET_SECONDS = 3600  # 1h → 168 points
 
-DEFAULT_PROBE_MODEL = "gpt-5.5"
 PROBE_REQUEST_TIMEOUT_SECONDS = 30.0
 PROBE_CONNECT_TIMEOUT_SECONDS = 10.0
+# Codex rejects probe completions below this output-token floor (1 → 400, 16 → 200).
+PROBE_MAX_OUTPUT_TOKENS = 16
 # Network/upstream failure sentinel for ``probe_status_code`` — kept as ``0`` so
 # the value is distinguishable from any real HTTP status the upstream might
 # return.
@@ -130,7 +131,12 @@ class AccountsService:
         self._encryptor = TokenEncryptor()
         self._auth_manager = auth_manager
 
-    async def list_accounts(self, *, account_ids: list[str] | None = None) -> list[AccountSummary]:
+    async def list_accounts(
+        self,
+        *,
+        account_ids: list[str] | None = None,
+        redact_identity: bool = False,
+    ) -> list[AccountSummary]:
         accounts = (
             await self._repo.list_accounts_by_ids(account_ids)
             if account_ids is not None
@@ -230,10 +236,11 @@ class AccountsService:
             additional_quotas_by_account=additional_quotas_by_account,
             limit_warmups_by_account=limit_warmups_by_account,
             encryptor=self._encryptor,
+            redact_identity=redact_identity,
         )
 
     async def get_account_trends(self, account_id: str) -> AccountTrendsResponse | None:
-        account = await self._repo.get_by_id(account_id)
+        account = await self._get_visible_account(account_id)
         if not account or not self._usage_repo:
             return None
         now = utcnow()
@@ -255,10 +262,10 @@ class AccountsService:
         )
 
     async def get_usage_reset_credits(self, account_id: str) -> AccountUsageResetCreditsResponse | None:
-        account = await self._repo.get_by_id(account_id)
+        account = await self._get_visible_account(account_id)
         if account is None:
             return None
-        if account.status in (AccountStatus.PAUSED, AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
+        if account.status in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED):
             raise AccountUsageResetCreditsUnavailableError(
                 f"Account is {account.status.value} and cannot fetch usage reset credits",
             )
@@ -318,10 +325,10 @@ class AccountsService:
         *,
         redeem_request_id: str | None = None,
     ) -> AccountUsageResetConsumeResponse | None:
-        account = await self._repo.get_by_id(account_id)
+        account = await self._get_visible_account(account_id)
         if account is None:
             return None
-        if account.status in (AccountStatus.PAUSED, AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
+        if account.status in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED):
             raise AccountUsageResetConsumeUnavailableError(
                 f"Account is {account.status.value} and cannot consume usage reset credits",
             )
@@ -345,7 +352,7 @@ class AccountsService:
 
         usage_written = False
         if upstream_response.code in ("reset", "already_redeemed") and self._usage_repo and self._usage_updater:
-            usage_written = await self._usage_updater.force_refresh(account, ignore_refresh_disabled=True)
+            usage_written = await self._usage_updater.force_refresh(account)
             get_account_selection_cache().invalidate()
 
         refreshed = await self._repo.get_by_id(account_id) or account
@@ -423,33 +430,19 @@ class AccountsService:
                 encryptor=self._encryptor,
             )
 
-    async def export_opencode_auth(self, account_id: str) -> AccountOpenCodeAuthExportResponse | None:
+    async def _get_visible_account(self, account_id: str) -> Account | None:
+        """Account fetch for ID-based operator routes; marked-for-deletion
+        rows are gone from the operator's perspective (the synchronous delete
+        returned 404 on every one of these routes once the row was removed)
+        and MUST NOT keep serving reads, mutations, or decrypted tokens
+        during the background drain window."""
         account = await self._repo.get_by_id(account_id)
-        if account is None:
+        if account is None or account.delete_requested_at is not None:
             return None
-
-        access_token = self._encryptor.decrypt(account.access_token_encrypted)
-        refresh_token = self._encryptor.decrypt(account.refresh_token_encrypted)
-        expires = token_expiry_epoch_ms(access_token) or 0
-        return AccountOpenCodeAuthExportResponse(
-            filename=_opencode_auth_export_filename(account),
-            account=AccountOpenCodeAuthExportAccount(
-                account_id=account.id,
-                chatgpt_account_id=account.chatgpt_account_id,
-                email=account.email,
-            ),
-            auth_json=OpenCodeAuthJson(
-                openai=OpenCodeOAuthAuth(
-                    refresh=refresh_token,
-                    access=access_token,
-                    expires=expires,
-                    account_id=account.chatgpt_account_id,
-                ),
-            ),
-        )
+        return account
 
     async def export_auth(self, account_id: str) -> AccountAuthExportResponse | None:
-        account = await self._repo.get_by_id(account_id)
+        account = await self._get_visible_account(account_id)
         if account is None:
             return None
 
@@ -592,6 +585,11 @@ class AccountsService:
         account = await self._repo.get_by_id(account_id)
         if account is None:
             return False
+        if account.delete_requested_at is not None:
+            # Marked for background deletion: already invisible in listings
+            # and about to be removed — report it as gone rather than racing
+            # the deletion worker back to ACTIVE.
+            return False
         if account.status == AccountStatus.REAUTH_REQUIRED:
             raise AccountStateTransitionError("Account requires re-authentication and cannot be reactivated directly")
         result = await self._repo.update_status_if_current(
@@ -614,7 +612,7 @@ class AccountsService:
         return result
 
     async def pause_account(self, account_id: str) -> bool:
-        account = await self._repo.get_by_id(account_id)
+        account = await self._get_visible_account(account_id)
         if account is None:
             return False
         if account.status in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
@@ -659,19 +657,25 @@ class AccountsService:
         return result
 
     async def delete_account(self, account_id: str, *, delete_history: bool = False) -> bool:
-        result = await self._repo.delete(account_id, delete_history=delete_history)
+        # Fast path: stamp the pending-deletion marker (terminal status, hidden
+        # from listings, sticky/bridge cleanup) and return in milliseconds; the
+        # background deletion worker drains the bulk rows and removes the
+        # account row afterwards (see app.modules.accounts.deletion).
+        result = await self._repo.begin_delete(account_id, delete_history=delete_history)
         if result:
             mark_account_routing_unavailable(account_id)
             get_account_selection_cache().invalidate()
             get_api_key_cache().clear()
-            # Deletion cascades the account_proxy_bindings row away, and account
-            # ids are deterministic (delete-then-re-import regenerates the same
-            # id), so the cached route outcome must not survive the deletion.
+            # Finalization cascades the account_proxy_bindings row away, and
+            # account ids are deterministic (delete-then-re-import regenerates
+            # the same id), so the cached route outcome must not survive the
+            # delete request; the worker invalidates again after finalizing.
             await get_upstream_route_cache().invalidate()
             await propagate_account_routing_change()
             poller = get_cache_invalidation_poller()
             if poller is not None:
                 await poller.bump(NAMESPACE_API_KEY)
+            request_account_deletion_run()
         return result
 
     async def set_account_alias(self, account_id: str, alias: str | None) -> bool:
@@ -679,35 +683,6 @@ class AccountsService:
         if normalized == "":
             normalized = None
         return await self._repo.update_alias(account_id, normalized)
-
-    async def export_account(self, account_id: str) -> AccountExportResponse | None:
-        account = await self._repo.get_by_id(account_id)
-        if not account:
-            return None
-        access_token = self._encryptor.decrypt(account.access_token_encrypted)
-        refresh_token = self._encryptor.decrypt(account.refresh_token_encrypted)
-        id_token = self._encryptor.decrypt(account.id_token_encrypted)
-        auth_json = {
-            "auth_mode": "chatgpt",
-            "OPENAI_API_KEY": None,
-            "tokens": {
-                "id_token": id_token,
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "account_id": account.chatgpt_account_id,
-            },
-            "last_refresh": account.last_refresh.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z",
-        }
-        return AccountExportResponse(
-            account_id=account.id,
-            email=account.email,
-            workspace_id=account.workspace_id,
-            workspace_label=account.workspace_label,
-            seat_type=account.seat_type,
-            plan_type=account.plan_type,
-            status=account.status.value,
-            auth_json=json.dumps(auth_json, indent=2),
-        )
 
     async def probe_account(
         self,
@@ -722,10 +697,10 @@ class AccountsService:
         before/after snapshot so the operator can see whether the upstream
         state changed.
         """
-        account = await self._repo.get_by_id(account_id)
+        account = await self._get_visible_account(account_id)
         if account is None:
             return None
-        if account.status in (AccountStatus.PAUSED, AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
+        if account.status in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED):
             raise AccountNotProbableError(f"Account is {account.status.value} and cannot be probed")
 
         primary_before, secondary_before = await self._latest_usage_percents(account_id)
@@ -736,7 +711,7 @@ class AccountsService:
             probe_account = await self._auth_manager.ensure_fresh(account, force=False)
 
         access_token = self._encryptor.decrypt(probe_account.access_token_encrypted)
-        probe_model = model or DEFAULT_PROBE_MODEL
+        probe_model = model or resolve_default_host_model()
         probe_status = await self._send_probe_request(
             access_token=access_token,
             chatgpt_account_id=probe_account.chatgpt_account_id,
@@ -745,10 +720,7 @@ class AccountsService:
 
         usage_refresh_fetch_succeeded: bool | None = None
         if self._usage_repo and self._usage_updater:
-            usage_refresh_result = await self._usage_updater.force_refresh_result(
-                probe_account,
-                ignore_refresh_disabled=True,
-            )
+            usage_refresh_result = await self._usage_updater.force_refresh_result(probe_account)
             usage_refresh_fetch_succeeded = usage_refresh_result.fetch_succeeded
             # Forced refresh can still persist fresh OAuth credentials before a
             # later upstream usage fetch fails. Selection-cache rows carry
@@ -811,7 +783,7 @@ class AccountsService:
                     "content": [{"type": "input_text", "text": "."}],
                 }
             ],
-            "max_output_tokens": 1,
+            "max_output_tokens": PROBE_MAX_OUTPUT_TOKENS,
             "stream": True,
             "store": False,
         }

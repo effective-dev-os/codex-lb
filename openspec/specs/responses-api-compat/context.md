@@ -16,13 +16,21 @@ See `openspec/specs/responses-api-compat/spec.md` for normative requirements.
 
 ## Constraints
 
+- Public-contract SSE filtering uses the `response.*` and `error` families, so
+  diagnostics such as `responsesapi.websocket_timing` cannot interrupt strict
+  client event deserializers. For example, a timing diagnostic between a text
+  delta and `response.completed` is removed while both standard events remain.
+  Native Codex requests retain vendor events; OpenAI-shaped backend requests
+  follow public filtering. This does not normalize string-valued
+  `response.instructions` or establish full IntelliJ compatibility (Refs #1934).
+
 - Upstream limitations determine available modalities, tool output, and overflow handling.
 - `store=true` is rejected; responses are not persisted.
 - `include` values must be on the documented allowlist.
 - `truncation` is rejected.
 - `previous_response_id` is forwarded when `conversation` is absent, but the `conversation + previous_response_id` conflict remains rejected.
 - HTTP `/v1/responses` and HTTP `/backend-api/codex/responses` now use a server-side upstream websocket session bridge by default so repeated compatible requests can keep upstream response/session continuity without forcing clients onto the public websocket route.
-- Codex-affinity HTTP bridge sessions can optionally use a conservative first-request prewarm (`generate=false`), but that behavior now stays behind an explicit flag so production defaults do not pay an extra upstream request unless operators opt in.
+- Codex-affinity HTTP bridge sessions can optionally use a conservative first-request prewarm (`generate=false`), but that behavior stays behind an explicit switch so production defaults do not pay an extra upstream request unless operators opt in. The switch is the dashboard setting `http_responses_session_bridge_codex_prewarm_enabled` (Settings → Advanced → Session bridge), resolved from the settings-cache snapshot before a session's prewarm lock; its `CODEX_LB_*` environment variable is a deprecated alias that applies only while the dashboard value is unset.
 - When operators configure a multi-instance bridge ring, deterministic owner enforcement now applies only to hard continuity keys such as `x-codex-turn-state` and explicit session headers. Prompt-cache-derived bridge keys remain stable for local reuse, but in gateway-safe mode a non-owner replica may tolerate that locality miss and create or reuse a local session instead of failing with `bridge_instance_mismatch`.
 - Codex-facing websocket routes now advertise `x-codex-turn-state` during websocket accept and honor client-provided turn-state on reconnect so routing can stay sticky at turn granularity even when the public websocket reconnects.
 - HTTP responses routes now also return `x-codex-turn-state` headers so clients that persist response headers can promote later HTTP requests from prompt-cache affinity to stronger Codex-session continuity.
@@ -31,10 +39,12 @@ See `openspec/specs/responses-api-compat/spec.md` for normative requirements.
 - Compact transport may use bounded same-contract retries only for safe pre-body transport failures and `401 -> refresh -> retry`.
 - `/v1/responses/compact` is supported only when the upstream implements it.
 - `prompt_cache_key` affinity on OpenAI-style routes is intentionally bounded by a dashboard-managed freshness window, unlike durable backend `session_id` or dashboard sticky-thread routing.
-- Codex-native direct websocket `/backend-api/codex/responses` treats upstream `previous_response_id` as an ephemeral anchor. If that anchor goes stale, the proxy must mask raw `previous_response_not_found` details and emit a sanitized `codex_previous_response_stale` classifier so compatible Codex clients can soft-reset and retry without `previous_response_id`.
+- Codex-native direct websocket `/backend-api/codex/responses` treats upstream `previous_response_id` as an ephemeral anchor. If that anchor goes stale, the proxy masks raw upstream details and emits the sanitized canonical `previous_response_not_found` classifier so compatible Codex clients can retry with full local history and no `previous_response_id`. The upstream Codex socket has emitted this condition both with the canonical code and as a parameterless `invalid_request_error` carrying ``Invalid `previous_response_id`.``; both shapes use the same recovery policy.
 - Upstream Responses WebSockets use transport ping/pong control frames to detect a black-holed connection without confusing valid application-event silence with an idle turn. Direct and routed connections reuse `proxy_downstream_websocket_idle_timeout_seconds` for this zero-config liveness budget.
 - A post-send liveness timeout is delivery-ambiguous. It remains account-neutral, is never transparently replayed, and retires the affected upstream socket so a client retry opens a fresh route without risking duplicated model work or tool side effects.
+- An HTTP SSE first-event `stream_idle_timeout` is also account-neutral for health writes. The request may still exclude that account and fail over, but idle silence must not increment `error_count` or move the account into probe/drain.
 - HTTP bridge settlement ownership is explicit: `closed` rejects new work but does not imply that a submitter owns existing siblings. Only a liveness-failed send claims whole-deque settlement under the lifecycle lock; otherwise the reader remains responsible for settling pending requests when the transport dies.
+- A DRAINING durable row with a live lease is still owned. Foreign `claim_live_session` and local session create must not steal it, including when forced recovery would otherwise run because the owner endpoint is missing; expired or ownerless DRAINING rows remain recoverable.
 - Hard-affinity retry-circuit evidence is request-lifecycle evidence: retirement counts only while the bridge still owns an eventless pending request. Idle no-pending retirement remains observable but neutral, so routine socket churn cannot manufacture the first strike for a later real timeout.
 
 ## Fast Mode and Service Tiers
@@ -72,6 +82,33 @@ Responses request with:
 
 Clients that expose Fast Mode as `fast` may keep using that spelling; codex-lb
 normalizes it to `priority` before forwarding.
+
+### Ultrafast Processing
+
+The [OpenAI Responses API reference](https://developers.openai.com/api/reference/resources/responses/methods/create)
+documents `ultrafast` as an access-controlled processing tier currently
+available for `gpt-5.6-sol`. codex-lb forwards this canonical value unchanged;
+it does not grant Ultrafast access by itself.
+
+Account eligibility comes from live or retained per-account upstream catalog
+metadata. The bundled bootstrap catalog deliberately does not advertise
+Ultrafast. If no account advertises the tier, an explicit Ultrafast request
+cannot select an eligible account; API-key enforcement follows the existing
+model-capability fallback when the model itself does not advertise the tier.
+
+Send a Responses request with:
+
+```json
+{
+  "model": "gpt-5.6-sol",
+  "input": "Summarize the change.",
+  "service_tier": "ultrafast"
+}
+```
+
+After completion, verify that the response reports
+`service_tier: "ultrafast"`. Request logs retain `ultrafast` in the requested,
+actual, and effective billable tier fields when upstream confirms it.
 
 ### Operator Fast Mode prohibition
 
@@ -116,7 +153,7 @@ when upstream reports a different actual tier.
 - **HTTP bridge session closes or expires:** The next compatible HTTP `/v1/responses` or `/backend-api/codex/responses` request recreates a fresh upstream websocket bridge session; continuity is guaranteed only within the lifetime of one active bridged session.
 - **Multi-instance routing without bridge owner policy:** if operators do not configure a bridge ring or front-door affinity, continuity can still fragment across replicas. With a configured bridge ring, hard continuity keys landing on a non-owner replica are proxy-forwarded to the owner replica; the proxy fails closed only when the owner endpoint or ring membership cannot be resolved or the forward signature fails authentication. Gateway-safe prompt-cache requests may accept locality misses and continue locally instead of forwarding.
 - **Codex websocket reconnects:** Reconnect continuity now depends on the client replaying the accepted `x-codex-turn-state`; generated turn-state is emitted on accept for backend Codex routes and echoed back when the client already supplies one.
-- **Codex websocket stale previous-response anchors:** Direct backend Codex websocket stale-anchor failures are surfaced as `response.failed` / `codex_previous_response_stale` without the raw upstream code or missing `resp_...` id; OpenAI-compatible `/v1/responses` websocket clients continue to receive generic `stream_incomplete` masking.
+- **Codex websocket stale previous-response anchors:** Direct backend Codex websocket stale-anchor failures are either replayed transparently from a self-contained full resend or surfaced as a sanitized `response.failed` whose `response.error.code` is `previous_response_not_found`; the error omits `param`, the raw upstream envelope, and the missing `resp_...` id. A connect-time failure uses the same code directly at `error.code`. This includes the parameterless upstream message ``Invalid `previous_response_id`.``. OpenAI-compatible `/v1/responses` websocket clients continue to receive generic `stream_incomplete` masking.
 - **Websocket handshake forbidden/not-found:** Auto transport now fails loud on `403` / `404` instead of silently hiding the websocket regression behind HTTP fallback.
 - **Upstream websocket stops answering pings:** Pending direct-WebSocket and HTTP-bridge work fails with `upstream_websocket_liveness_timeout`; the account remains healthy and the request is not replayed because upstream acceptance is unknown.
 - **Repeated eventless bridge failures:** Two consecutive request-affecting pre-response failures can open the hard-key cooldown. A successful terminal response clears the state; an idle close followed by one real timeout remains only one strike.
@@ -157,6 +194,45 @@ the next request times out before `response.created`. The idle close is logged
 but contributes no failure; the timeout is the first strike. Only another
 consecutive eventless pending failure may open the repeated-failure cooldown.
 
+Stale-anchor recovery example: a reconnect sends a tool-output delta with a
+recent `previous_response_id`, and upstream answers
+``{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"Invalid `previous_response_id`."}}``.
+Because the delta cannot stand alone, codex-lb returns a sanitized
+`previous_response_not_found` signal on the Codex-native route so the client can
+retry once with full local history. If the original request already contained a
+self-contained full resend, codex-lb instead reconnects and replays that body
+without the rejected anchor.
+
+## Previous-response replay owner fencing
+
+Removing a stale continuation anchor does not make every retained body
+portable. Encrypted reasoning, account-scoped items, file references, and
+durable bridge operation identities remain owned by the account that first
+received them. The proxy records that dispatch owner and requires it on later
+HTTP streaming, HTTP bridge, and direct WebSocket selections.
+
+For example, if account A first receives encrypted reasoning and then returns a
+pre-visible Trusted Access or authentication failure, account B must never
+receive the retained ciphertext. One forced token refresh may replay the body
+on account A; permanent failure or owner unavailability fails closed.
+
+Verified recovery installs a replacement body and updates owner state
+atomically. A canonical account-neutral replacement clears the owner and may
+use normal failover. A verified nonneutral replacement, including a
+Responses-Lite full resend, may replay only on the same owner and preserves the
+fence.
+
+HTTP bridge tracing archive IDs do not pin neutral requests. A real durable
+`operation_id` does pin the request until an explicit operation-rebind path
+replaces that identity. Existing file pins and API-key settlement-before-health
+ordering remain independent invariants.
+
+Streaming selection authorizes owner compatibility before opening upstream, but
+persists a new owner only after dispatch is observed. A transport failure that
+is positively classified as pre-dispatch therefore leaves the body unowned and
+eligible for its first real dispatch on another account. Ambiguous failures
+remain owner-bound.
+
 ## Known Client Integrations (Reference)
 
 Third-party agents that consume the `/v1` Responses surface documented by this
@@ -187,5 +263,50 @@ OpenSpec change first.
 - Post-deploy: monitor `no_accounts`, `stream_incomplete`, and `upstream_unavailable`.
 - Post-deploy: monitor `upstream_websocket_liveness_timeout`; recurring failures indicate a host route, VPN, proxy, or intermediary that black-holes established WebSockets.
 - Post-deploy: correlate retry-circuit `opened`, `half_open`, and `reset` events with bridge `pending` and `response_events_seen` diagnostics. An idle `pending=0` retirement must not precede an immediate two-failure cooldown.
-- Post-deploy: monitor `codex_previous_response_stale` on `/backend-api/codex/responses`; recurring spikes mean clients are still relying on stale upstream anchors and should perform the documented full-context retry without `previous_response_id`.
+- Post-deploy: monitor `previous_response_not_found` on `/backend-api/codex/responses`; recurring spikes show repeated continuity failures, which may come from malformed client identifiers, server-side invalidation, or connection lifecycle. Clients should perform the documented full-context retry without `previous_response_id`. Investigate socket-lifecycle remediation only when a separate close-reason, reconnect, or transport diagnostic correlates with the failures.
 - Websocket/Codex CLI tier verification runbook: `openspec/specs/responses-api-compat/ops.md`
+
+
+## HTTP continuation promotion
+
+Healthy native HTTP requests use normal policy. The proxy cannot infer every
+client-local WebSocket failure from HTTP alone; it uses its existing 60-second
+upstream-connect failure marker as concrete failure evidence. Operator HTTP
+pins and size bypasses remain effective. The image bypass keeps requests off the
+HTTP session bridge but no longer pins the upstream transport, which is resolved
+by ordinary precedence; an `input_image` request keeps upstream HTTP only when
+its payload exceeds the WebSocket frame budget or still carries an external
+image URL. External-URL detection for that decision recurses the whole input, so
+a URL nested inside a tool-output array keeps the pin even though the image
+inliner never rewrites it — that is the case where the URL is still external at
+the upstream. The inliner and the bridge's post-inline guard still read only
+top-level `input_image` items and one level of `content`; closing that is a
+separate change. No new retry/session registry.
+
+History-only locality is soft, scoped by the bridge's full API-key identifier,
+and hashes the complete first user item plus instructions and model. No client
+prompt cache field is overwritten. Identical initial prompts may share an idle
+connection, but neither histories nor response anchors are merged; the complete
+request is sent each time. Existing hard-continuity paths retain their guarded
+incremental replay. Conversation IDs get their own hashed locality and are never
+combined with an injected previous_response_id.
+
+Chat keeps the existing stream conversion/usage/error/cleanup pipeline and uses
+the bridge only after the source-routing branch. Backend stream=false retains
+its native non-streaming upstream contract. No claimed latency percentage:
+connection reuse is measured separately from admission and successful transport.
+
+For example, a Chat client sending `[user(task), assistant(answer), user(next)]`
+without session headers can open a bridge connection. Appending the next
+assistant/user pair reuses that connection while sending the entire new history.
+The same initial task under a different API key selects a separate connection.
+
+Chat binds existing settlement ownership signals while advancing its bridged
+stream. Predispatch failures and cancellation release origin-owned reservations;
+accepted or delivery-ambiguous owner forwards retain their settlement owner.
+Context bindings do not span yields because startup probes and consumers may
+advance the stream from different tasks.
+
+## Detached retirement sweep deadline
+
+Issue #2149 bounds aggregate detached-session lock waiting during request finalization. A sweep shares five seconds: if its first attempt consumes three seconds, the next receives two, and later attempts stop at expiry. Deferred generations remain tracked for later requests and their lifecycle owners. The deadline does not cancel resource-close owners or replace their existing close timeout.

@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import { RequestFilters, type RequestFiltersProps } from "@/features/dashboard/components/filters/request-filters";
@@ -17,14 +18,19 @@ const BASE_FILTERS: FilterState = {
   offset: 0,
 };
 
-function renderFilters(overrides: Partial<FilterState> = {}) {
+function renderFilters(
+  overrides: Partial<FilterState> = {},
+  statusOptions: RequestFiltersProps["statusOptions"] = EMPTY_OPTIONS,
+  extraProps: Partial<RequestFiltersProps> = {},
+) {
   const filters = { ...BASE_FILTERS, ...overrides };
   const props: RequestFiltersProps = {
     filters,
     accountOptions: EMPTY_OPTIONS,
     apiKeyOptions: EMPTY_OPTIONS,
     modelOptions: EMPTY_OPTIONS,
-    statusOptions: EMPTY_OPTIONS,
+    statusOptions,
+    ...extraProps,
     onSearchChange: vi.fn(),
     onTimeframeChange: vi.fn(),
     onAccountChange: vi.fn(),
@@ -38,7 +44,38 @@ function renderFilters(overrides: Partial<FilterState> = {}) {
   return props;
 }
 
+describe("RequestFilters API key filter", () => {
+  it("renders the API key filter by default", () => {
+    renderFilters();
+
+    expect(screen.getByRole("button", { name: "API Keys" })).toBeInTheDocument();
+  });
+
+  it("hides the API key filter when showApiKeyFilter is false", () => {
+    renderFilters({}, EMPTY_OPTIONS, { showApiKeyFilter: false });
+
+    expect(screen.queryByRole("button", { name: "API Keys" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Accounts" })).toBeInTheDocument();
+  });
+});
+
 describe("RequestFilters conversation badge", () => {
+  it("renders cancelled as a selectable status option", async () => {
+    const user = userEvent.setup();
+    const props = renderFilters({}, [{ value: "cancelled", label: "Cancelled" }]);
+
+    await user.click(screen.getByRole("button", { name: "Statuses" }));
+    const [option] = await screen.findAllByRole("menuitemcheckbox");
+    expect(option).toBeDefined();
+    if (!option) {
+      throw new Error("Expected the cancelled status option");
+    }
+
+    await user.click(option);
+
+    expect(props.onStatusChange).toHaveBeenCalledWith(["cancelled"]);
+  });
+
   it("renders no badge when conversationId is null", () => {
     renderFilters();
     expect(screen.queryByText(/conv/i)).not.toBeInTheDocument();

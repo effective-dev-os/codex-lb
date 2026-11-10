@@ -26,6 +26,8 @@ export type ApiListProps = {
   selectedKeyId: string | null;
   onSelect: (keyId: string) => void;
   onOpenCreate: () => void;
+  /** Read-only sessions (`api_keys:read` without the write alias) get the list without the create action. */
+  readOnly?: boolean;
 };
 
 function isExpired(apiKey: ApiKey): boolean {
@@ -42,7 +44,7 @@ function matchStatus(apiKey: ApiKey, filter: string): boolean {
   return true;
 }
 
-export function ApiList({ apiKeys, selectedKeyId, onSelect, onOpenCreate }: ApiListProps) {
+export function ApiList({ apiKeys, selectedKeyId, onSelect, onOpenCreate, readOnly = false }: ApiListProps) {
   const { t } = useTranslation();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
@@ -85,16 +87,22 @@ export function ApiList({ apiKeys, selectedKeyId, onSelect, onOpenCreate }: ApiL
         </Select>
       </div>
 
-      <Button type="button" size="sm" onClick={onOpenCreate} className="h-8 w-full gap-1.5 text-xs">
-        <Plus className="h-3.5 w-3.5" />
-        {t("apis.list.createKey")}
-      </Button>
+      {readOnly ? null : (
+        <Button type="button" size="sm" onClick={onOpenCreate} className="h-8 w-full gap-1.5 text-xs">
+          <Plus className="h-3.5 w-3.5" />
+          {t("apis.list.createKey")}
+        </Button>
+      )}
 
       <div className="max-h-[calc(100vh-16rem)] space-y-1 overflow-y-auto p-1">
         {filtered.length === 0 ? (
           <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed p-6 text-center">
-            <p className="text-sm font-medium text-muted-foreground">{t("apis.list.noMatches")}</p>
-            <p className="text-xs text-muted-foreground/70">{t("accounts.list.adjustFilters")}</p>
+            <p className="text-sm font-medium text-muted-foreground">
+              {apiKeys.length === 0 ? t("apis.list.emptyTitle") : t("apis.list.noMatches")}
+            </p>
+            <p className="text-xs text-muted-foreground/70">
+              {apiKeys.length === 0 ? t("apis.list.emptyDescription") : t("accounts.list.adjustFilters")}
+            </p>
           </div>
         ) : (
           filtered.map((apiKey) => (

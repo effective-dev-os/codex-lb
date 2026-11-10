@@ -7,7 +7,7 @@ from typing import cast
 
 from app.core.openai import tool_call_safety
 from app.core.openai.models import OpenAIEvent
-from app.core.openai.parsing import parse_sse_event_payload
+from app.core.openai.parsing import classify_event_type, parse_sse_event_payload
 from app.core.types import JsonValue
 from app.core.utils.sse import format_sse_event
 
@@ -36,14 +36,7 @@ def is_downstream_side_effect_tool_call(item: Mapping[str, JsonValue]) -> bool:
 def event_type_from_payload(event: OpenAIEvent | None, payload: dict[str, JsonValue] | None) -> str | None:
     if event is not None:
         return event.type
-    if payload is None:
-        return None
-    payload_type = payload.get("type")
-    if isinstance(payload_type, str):
-        return payload_type
-    if isinstance(payload.get("error"), dict):
-        return "error"
-    return None
+    return classify_event_type(payload)
 
 
 def response_id_from_payload(payload: dict[str, JsonValue] | None) -> str | None:
@@ -107,7 +100,7 @@ def mark_duplicate_tool_call_downstream_event(
         return False
     if item_name == tool_call_safety.PARALLEL_TOOL_CALL_NAME and is_side_effect_tool_call:
         return _mark_duplicate_parallel_tool_call_downstream_event(
-            cast(dict[str, JsonValue], item),
+            item,
             argument_value,
             seen_tool_call_keys=seen_tool_call_keys,
             response_id=response_id,
@@ -174,8 +167,8 @@ def mark_duplicate_tool_call_downstream_event(
 
 def _clear_legacy_downstream_tool_call_keys(seen_tool_call_keys: dict[ToolCallDedupeKey, None]) -> None:
     for key in tuple(seen_tool_call_keys):
-        _, _, namespace, _, call_id, _ = key
-        if namespace is not None and call_id is not None:
+        _, item_type, namespace, _, call_id, _ = key
+        if namespace is not None and (call_id is not None or item_type == "parallel_tool_use"):
             continue
         seen_tool_call_keys.pop(key, None)
 
@@ -196,6 +189,7 @@ def _mark_duplicate_parallel_tool_call_downstream_event(
         return False
 
     candidate_keys: list[ToolCallDedupeKey] = []
+    outer_call_id = item.get("call_id")
     for tool_use in tool_uses:
         if not isinstance(tool_use, dict):
             continue
@@ -206,14 +200,21 @@ def _mark_duplicate_parallel_tool_call_downstream_event(
         ):
             continue
         dedupe_response_id = response_id if scope_side_effects_by_response_id else None
+        identity_call_id = (
+            outer_call_id
+            if recipient_name.removeprefix("functions.")
+            in tool_call_safety.CODE_MODE_DOWNSTREAM_SIDE_EFFECT_TOOL_CALL_NAMES
+            and isinstance(outer_call_id, str)
+            else None
+        )
         candidate_keys.append(
             (
                 dedupe_response_id or "",
                 "parallel_tool_use",
-                None,
+                identity_call_id,
                 recipient_name,
                 None,
-                canonical_parallel_tool_use_key(cast(dict[str, JsonValue], tool_use)),
+                canonical_parallel_tool_use_key(tool_use),
             )
         )
     kept_tool_uses: list[JsonValue] = []
@@ -230,13 +231,20 @@ def _mark_duplicate_parallel_tool_call_downstream_event(
             kept_tool_uses.append(cast(JsonValue, tool_use))
             continue
         dedupe_response_id = response_id if scope_side_effects_by_response_id else None
+        identity_call_id = (
+            outer_call_id
+            if recipient_name.removeprefix("functions.")
+            in tool_call_safety.CODE_MODE_DOWNSTREAM_SIDE_EFFECT_TOOL_CALL_NAMES
+            and isinstance(outer_call_id, str)
+            else None
+        )
         key = (
             dedupe_response_id or "",
             "parallel_tool_use",
-            None,
+            identity_call_id,
             recipient_name,
             None,
-            canonical_parallel_tool_use_key(cast(dict[str, JsonValue], tool_use)),
+            canonical_parallel_tool_use_key(tool_use),
         )
         if key in seen_tool_call_keys:
             removed_count += 1
@@ -271,6 +279,26 @@ def json_object_from_argument(argument_value: str) -> dict[str, JsonValue] | Non
     if not isinstance(decoded_argument, dict):
         return None
     return cast(dict[str, JsonValue], decoded_argument)
+
+
+def parallel_argument_has_only_code_mode_side_effects(argument_value: str) -> bool:
+    argument = json_object_from_argument(argument_value)
+    if argument is None:
+        return False
+    tool_uses = argument.get("tool_uses")
+    if not isinstance(tool_uses, list):
+        return False
+    side_effect_names = tool_call_safety.PARALLEL_TOOL_USE_SIDE_EFFECT_RECIPIENT_NAMES
+    side_effects = [
+        tool_use.get("recipient_name")
+        for tool_use in tool_uses
+        if isinstance(tool_use, dict) and tool_use.get("recipient_name") in side_effect_names
+    ]
+    return bool(side_effects) and all(
+        isinstance(name, str)
+        and name.removeprefix("functions.") in tool_call_safety.CODE_MODE_DOWNSTREAM_SIDE_EFFECT_TOOL_CALL_NAMES
+        for name in side_effects
+    )
 
 
 def canonical_json_key(value: JsonValue) -> str:
@@ -505,13 +533,19 @@ def replayed_side_effect_tool_call_key(item: Mapping[str, JsonValue]) -> Replaye
     namespace_value = item.get("namespace")
     namespace = namespace_value if isinstance(namespace_value, str) else None
     call_id_value = item.get("call_id")
-    call_id = call_id_value if namespace is not None and isinstance(call_id_value, str) and call_id_value else None
+    identity_scoped = namespace is not None
+    if item_name == tool_call_safety.PARALLEL_TOOL_CALL_NAME:
+        # A mixed parallel wrapper remains argument-scoped for ordinary
+        # side effects; only an all-code-mode wrapper gets outer-call
+        # identity because those nested calls are independently meaningful.
+        identity_scoped = parallel_argument_has_only_code_mode_side_effects(argument_value)
+    call_id = call_id_value if identity_scoped and isinstance(call_id_value, str) and call_id_value else None
     return (item_type, namespace, item_name, call_id, argument_key)
 
 
 def _replayed_side_effect_key_has_stable_identity(key: ReplayedSideEffectToolCallKey) -> bool:
-    _, namespace, _, call_id, _ = key
-    return namespace is not None and call_id is not None
+    _, namespace, item_name, call_id, _ = key
+    return call_id is not None and (namespace is not None or item_name == tool_call_safety.PARALLEL_TOOL_CALL_NAME)
 
 
 def _clear_legacy_replayed_side_effect_keys(
@@ -633,7 +667,7 @@ def canonical_parallel_tool_use_key(tool_use: Mapping[str, JsonValue]) -> str:
             ensure_ascii=False,
         )
     if normalized_recipient_name == "exec_command" and isinstance(parameters, dict):
-        return canonical_parameters_key(normalized_recipient_name, cast(dict[str, JsonValue], parameters))
+        return canonical_parameters_key(normalized_recipient_name, parameters)
     return json.dumps(tool_use, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -707,7 +741,7 @@ def rewrite_parallel_tool_call_payload(
     if not changed:
         return payload, False, 0
 
-    rewritten_item: dict[str, JsonValue] = dict(cast(dict[str, JsonValue], item))
+    rewritten_item: dict[str, JsonValue] = dict(item)
     rewritten_item["arguments"] = rewritten_arguments
     rewritten_payload: dict[str, JsonValue] = dict(payload)
     rewritten_payload["item"] = rewritten_item
@@ -728,10 +762,10 @@ def rewrite_parallel_tool_call_text(
 ) -> tuple[str, dict[str, JsonValue] | None, OpenAIEvent | None, str | None, str]:
     rewritten_payload, changed, _removed_count = rewrite_parallel_tool_call_payload(payload)
     if not changed:
-        # Reuse the caller's parsed event; validating the payload directly
-        # avoids re-parsing the raw block when a caller has neither.
-        if event is None:
-            event = parse_sse_event_payload(payload)
+        # Reuse the caller's parsed event as-is. Hot streaming paths validate
+        # only lifecycle frames, so ``event`` is intentionally None for the
+        # delta bulk; the event type is classified from the payload dict
+        # instead of re-validating per frame.
         return text, payload, event, event_type_from_payload(event, payload), event_block
     assert rewritten_payload is not None
     rewritten_text = json.dumps(rewritten_payload, ensure_ascii=True, separators=(",", ":"))
@@ -754,8 +788,8 @@ def rewrite_parallel_tool_call_sse_line(
 ) -> tuple[str, dict[str, JsonValue] | None, OpenAIEvent | None, str | None]:
     rewritten_payload, changed, _removed_count = rewrite_parallel_tool_call_payload(payload)
     if not changed:
-        if event is None:
-            event = parse_sse_event_payload(payload)
+        # See rewrite_parallel_tool_call_text: no per-frame re-validation on
+        # the unchanged path; callers own lifecycle-gated validation.
         return line, payload, event, event_type_from_payload(event, payload)
     assert rewritten_payload is not None
     rewritten_line = format_sse_event(rewritten_payload)
