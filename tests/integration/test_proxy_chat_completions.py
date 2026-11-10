@@ -756,3 +756,63 @@ async def test_v1_chat_completions_stream_include_usage(async_client, monkeypatc
     assert chunks[-2]["usage"] is None
     assert chunks[-1]["choices"] == []
     assert chunks[-1]["usage"]["total_tokens"] == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/chat/completions/"])
+async def test_v1_chat_completions_non_stream_terminal_output(async_client, monkeypatch, path):
+    auth_json = _make_auth_json("acc_chat_terminal_output", "chat-terminal-output@example.com")
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    imported = await async_client.post("/api/accounts/import", files=files)
+    assert imported.status_code == 200
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        assert payload.stream is True
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_chat_terminal_output",
+                        "output": [
+                            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "private reasoning"}]},
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "output_text", "text": "Terminal answer"},
+                                ],
+                            },
+                        ],
+                        "usage": {
+                            "input_tokens": 20,
+                            "output_tokens": 2403,
+                            "total_tokens": 2423,
+                            "output_tokens_details": {"reasoning_tokens": 194},
+                        },
+                    },
+                }
+            )
+            + "\n\n"
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    response = await async_client.post(
+        path,
+        json={
+            "model": "gpt-6-astra",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        },
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "chat.completion"
+    assert body["id"] == "resp_chat_terminal_output"
+    assert body["choices"][0]["message"]["content"] == "Terminal answer"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["usage"]["completion_tokens"] == 2403
+    assert body["usage"]["completion_tokens_details"]["reasoning_tokens"] == 194
+    assert "private reasoning" not in response.text

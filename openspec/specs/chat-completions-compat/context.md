@@ -59,3 +59,17 @@ Responses-shaped chat request with a built-in tool:
 
 - Streaming chunk mapping is validated in unit tests.
 - Integration tests cover include_usage and tool call finish reasons.
+
+## Terminal text collection (2026-11-04)
+
+Non-streaming collection uses populated terminal assistant message `output_text`
+parts as the complete text snapshot, replacing deltas rather than appending.
+Empty or absent terminal assistant text preserves delta fallback. Reasoning,
+non-assistant messages and other content types are excluded. Terminal errors
+still win, and tools, refusal, usage and incomplete finish reasons retain their
+existing mapping. Streaming text reconciliation is outside this change because
+already-emitted chunks cannot be replaced in the same way.
+
+The Daily incident upstream events were unavailable. Tests reproduce terminal-only
+text loss and partial-delta truncation in the collector and terminal-only loss
+through the ASGI Chat route; they do not establish the historical event sequence.

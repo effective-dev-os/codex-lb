@@ -467,10 +467,30 @@ async def stream_chat_chunks(
         yield "data: [DONE]\n\n"
 
 
+def _terminal_output_text(output: JsonValue | None) -> str:
+    if not isinstance(output, list):
+        return ""
+    parts: list[str] = []
+    for item in output:
+        if not is_json_mapping(item) or item.get("type") != "message" or item.get("role") != "assistant":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not is_json_mapping(part) or part.get("type") != "output_text":
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
+
+
 async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> ChatCompletionResult:
     created = int(time.time())
     content_parts: list[str] = []
     refusal_parts: list[str] = []
+    terminal_text = ""
     response_id: str | None = None
     usage: ResponseUsage | None = None
     incomplete_reason: str | None = None
@@ -535,6 +555,7 @@ async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> Cha
                 if isinstance(response_id_value, str):
                     response_id = response_id_value
                 usage = _parse_usage(response.get("usage"))
+                terminal_text = _terminal_output_text(response.get("output"))
                 if event_type == "response.incomplete":
                     incomplete_reason = _finish_reason_from_incomplete(response)
 
@@ -543,7 +564,8 @@ async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> Cha
     if not terminal_event_seen:
         return _upstream_stream_truncated_error()
 
-    message_content: str | None = "".join(content_parts)
+    # Terminal output is the complete snapshot; appending it would duplicate deltas.
+    message_content: str | None = terminal_text or "".join(content_parts)
     message_refusal = "".join(refusal_parts) or None
     message_tool_calls = _compact_tool_calls(tool_calls)
     has_tool_calls = bool(message_tool_calls)

@@ -1071,3 +1071,158 @@ async def test_collect_completion_preserves_provider_response_id():
     completion = await collect_chat_completion(source(), model="gpt-5.2")
     assert isinstance(completion, ChatCompletion)
     assert completion.id == "provider_valid_response"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["response.completed", "response.incomplete"])
+@pytest.mark.parametrize("deltas", [[], ["Hello", " world!"], ["Hello"]])
+async def test_collect_terminal_output_reconciles_assistant_text(terminal, deltas):
+    async def source():
+        for delta in deltas:
+            yield "data: " + json.dumps({"type": "response.output_text.delta", "delta": delta}) + "\n\n"
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": terminal,
+                    "response": {
+                        "id": "resp_terminal_text",
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                        "output": [
+                            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "private reasoning"}]},
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "output_text", "text": "user text"}],
+                            },
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "output_text", "text": "Hello"},
+                                    {"type": "refusal", "refusal": "not text"},
+                                    {"type": "output_text", "text": " world"},
+                                ],
+                            },
+                            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "!"}]},
+                        ],
+                        "usage": {
+                            "input_tokens": 20,
+                            "output_tokens": 2403,
+                            "total_tokens": 2423,
+                            "output_tokens_details": {"reasoning_tokens": 194},
+                        },
+                    },
+                }
+            )
+            + "\n\n"
+        )
+
+    result = await collect_chat_completion(source(), model="gpt-6-astra")
+    assert isinstance(result, ChatCompletion)
+    assert result.choices[0].message.content == "Hello world!"
+    assert result.choices[0].finish_reason == ("length" if terminal == "response.incomplete" else "stop")
+    assert result.id == "resp_terminal_text"
+    assert result.usage is not None
+    assert result.usage.completion_tokens == 2403
+    assert result.usage.completion_tokens_details is not None
+    assert result.usage.completion_tokens_details.reasoning_tokens == 194
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delta", [None, "delta fallback"])
+@pytest.mark.parametrize(
+    "output",
+    [
+        None,
+        [],
+        [
+            {"type": "reasoning", "content": [{"type": "output_text", "text": "private"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": ""}]},
+        ],
+    ],
+)
+async def test_collect_terminal_output_empty_preserves_delta_fallback(delta, output):
+    async def source():
+        if delta is not None:
+            yield "data: " + json.dumps({"type": "response.output_text.delta", "delta": delta}) + "\n\n"
+        yield "data: " + json.dumps({"type": "response.completed", "response": {"output": output}}) + "\n\n"
+
+    result = await collect_chat_completion(source(), model="gpt-6-astra")
+    assert isinstance(result, ChatCompletion)
+    assert result.choices[0].message.content == (delta or "")
+    assert result.choices[0].finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_first", [True, False])
+@pytest.mark.parametrize("error_type", ["error", "response.failed"])
+async def test_collect_terminal_output_preserves_error_precedence(error_first, error_type):
+    error = {"code": "upstream_error", "type": "server_error", "message": "failed"}
+    failed = {"type": error_type, "error": error, "response": {"error": error}}
+    completed = {
+        "type": "response.completed",
+        "response": {
+            "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]},
+            ]
+        },
+    }
+
+    async def source():
+        for event in [failed, completed] if error_first else [completed, failed]:
+            yield "data: " + json.dumps(event) + "\n\n"
+
+    result = await collect_chat_completion(source(), model="gpt-6-astra")
+    assert isinstance(result, OpenAIErrorEnvelope)
+    assert result.error is not None
+    assert result.error.code == "upstream_error"
+
+
+@pytest.mark.asyncio
+async def test_collect_terminal_output_preserves_tools_and_refusal():
+    events = [
+        {"type": "response.refusal.delta", "delta": "refusal preserved"},
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "fc_terminal",
+                "call_id": "call_terminal",
+                "name": "lookup",
+                "arguments": '{"city":"Zurich"}',
+            },
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_terminal",
+                        "call_id": "call_terminal",
+                        "name": "lookup",
+                        "arguments": '{"city":"Zurich"}',
+                    },
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Answer"}]},
+                ]
+            },
+        },
+    ]
+
+    async def source():
+        for event in events:
+            yield "data: " + json.dumps(event) + "\n\n"
+
+    result = await collect_chat_completion(source(), model="gpt-6-astra")
+    assert isinstance(result, ChatCompletion)
+    choice = result.choices[0]
+    assert choice.message.content == "Answer"
+    assert choice.message.refusal == "refusal preserved"
+    assert choice.finish_reason == "tool_calls"
+    assert choice.message.tool_calls is not None
+    assert len(choice.message.tool_calls) == 1
+    assert choice.message.tool_calls[0].id == "call_terminal"
+    assert _tool_call_name(choice.message.tool_calls[0]) == "lookup"
+    assert _tool_call_args(choice.message.tool_calls[0]) == '{"city":"Zurich"}'
