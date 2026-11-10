@@ -37,6 +37,7 @@ import aiohttp
 from aiohttp import hdrs
 from aiohttp.client_ws import DEFAULT_WS_CLIENT_TIMEOUT, WebSocketDataQueue
 from aiohttp.http_websocket import WS_KEY, WebSocketReader, WebSocketWriter
+from aiohttp_socks import ProxyConnector
 from multidict import CIMultiDict
 
 from app.core.clients.codex import (
@@ -403,6 +404,7 @@ async def _service_circuit_breaker_context(
     *,
     settings: Settings | None = None,
     account_id: str | None = None,
+    shared_proxy_session: aiohttp.ClientSession | None = None,
 ) -> AsyncIterator[aiohttp.ClientResponse]:
     """Wrap an async context manager with circuit breaker protection."""
     effective_settings = settings or get_settings()
@@ -429,6 +431,10 @@ async def _service_circuit_breaker_context(
     except CircuitBreakerOpenError:
         raise
     except Exception as e:
+        if resp_ref is None and shared_proxy_session is not None:
+            shared_proxy_error = _shared_socks_pre_dispatch_error(e, shared_proxy_session)
+            if shared_proxy_error is not None:
+                raise shared_proxy_error from e
         if cb is not None:
             if (
                 resp_ref is not None
@@ -704,6 +710,28 @@ def _failed_shared_session_for_process_network_error(
     # Replay safety answers whether this request may run again; it must not
     # decide whether later callers inherit a concrete failed generation.
     return session if error_code == PROCESS_NETWORK_UNAVAILABLE_CODE else None
+
+
+def _shared_socks_pre_dispatch_error(
+    exc: Exception,
+    session: aiohttp.ClientSession,
+) -> ProxyResponseError | None:
+    # Only direct shared-session callers use this boundary. A resolved account
+    # route uses its private Codex client, even if that route also uses SOCKS.
+    # Inspect the actual connector rather than an environment variable: an
+    # injected/direct session may deliberately bypass the configured proxy.
+    if not (
+        isinstance(getattr(session, "connector", None), ProxyConnector)
+        and is_proxy_endpoint_failure(exc)
+        and is_pre_dispatch_connection_failure(exc)
+    ):
+        return None
+    return _process_network_failure_error(
+        str(exc) or "Shared SOCKS connection failed",
+        exc,
+        retryable_same_contract=True,
+        failed_session=session,
+    )
 
 
 @dataclass(frozen=True)
@@ -2618,6 +2646,9 @@ async def _open_upstream_websocket(
                 probe_transferred = True
             return websocket_cm, websocket
         except Exception as exc:
+            shared_proxy_error = _shared_socks_pre_dispatch_error(exc, session)
+            if shared_proxy_error is not None:
+                raise shared_proxy_error from exc
             if circuit_breaker is not None:
                 await _record_account_circuit_breaker_failure(circuit_breaker, exc)
             raise
@@ -2646,6 +2677,9 @@ async def _open_upstream_websocket(
                 read_until_eof=False,
             )
         except Exception as exc:
+            shared_proxy_error = _shared_socks_pre_dispatch_error(exc, session)
+            if shared_proxy_error is not None:
+                raise shared_proxy_error from exc
             if circuit_breaker is not None:
                 await _record_account_circuit_breaker_failure(circuit_breaker, exc)
             raise
@@ -4084,6 +4118,7 @@ async def _stream_responses_with_session(
             cast(AsyncContextManager[aiohttp.ClientResponse], _direct_response_context()),
             settings=settings,
             account_id=account_id,
+            shared_proxy_session=client_session,
         ) as resp:
             status_code = resp.status
             last_stream_activity_at = time.monotonic()
